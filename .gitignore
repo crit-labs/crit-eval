@@ -1,0 +1,9 @@
+# Python bytecode and builds
+__pycache__/
+*.py[co]
+*.egg-info/
+build/
+dist/
+
+# The machine's own settings (see README)
+settings.toml

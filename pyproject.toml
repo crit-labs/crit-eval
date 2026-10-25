@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crit-eval"
+version = "0.1.0"
+description = "crit Eval: one speed, quality and exactness suite that every inference engine runs the same way"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = ["crit-core==0.9.1"]
+
+[project.optional-dependencies]
+# The reference scores the quality texts on the checkpoint itself (crit-eval reference).
+reference = ["torch", "transformers>=5.20", "safetensors", "numpy"]
+
+[project.urls]
+Repository = "https://github.com/crit-labs/crit-eval"
+
+[project.scripts]
+crit-eval = "crit_eval.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["crit_eval*"]
+
+[tool.setuptools.package-data]
+crit_eval = ["protocol.json", "suite/**/*", "probe/*", "examples/*"]
