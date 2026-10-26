@@ -14,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import chat, fixed, prepare, reference, runner, status  # noqa: E402
+from crit_eval import chat, fixed, headroom, prepare, reference, runner, status  # noqa: E402
 from test_eval import CharacterText  # noqa: E402
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
@@ -274,6 +274,17 @@ class ChatServerTests(unittest.TestCase):
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
         sample = result["speed"]["cases"]["chat"]["samples"][0]
         self.assertEqual((sample["rounds"], sample["tokens_per_round"]), (4, 3.0))
+
+    def test_the_time_to_first_token_splits_into_the_engines_own_and_the_rest(self):
+        # crit serve's telemetry names the engine's prefill and its own time to the first token.
+        self.server.telemetry = {"tokens_per_round": 3.0, "prefill_ms": 0.5, "ttft_ms": 0.75}
+        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed",),
+                            warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
+        sample = result["speed"]["cases"]["chat"]["samples"][0]
+        self.assertEqual((sample["prefill_ms"], sample["first_token_ms"]), (0.5, 0.75))
+        parts = headroom.ttft_parts(result["speed"]["cases"]["chat"])
+        self.assertEqual((parts["engine_prefill_ms"], parts["engine_first_token_ms"]), (0.5, 0.75))
+        self.assertAlmostEqual(parts["outside_engine_ms"], max(0.0, result["speed"]["cases"]["chat"]["ttft_ms"] - 0.75))
 
     def test_sampled_requests_carry_the_models_sampling_and_a_seed_per_repetition(self):
         path = self.data / "prepared.json"

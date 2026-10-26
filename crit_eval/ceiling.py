@@ -16,7 +16,9 @@ A GGUF's ggml block types
 count at the fp8 rate (engines multiply their integer codes on 8-bit tensor cores, which run int8 and FP8 at
 the same rate), its MXFP4 and NVFP4 at the nvfp4 rate and its F32/F16/BF16 at bf16. Embedding tables
 (gathered), vision towers, norms, convolutions and the output head (one row of logits per
-prompt) are left out. Engines may compute in other formats; the floor uses the stored ones.
+prompt) are left out. Engines may compute in other formats; the floor uses the stored ones, and
+prefill_floor_ms prices the quantized matrices with other prompt activations on request (ACTIVATIONS:
+BF16, FP16 accumulation, FP8), as crit_eval.headroom.activation_ceilings reports them.
 
 Time to first token cannot beat either floor: the prompt's arithmetic, or reading the weights
 once (language-model tensors and the output head, not embeddings, vision or draft layers)
@@ -147,17 +149,91 @@ def model_ceiling(model):
     return out
 
 
-def prefill_floor_ms(ceiling, tflops, prompt_tokens):
-    """Floor of one prefill in ms with its parts, or (None, missing formats)."""
+RATE_SOURCES = (("tflops", "cuBLASLt GEMM"), ("mma_tflops", "raw MMA"))
+
+
+def best_rates(device):
+    """The best achievable TFLOPS per format of a `crit eval probe` result, and what achieved each: {key: tflops} and
+    {key: "cuBLASLt GEMM" or "raw MMA"}. cuBLASLt's GEMMs (bf16, fp8, nvfp4) are not every device's best kernels
+    (an RTX 5090's BF16 GEMM reaches 185 TFLOPS where its BF16 tensor cores run 252), so each format takes the larger
+    of its GEMM rate and its raw tensor-core rate (bf16, fp16, fp16_acc, fp8, nvfp4, fp4_fp8). A probe from before
+    the raw rates has GEMM rates alone."""
+    rates, sources = {}, {}
+    for key, source in RATE_SOURCES:
+        for name, value in ((device or {}).get(key) or {}).items():
+            if value and value > rates.get(name, 0):
+                rates[name], sources[name] = value, source
+    return rates, sources
+
+
+# The activation formats a quantized matrix's prompt GEMM can take, and the rates (crit_eval.probe keys) each runs at
+# for each stored weight format, the best available one counting: BF16 activations on BF16 tensor cores with FP32
+# accumulation, FP16 activations accumulating in FP16, FP8 activations (FP4 weights times FP8 through kind::f8f6f4, or
+# widened to FP8), and the stored format itself (W8A8, W4A4). Weights stored in BF16 stay at the BF16 rate.
+ACTIVATIONS = {"bf16": {"fp8": ("bf16",), "nvfp4": ("bf16",)},
+               "fp16_acc": {"fp8": ("fp16_acc",), "nvfp4": ("fp16_acc",)},
+               "fp8": {"fp8": ("fp8",), "nvfp4": ("fp4_fp8", "fp8")},
+               "stored": {"fp8": ("fp8",), "nvfp4": ("nvfp4",)}}
+QUANTIZED = ("fp8", "nvfp4")
+
+
+def quantized_formats(ceiling):
+    """The quantized stored formats whose matrices the model's prompt GEMMs multiply (fp8, nvfp4)."""
+    return [f for f in QUANTIZED if ((ceiling or {}).get("matmul_flops_per_token") or {}).get(f)]
+
+
+def activation_shares(activations, formats):
+    """{stored format: {activation: share}} from an engine's prompt_activations: one activation for every quantized
+    format ("fp16_acc"), one per format ({"nvfp4": "fp16_acc", "fp8": "fp8"}) or shares of a format's FLOPs
+    ({"nvfp4": {"fp16_acc": 0.93, "bf16": 0.07}}); None when it names no format of `formats` or an activation that is
+    not one of ACTIVATIONS. A format it leaves out keeps its stored activations."""
+    if isinstance(activations, str):
+        activations = {f: activations for f in formats}
+    if not isinstance(activations, dict):
+        return None
+    shares = {}
+    for f in formats:
+        value = activations.get(f, "stored")
+        value = {value: 1.0} if isinstance(value, str) else value
+        if (not isinstance(value, dict) or not value or any(k not in ACTIVATIONS for k in value)
+                or any(not isinstance(v, (int, float)) or v < 0 for v in value.values())):
+            return None
+        total = sum(value.values())
+        if total <= 0:
+            return None
+        shares[f] = {k: v / total for k, v in value.items()}
+    return shares if any(f in activations for f in formats) else None
+
+
+def matmul_rate(tflops, stored, activation=None):
+    """(TFLOPS, rate key) a stored format's matrices multiply at with the given activation (ACTIVATIONS; None: the
+    stored format's own), the best of the activation's rates; (None, the keys tried) when none was probed."""
+    keys = ACTIVATIONS[activation].get(stored, (stored,)) if activation else (stored,)
+    found = [(tflops[key], key) for key in keys if (tflops or {}).get(key)]
+    return max(found) if found else (None, keys)
+
+
+def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
+    """Floor of one prefill in ms with its parts (matmul_by_format: each stored format's matmul ms), or (None,
+    missing rates). activations: {stored format: {activation: share}} (activation_shares) for the quantized
+    formats' prompt GEMMs; without it each format multiplies at its own rate."""
     if not ceiling or not tflops:
         return None, ["device GEMM rates (--device)"] if not tflops else ["model arithmetic (re-run prepare)"]
-    missing = [f for f in ceiling["matmul_flops_per_token"] if not tflops.get(f)]
+    missing, by_format, n = [], {}, prompt_tokens
+    for f, flops in ceiling["matmul_flops_per_token"].items():
+        ms = 0.0
+        for activation, share in ((activations or {}).get(f) or {None: 1.0}).items():
+            rate, key = matmul_rate(tflops, f, activation)
+            if rate is None:
+                missing += [k for k in key if k not in missing]
+                continue
+            ms += share * n * flops / (rate * 1e12) * 1000
+        by_format[f] = ms
     if not tflops.get("bf16"):
         missing.append("bf16")
     if missing:
         return None, [f"{f} GEMM rate" for f in sorted(set(missing))]
-    n = prompt_tokens
-    matmul = sum(n * flops / (tflops[f] * 1e12) for f, flops in ceiling["matmul_flops_per_token"].items()) * 1000
+    matmul = sum(by_format.values())
     pairs = n * (n + 1) / 2
     # Attention at the faster of the BF16 and FP8 rates: engines run Q K^T and P V on FP8 tensor cores within
     # the quality budget, so a BF16-only floor is one they beat.
@@ -165,13 +241,14 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens):
     attention = pairs * (ceiling.get("attention_flops_per_pair") or 0) / (attention_rate * 1e12) * 1000
     recurrent = n * (ceiling.get("recurrent_flops_per_token") or 0) / (tflops["bf16"] * 1e12) * 1000
     return {"matmul_ms": matmul, "attention_ms": attention, "recurrent_ms": recurrent,
-            "total_ms": matmul + attention + recurrent}, []
+            "total_ms": matmul + attention + recurrent, "matmul_by_format": by_format}, []
 
 
-def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None):
-    """Floor of the time to first token: the larger of the prompt's compute floor and one read of
-    the weights (bytes_per_pass when the adapter declares it) plus the prompt's KV writes."""
-    compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens)
+def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None, activations=None):
+    """Floor of the time to first token: the larger of the prompt's compute floor (with the quantized formats'
+    activations, prefill_floor_ms) and one read of the weights (bytes_per_pass when the adapter declares it) plus the
+    prompt's KV writes."""
+    compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens, activations)
     weights = bytes_per_pass or (ceiling or {}).get("weight_bytes")
     if not weights or not bandwidth_gbs:
         missing = missing + ["device bandwidth (--device)" if not bandwidth_gbs else "model weight bytes (re-run prepare)"]

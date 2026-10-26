@@ -58,6 +58,14 @@ def main(argv=None):
                           "context_reserve_gib, else the protocol's reserve_gib)")
     run.add_argument("--vram-headroom-gib", type=float, default=None,
                      help="Device memory left free when crit-eval computes the max context (default 1)")
+    run.add_argument("--adaptive-sampled", action=argparse.BooleanOptionalAction, default=True,
+                     help="Repeat each sampled speed case at further seeds until its relative standard error reaches "
+                          "the protocol's target or its repetition cap (protocol sampled_speed.adaptive; the default). "
+                          "--no-adaptive-sampled keeps the seeds' repetitions alone: an override like --repetitions, "
+                          "recorded in the result")
+    run.add_argument("--attribute-drift", action="store_true",
+                     help="After quality, score it again on an engine opened with each of the adapter's exact_variants "
+                          "(one matrix group or arithmetic choice exact) and report each one's share of the drift budget")
     run.add_argument("--keep-disturbed", action="store_true",
                      help="Finish the round even when a speed case's repetitions show a disturbed device (by default "
                           "the round stops there; protocol speed.disturbed_spread)")
@@ -86,6 +94,12 @@ def main(argv=None):
     status.add_argument("result")
     status.add_argument("--baseline", metavar="RESULT", help="Earlier result to show KPI changes against")
     status.add_argument("--json", action="store_true", help="Print the status as JSON")
+    status.add_argument("--device", metavar="JSON", help="Price prefill and time to first token with this `crit eval probe` "
+                                                       "result's rates instead of the result's own device")
+    status.add_argument("--kernels", metavar="JSON", help="A kernel trace of the engine (crit eval kernels): its prefill GPU "
+                                                         "time per floor term against the term's floor, with a gap each")
+    status.add_argument("--data", metavar="DIR", help="The data directory the result was measured on: its model arithmetic "
+                                                     "prices prefill for a result that does not record it")
 
     prepare = subs.add_parser("prepare", help="Freeze the suite as token ids for one model")
     prepare.add_argument("--model", required=True)
@@ -150,6 +164,9 @@ def main(argv=None):
     kernels.add_argument("--device", metavar="JSON", help="Device ceilings from `crit eval probe` for share of peak")
     kernels.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
     kernels.add_argument("--top", type=int, default=12, help="Kernels listed per phase")
+    kernels.add_argument("--work", metavar="JSON", help="kernel_work rules ahead of the adapter's own, as JSON text or a "
+                                                       "file: [{\"match\": NAME_PART, \"term\": matmul|attention|recurrent|"
+                                                       "other|draft, \"format\": nvfp4|fp8|bf16, ...}]")
     kernels.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     args = parser.parse_args(argv)
@@ -174,8 +191,14 @@ def _command(args):
         if not (Path(args.data) / PREPARED).is_file():
             from .prepare import prepare as do_prepare
             do_prepare(args.model, args.data)
+        work = None
+        if args.work:   # JSON text, else a file holding it
+            try:
+                work = json.loads(args.work)
+            except json.JSONDecodeError:
+                work = json.loads(Path(args.work).read_text(encoding="utf-8"))
         result = trace(args.adapter, args.model, args.data, args.out, json.loads(args.config), args.case, args.nvcc,
-                       load(args.device) if args.device else None, context_tokens=args.context)
+                       load(args.device) if args.device else None, context_tokens=args.context, work=work)
         print(f"wrote {args.out}")
         print(render_kernels(result, args.top))
         return 0
@@ -254,6 +277,7 @@ def _command(args):
         device = do_probe(args.out, args.nvcc, args.repeats)
         print(f"wrote {args.out}: {device['bandwidth_gbs']:.0f} GB/s, "
               + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in device["tflops"].items())
+              + "; raw MMA " + (", ".join(f"{k} {v:.0f}" for k, v in (device.get("mma_tflops") or {}).items()) or "none")
               + (f", {device['memory_free_bytes'] / 1e9:.1f} of {device['memory_total_bytes'] / 1e9:.1f} GB free"
                  if device.get("memory_free_bytes") and device.get("memory_total_bytes") else ""))
         return 0
@@ -262,7 +286,7 @@ def _command(args):
         from .status import render, status_of
         from . import EVAL_DIR
         protocol = load(EVAL_DIR / "protocol.json")
-        current = status_of(args.result, protocol, args.baseline)
+        current = status_of(args.result, protocol, args.baseline, args.device, args.data, args.kernels)
         print(json.dumps(current, indent=1) if args.json else render(current))
         return 0
     from .prepare import PREPARED, read_template
@@ -290,7 +314,8 @@ def _command(args):
                     vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
                     abort_disturbed=not args.keep_disturbed, url=args.url, served_model=args.served_model,
-                    profile=args.profile, chat_template=template)
+                    profile=args.profile, chat_template=template, attribute_drift=args.attribute_drift,
+                    adaptive_sampled=args.adaptive_sampled)
     print(f"wrote {args.out}")
     if result.get("aborted"):
         print(f"aborted: {result['aborted']['detail']}")

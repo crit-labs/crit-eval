@@ -21,6 +21,14 @@
 // bytes written), on every hardware thread and on one, best of five passes; and CPU FP32 throughput as GFLOPS of
 // independent fused multiply-add chains in the widest vectors the build targets (AVX-512 or AVX2, recorded as
 // cpu_isa), on every hardware thread and on one. These are the host's ceilings, not what a particular kernel reaches.
+//
+// Raw tensor-core rates (mma_tflops): mma.sync throughput with operands in registers and every SM busy, per input and
+// accumulator format: BF16 and FP16 into FP32, FP16 into FP16 (twice the FP32-accumulate rate on some devices), E4M3
+// into FP32 (sm_89+), and on sm_120a E2M1 with E4M3 block scales (NVFP4) and E2M1 times E4M3 (kind::f8f6f4, the
+// rate of FP4 weights with FP8 activations). A GEMM moves operands through memory, so it reaches less than these,
+// but more than cuBLASLt where cuBLASLt's kernels are not the device's best (BF16 on an RTX 5090: 185 vs 252). The
+// probe is built for the device's own architecture (`crit eval probe` passes it); a kind the build cannot run is
+// omitted.
 #include <cublasLt.h>
 #include <cuda_runtime.h>
 
@@ -254,6 +262,116 @@ double cpu_gflops(int threads, int passes) {
     return best;
 }
 
+// Raw tensor-core rates: mma.sync throughput per input and accumulator format, every SM busy, operands in registers.
+// Kinds: 0 bf16->f32, 1 f16->f32, 2 f16->f16, 3 e4m3->f32, 4 e2m1 x e2m1 block-scaled (nvfp4) -> f32,
+// 5 e2m1 x e4m3 (kind::f8f6f4) -> f32.
+constexpr int kMmaKinds = 6;
+constexpr const char* kMmaNames[kMmaKinds] = {"bf16", "fp16", "fp16_acc", "fp8", "nvfp4", "fp4_fp8"};
+constexpr int kMmaK[kMmaKinds] = {16, 16, 16, 32, 64, 32};
+constexpr int kMmaChains = 8;   // independent accumulators per thread, enough to keep the tensor cores fed
+
+// The kinds this build's device code runs: FP8 from sm_89, the FP4 kinds on sm_120a/sm_121a only.
+__global__ void mma_kinds(int* out) {
+    int kinds = 0;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+    kinds |= 0x7;
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+    kinds |= 0x8;
+#endif
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+    kinds |= 0x30;
+#endif
+    *out = kinds;
+}
+
+template <int KIND>
+__global__ void mma_rate(float* out, int iters) {
+    uint32_t a0 = threadIdx.x * 0x01010101u, a1 = a0 ^ 0x3c3c3c3cu, a2 = a0 ^ 0x5a5a5a5au, a3 = a0 ^ 0x69696969u;
+    uint32_t b0 = a0 ^ 0x33333333u, b1 = a0 ^ 0x55555555u;
+    float c[kMmaChains][4] = {};
+    uint32_t h[kMmaChains][2] = {};
+    for (int i = 0; i < iters; ++i) {
+#pragma unroll
+        for (int j = 0; j < kMmaChains; ++j) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 800
+            if constexpr (KIND == 0)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            if constexpr (KIND == 1)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+            if constexpr (KIND == 2)
+                asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0,%1}, {%2,%3,%4,%5}, {%6,%7}, {%0,%1};"
+                             : "+r"(h[j][0]), "+r"(h[j][1]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+            if constexpr (KIND == 3)
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.f32.e4m3.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+#if defined(__CUDA_ARCH_FEAT_SM120_ALL) || defined(__CUDA_ARCH_FEAT_SM121_ALL)
+            if constexpr (KIND == 4) {
+                const uint32_t scale = 0x38383838u;   // E4M3 1.0 in every byte
+                const uint16_t zero = 0;
+                asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                             "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3}, {%10}, {%11,%12}, {%10}, {%11,%12};"
+                             : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1), "r"(scale), "h"(zero), "h"(zero));
+            }
+            if constexpr (KIND == 5)
+                asm volatile("mma.sync.aligned.kind::f8f6f4.m16n8k32.row.col.f32.e2m1.e4m3.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                             : "+f"(c[j][0]), "+f"(c[j][1]), "+f"(c[j][2]), "+f"(c[j][3])
+                             : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+#endif
+        }
+    }
+    float s = 0.f;
+    for (int j = 0; j < kMmaChains; ++j) s += c[j][0] + c[j][1] + c[j][2] + c[j][3] + float(h[j][0] & 0xff) + float(h[j][1] & 0xff);
+    out[blockIdx.x * blockDim.x + threadIdx.x] = s;
+}
+
+// TFLOPS of one kind (m16n8kK per instruction, 2 FLOPs per multiply-add), best of three launches; 0 when the build
+// cannot run it.
+double mma_tflops(int kind, int sms) {
+    const int blocks = sms * 4, threads = 256, iters = 2048;
+    float* out = nullptr;
+    if (cudaMalloc(&out, size_t(blocks) * threads * sizeof(float)) != cudaSuccess) { cudaGetLastError(); return 0.0; }
+    auto launch = [&] {
+        switch (kind) {
+            case 0: mma_rate<0><<<blocks, threads>>>(out, iters); break;
+            case 1: mma_rate<1><<<blocks, threads>>>(out, iters); break;
+            case 2: mma_rate<2><<<blocks, threads>>>(out, iters); break;
+            case 3: mma_rate<3><<<blocks, threads>>>(out, iters); break;
+            case 4: mma_rate<4><<<blocks, threads>>>(out, iters); break;
+            default: mma_rate<5><<<blocks, threads>>>(out, iters); break;
+        }
+    };
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    launch();   // warmup
+    double best = 0.0;
+    for (int rep = 0; rep < 3; ++rep) {
+        cudaEventRecord(start);
+        launch();
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        float ms = 0.f;
+        if (cudaEventElapsedTime(&ms, start, stop) != cudaSuccess || !(ms > 0.f)) break;
+        const double flops = 2.0 * blocks * (threads / 32) * double(iters) * kMmaChains * 16 * 8 * kMmaK[kind];
+        best = std::max(best, flops / (ms * 1e-3) / 1e12);
+    }
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaFree(out);
+    if (cudaGetLastError() != cudaSuccess) best = 0.0;
+    return best;
+}
+
 // TFLOPS of D[N x M] = W[N x K] * X[K x M] (W row-major, op T), or 0 when unsupported.
 double gemm_tflops(cublasLtHandle_t lt, cudaDataType_t type, bool block_scaled, int M, int N, int K) {
     const bool fp4 = type == CUDA_R_4F_E2M1;
@@ -402,14 +520,31 @@ int main() {
         }
     }
     cublasLtDestroy(lt);
+    std::string mma;
+    int* mma_out = nullptr;
+    int mma_supported = 0;
+    if (cudaMalloc(&mma_out, sizeof(int)) == cudaSuccess) {
+        mma_kinds<<<1, 1>>>(mma_out);
+        if (cudaMemcpy(&mma_supported, mma_out, sizeof(int), cudaMemcpyDeviceToHost) != cudaSuccess) mma_supported = 0;
+        cudaFree(mma_out);
+    }
+    cudaGetLastError();
+    for (int kind = 0; kind < kMmaKinds; ++kind) {
+        const double t = mma_supported & (1 << kind) ? mma_tflops(kind, prop.multiProcessorCount) : 0.0;
+        if (t > 0.0) {
+            char item[96];
+            std::snprintf(item, sizeof item, "%s\"%s\": %.1f", mma.empty() ? "" : ", ", kMmaNames[kind], t);
+            mma += item;
+        }
+    }
     int runtime = 0;
     cudaRuntimeGetVersion(&runtime);
     std::printf("{\"device\": \"%s\", \"compute_capability\": \"%d.%d\", \"cuda_runtime\": %d, "
                 "\"memory_total_bytes\": %llu, \"memory_free_bytes\": %llu, "
                 "\"bandwidth_gbs\": %.1f, \"host_to_device_gbs\": {%s}, \"device_to_host_gbs\": {%s}, %s, "
-                "\"tflops\": {%s}}\n",
+                "\"tflops\": {%s}, \"mma_tflops\": {%s}}\n",
                 prop.name, prop.major, prop.minor, runtime, static_cast<unsigned long long>(total_bytes),
                 static_cast<unsigned long long>(free_bytes), bandwidth, host_to_device.c_str(), device_to_host.c_str(),
-                host, tflops.c_str());
+                host, tflops.c_str(), mma.c_str());
     return 0;
 }

@@ -1,4 +1,5 @@
 """crit eval harness: metrics, runner and comparison with the mock adapter (no GPU)."""
+import copy
 import hashlib
 import importlib.util
 import json
@@ -36,7 +37,7 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v0.1.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v0.2.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
@@ -314,6 +315,15 @@ PROTOCOLS = {
     "crit-eval-v7.3": "f93174627087ca2f3b6ccff40d42790f2ad0dfbd8b2bde0844ccbfa3bdb7f9ae",  # hub: retrieval at 4K, 32K, max
     "crit-eval-v8": "f15b05a73387399d950ab3f31fe27dc4eec1b16662a65b91d0f9a583f44ac8ad",  # one long text per length, ...
     "crit-eval-v0.1.0": "f15b05a73387399d950ab3f31fe27dc4eec1b16662a65b91d0f9a583f44ac8ad",  # crit-eval-v8 renamed
+    "crit-eval-v0.1.1": "fe48eaec226309bf72da471ff979eb1065dded62139fd5b3705ff1553aa87a72",  # floors at the best rates
+    "crit-eval-v0.1.2": "099795443d1c7743b134b28eba34a7c737bf7b15f13f08e986753fd228bd0588",  # prompt activations
+    "crit-eval-v0.1.3": "ae6730b96936c36d729b311f35bcbd670d64a147c3f2823e2c766d323d4f947d",  # development quality
+    "crit-eval-v0.1.4": "ccf386acaa700e630a1c3fdb2609629114a1efa40218a6b0536d82f578b96c90",  # position spread
+    "crit-eval-v0.1.5": "aa1aa7ea2f352e1abf468b50dc979acb5ad1fe7e06db8b0c60206874c55c0b6b",  # drift attribution
+    "crit-eval-v0.1.6": "1b23940cff3acb7209445f83f02ca044185744370e3a5b2f87807a518c76404e",  # sampled case errors
+    "crit-eval-v0.1.7": "640b868d23156fa622e323ab9d031bdbd086db65d36f0aa56bd1c619f9e11c2f",  # draft and verify apart
+    "crit-eval-v0.1.8": "c1702d19e6be9a3745e3dc3a3ae14902e94489fdb1662a1ed58b2d45629d98ca",  # free device memory
+    "crit-eval-v0.2.0": "a2f9fae42fe8157d19cca4c33336fb9def7129c2c4b4da05f1e90e22e20a5d10",  # adaptive sampled decode
 }
 
 
@@ -523,6 +533,29 @@ class CeilingTests(unittest.TestCase):
                                                                               "mapped_read": {"65536": 0.0}}}]
         self.assertEqual(probe.combine(failed)["host_to_device_gbs"], {"pinned": {"1048576": 9.0}})   # unmeasured left out
 
+    def test_floors_take_each_formats_best_rate_gemm_or_raw_tensor_cores(self):
+        samples = [{"device": "gpu", "bandwidth_gbs": 1, "tflops": {"bf16": 185.0, "fp8": 522.0, "nvfp4": 1108.0},
+                    "mma_tflops": {"bf16": b, "fp16_acc": 2 * b, "fp8": 500.0, "nvfp4": 1990.0}} for b in (251.0, 252.0, 253.0)]
+        combined = probe.combine(samples)
+        self.assertEqual(combined["mma_tflops"], {"bf16": 252.0, "fp16_acc": 504.0, "fp8": 500.0, "nvfp4": 1990.0})
+        rates, sources = ceiling.best_rates(combined)
+        # cuBLASLt's BF16 GEMM is not this device's best BF16 kernel; its FP8 GEMM beats the raw rate measured.
+        self.assertEqual(rates, {"bf16": 252.0, "fp8": 522.0, "nvfp4": 1990.0, "fp16_acc": 504.0})
+        self.assertEqual(sources, {"bf16": "raw MMA", "fp8": "cuBLASLt GEMM", "nvfp4": "raw MMA", "fp16_acc": "raw MMA"})
+        older = probe.combine([{"device": "gpu", "bandwidth_gbs": 1, "tflops": {"bf16": 185.0}}])
+        self.assertIsNone(older["mma_tflops"])
+        self.assertEqual(ceiling.best_rates(older), ({"bf16": 185.0}, {"bf16": "cuBLASLt GEMM"}))
+        self.assertEqual(ceiling.best_rates(None), ({}, {}))
+
+    def test_the_probe_builds_for_the_devices_own_architecture(self):
+        answers = {"12.0\n": ["-gencode", "arch=compute_120a,code=sm_120a"],
+                   "8.9\n": ["-gencode", "arch=compute_89,code=sm_89"], "": ["-arch=native"]}
+        for stdout, expected in answers.items():
+            with self.subTest(stdout), patch.object(probe.subprocess, "run", return_value=SimpleNamespace(stdout=stdout)):
+                self.assertEqual(probe.architecture(), expected)
+        with patch.object(probe.subprocess, "run", side_effect=OSError("no nvidia-smi")):
+            self.assertEqual(probe.architecture(), ["-arch=native"])
+
     def test_probe_keeps_the_median_host_rates(self):
         from crit_eval import probe
         samples = [{"device": "gpu", "bandwidth_gbs": 1, "host_threads": 12, "cpu_isa": "avx512",
@@ -610,6 +643,41 @@ class GapTests(unittest.TestCase):
         # Draft floor 0.25 ms: three steps 0.5 -> 0.25 ms take 0.75 ms off each 20 ms round.
         self.assertAlmostEqual(gaps["draft steps at their bandwidth floor"]["projected_gain"], 20 / 19.25 - 1)
 
+    def test_a_kernel_trace_splits_rounds_into_the_verify_pass_and_draft_steps(self):
+        info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 0.25e9, "speculative": True}
+        room = headroom.summarize(info, self.speed(), 16.0, 1000, THRESHOLDS)
+        self.assertIn("draft steps and verify columns at the draft floor", [g["name"] for g in room["gaps"]])
+        result = {"engine": info, "headroom": room, "speed": self.speed(), "bandwidth_gbs": 1000}
+        # Per case 10 rounds: 185 ms of GPU time outside draft kernels and 15 ms in them (3 drafts a round).
+        trace = {"cases": {cid: {"rounds": 10, "decode": {"kernel_ms": 200.0, "terms": {"matmul": 185.0, "draft": 15.0}}}
+                           for cid in ("short", "long")}}
+        split = headroom.trace_decode_parts(result, trace)
+        self.assertAlmostEqual(split["cases"]["short"]["verify_ms"], 18.5)
+        self.assertAlmostEqual(split["cases"]["short"]["draft_step_ms"], 0.5)
+        names = {g["name"]: g for g in split["gaps"]}
+        self.assertAlmostEqual(names["draft steps at their bandwidth floor"]["projected_gain"], 20 / 19.25 - 1)
+        self.assertTrue(names["verify pass of 4 columns at the ordinary pass cost"]["detail"].endswith(
+            "(kernel trace, GPU time)"))
+        # A trace without draft kernels, or without every case, splits nothing.
+        self.assertIsNone(headroom.trace_decode_parts(result, {"cases": {"short": trace["cases"]["short"]}}))
+        plain = {cid: {"rounds": 10, "decode": {"kernel_ms": 200.0, "terms": {"matmul": 200.0}}} for cid in ("short", "long")}
+        self.assertIsNone(headroom.trace_decode_parts(result, {"cases": plain}))
+
+    def test_acceptance_at_a_wider_probed_draft_extends_the_width_projection(self):
+        info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 1e9}
+        speed = self.speed()
+        for case in speed["cases"].values():
+            case["samples"] = [{"warmup": False, "accepted": [3, 1] * 5}]
+        narrow = headroom.summarize(info, speed, 16.0, 1000, THRESHOLDS)
+        # At width 6, drafts 4 and 5 are accepted in half the rounds, 6 in none.
+        speed["wider_draft"] = {"width": 6, "cases": {cid: {"accepted": [5, 1] * 5} for cid in speed["cases"]}}
+        wide = headroom.summarize(info, speed, 16.0, 1000, THRESHOLDS)
+        curve = wide["cases"]["short"]["tokens_by_width"]
+        self.assertEqual(curve[:4], narrow["cases"]["short"]["tokens_by_width"])
+        self.assertEqual(curve[4:], [curve[3] + 0.5, curve[3] + 1.0, curve[3] + 1.0])
+        self.assertEqual((wide["projection"]["probed_width"], wide["cases"]["short"]["probed_width"]), (6, 6))
+        self.assertFalse(any(m.startswith("acceptance beyond draft width 3") for m in wide["missing"]))
+
     def test_prefill_score_against_its_compute_ceiling(self):
         model = {"matmul_flops_per_token": {"bf16": 1e10}, "attention_flops_per_pair": 0, "recurrent_flops_per_token": 0}
         room = headroom.summarize({}, self.speed(), None, None, THRESHOLDS, ceiling=model, tflops={"bf16": 100},
@@ -640,6 +708,195 @@ class GapTests(unittest.TestCase):
         gap = next(gap for gap in room["gaps"] if gap["kpi"] == "ttft")
         self.assertAlmostEqual(gap["projected_gain"], 1 / ttft["fraction_of_floor"] - 1)
         self.assertIn("short 50 ms vs 20 ms (memory bound)", gap["detail"])
+
+
+class ActivationCeilingTests(unittest.TestCase):
+    # 1e9 NVFP4 and 1e9 FP8 FLOPs per token; rates where FP16 accumulation doubles BF16 and NVFP4 doubles FP8.
+    CEILING = {"matmul_flops_per_token": {"nvfp4": 1e9, "fp8": 1e9}, "attention_flops_per_pair": 0,
+               "recurrent_flops_per_token": 0, "weight_bytes": 1e6, "kv_bytes_per_token": 0}
+    RATES = {"bf16": 100.0, "fp16_acc": 200.0, "fp8": 400.0, "nvfp4": 800.0}
+    SOURCES = {"bf16": "raw MMA", "fp16_acc": "raw MMA", "fp8": "cuBLASLt GEMM", "nvfp4": "raw MMA"}
+
+    def result(self, declared=None, passed=None, label="new", model="m"):
+        speed = {"cases": {cid: {"status": "measured", "prompt_tokens": n, "ttft_ms": ms, "prefill_tps": n / ms * 1000,
+                                 "output_tokens": 10, "decode_tps": 100.0}
+                           for cid, n, ms in (("short", 100, 20.0), ("long", 10000, 2000.0))}}
+        scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
+        quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
+            "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
+        return {"protocol": "crit-eval-v0.2.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
+                "engine": {"prompt_activations": declared}, "quality": quality,
+                "headroom": {"gaps": [], "missing": []}}
+
+    def test_activations_are_declared_per_format_or_as_shares(self):
+        formats = ["fp8", "nvfp4"]
+        self.assertEqual(ceiling.activation_shares("fp16_acc", formats),
+                         {"fp8": {"fp16_acc": 1.0}, "nvfp4": {"fp16_acc": 1.0}})
+        self.assertEqual(ceiling.activation_shares({"nvfp4": {"fp16_acc": 3, "bf16": 1}}, formats),
+                         {"fp8": {"stored": 1.0}, "nvfp4": {"fp16_acc": 0.75, "bf16": 0.25}})
+        for wrong in ({"nvfp4": "int4"}, {"bf16": "fp8"}, None, 7, {"nvfp4": {"bf16": 0}}):
+            self.assertIsNone(ceiling.activation_shares(wrong, formats))
+        # FP4 weights with FP8 activations take the better of kind::f8f6f4 and a widening to FP8.
+        self.assertEqual(ceiling.matmul_rate({"fp8": 400.0, "fp4_fp8": 300.0}, "nvfp4", "fp8"), (400.0, "fp8"))
+        self.assertEqual(ceiling.matmul_rate({"fp8": 400.0}, "nvfp4", "fp16_acc"), (None, ("fp16_acc",)))
+        floor, missing = ceiling.prefill_floor_ms(self.CEILING, self.RATES, 1000,
+                                                  {"fp8": {"fp8": 1.0}, "nvfp4": {"fp16_acc": 0.75, "bf16": 0.25}})
+        self.assertEqual(missing, [])
+        nvfp4 = 1000 * 1e9 * (0.75 / 200e12 + 0.25 / 100e12) * 1000
+        self.assertAlmostEqual(floor["matmul_by_format"]["nvfp4"], nvfp4)
+        self.assertAlmostEqual(floor["matmul_ms"], nvfp4 + 1000 * 1e9 / 400e12 * 1000)
+
+    def test_ceilings_by_activation_format_and_the_reachable_one_quality_shows(self):
+        rates, sources = self.RATES, self.SOURCES
+        # The baseline served stored activations (W4A4, W8A8) and failed on its prompt path; this result declares
+        # FP16 accumulation for the NVFP4 matrices and FP8 for the FP8 ones, and passes.
+        baseline = self.result("stored", passed=False, label="old")
+        found = headroom.activation_ceilings(self.result({"nvfp4": "fp16_acc", "fp8": "fp8"}, passed=True), rates, sources,
+                                             ["long"], [baseline])
+        modes = found["modes"]
+        self.assertEqual(list(modes), ["bf16", "fp16_acc", "fp8", "stored"])
+        # 10,000 tokens x (1e9 / rate(fp8) + 1e9 / rate(nvfp4)).
+        for name, fp8, nvfp4 in (("bf16", 100, 100), ("fp16_acc", 200, 200), ("fp8", 400, 400), ("stored", 400, 800)):
+            ms = 10000 * 1e9 * (1 / (fp8 * 1e12) + 1 / (nvfp4 * 1e12)) * 1000
+            self.assertAlmostEqual(modes[name]["ceiling_score"], 10000 / ms * 1000)
+        self.assertEqual(modes["stored"]["rates"]["nvfp4"], {"tflops": 800.0, "rate": "nvfp4", "source": "raw MMA"})
+        self.assertEqual(modes["stored"]["state"], "fails")
+        self.assertEqual(modes["stored"]["evidence"], ["quality failed on long-4096/prompt (old)"])
+        self.assertIsNone(modes["fp16_acc"]["state"])   # not judged as a whole: the declaration mixes two formats
+        own = found["declared"]
+        self.assertEqual((own["state"], own["label"]), ("passes", "fp8 fp8, nvfp4 fp16_acc"))
+        self.assertAlmostEqual(own["ceiling_score"], 10000 / (10000 * 1e9 * (1 / 400e12 + 1 / 200e12) * 1000) * 1000)
+        self.assertEqual(found["reachable"]["name"], "declared")
+        self.assertEqual(found["missing"], [])
+        # A uniform declaration that passes shows that activation passing; one that fails rules it out.
+        uniform = headroom.activation_ceilings(self.result("fp16_acc", passed=True), rates, sources, ["long"])
+        self.assertEqual(uniform["modes"]["fp16_acc"]["state"], "passes")
+        self.assertEqual(uniform["reachable"]["name"], "fp16_acc")
+        failing = headroom.activation_ceilings(self.result("bf16", passed=False), rates, sources, ["long"])
+        self.assertEqual(failing["modes"]["bf16"]["state"], "fails")
+        self.assertIsNone(failing["reachable"])
+        # Another model's results are no evidence; an engine that declares nothing has no reachable ceiling.
+        other = headroom.activation_ceilings(self.result(), rates, sources, ["long"], [self.result("stored", False, model="x")])
+        self.assertIsNone(other["modes"]["stored"]["state"])
+        self.assertIn("prompt_activations from the adapter", other["missing"][0])
+        self.assertIsNone(headroom.activation_ceilings({**self.result(), "ceiling": {"matmul_flops_per_token": {"bf16": 1}}},
+                                                       rates, sources, ["long"]))
+
+    def test_the_reachable_ceiling_is_a_prefill_gap_and_status_states_the_evidence(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        result = {**MEASURED, **self.result({"nvfp4": "fp16_acc", "fp8": "fp8"}, passed=True)}
+        result["device"] = {"tflops": {"bf16": 50.0, "fp8": 400.0}, "mma_tflops": {"bf16": 100.0, "fp16_acc": 200.0,
+                                                                                    "nvfp4": 800.0}}
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(json.dumps(result))
+            baseline = Path(directory) / "baseline.json"
+            baseline.write_text(json.dumps({**MEASURED, **self.result("stored", passed=False, label="old")}))
+            # The result records its arithmetic but no ceilings by activation: status prices them from its device.
+            current = status.status_of(path, {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}},
+                                       baseline)
+        names = [gap["name"] for gap in current["gaps"]]
+        self.assertEqual(names[:2], ["prefill at its compute ceiling",
+                                     "prefill at its reachable ceiling (prompt activations fp8 fp8, nvfp4 fp16_acc)"])
+        reach = current["kpis"]["prefill"]["activations"]["reachable"]
+        self.assertAlmostEqual(current["gaps"][1]["projected_gain"], reach["ceiling_score"] / 5000 - 1)
+        text = status.render(current)
+        self.assertIn("prefill by prompt activations of the fp8 and nvfp4 matrices: ceilings bf16", text)
+        self.assertIn("ruled out by quality: stored (quality failed on long-4096/prompt (old))", text)
+        self.assertIn(f"reachable limit {reach['ceiling_score']:,.0f} tok/s (prompt activations fp8 fp8, nvfp4 fp16_acc)",
+                      text)
+        self.assertIn("rates bf16 100, fp16_acc 200, fp8 400, nvfp4 800 TFLOPS", text)
+
+    def test_status_prices_an_older_result_with_its_data_and_a_newer_probe(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
+        older = {**MEASURED, **self.result(), "device": {"tflops": {"bf16": 50.0, "fp8": 100.0, "nvfp4": 200.0}}}
+        older.pop("ceiling")
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory) / "data"
+            data.mkdir()
+            (data / "prepared.json").write_text(json.dumps({"model": {"sha256": "m"}, "ceiling": self.CEILING}))
+            path, device = Path(directory) / "result.json", Path(directory) / "device.json"
+            path.write_text(json.dumps(older))
+            device.write_text(json.dumps({"tflops": {"bf16": 50.0, "fp8": 100.0, "nvfp4": 200.0},
+                                          "mma_tflops": {"bf16": 100.0, "fp8": 400.0, "nvfp4": 800.0}}))
+            # Without the arithmetic there is nothing to price; with the data, its own device's rates; then the probe's.
+            self.assertIsNone(status.status_of(path, protocol)["kpis"]["prefill"]["activations"])
+            own = status.status_of(path, protocol, data=data)["kpis"]["prefill"]
+            probed = status.status_of(path, protocol, device_path=device, data=data)["kpis"]["prefill"]
+            other = Path(directory) / "other"
+            other.mkdir()
+            (other / "prepared.json").write_text(json.dumps({"model": {"sha256": "x"}, "ceiling": self.CEILING}))
+            with self.assertRaisesRegex(SystemExit, "another model"):
+                status.status_of(path, protocol, data=other)
+        stored = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
+        self.assertAlmostEqual(own["ceiling"], stored(100e12, 200e12))
+        self.assertAlmostEqual(probed["ceiling"], stored(400e12, 800e12))
+        self.assertAlmostEqual(probed["activations"]["modes"]["stored"]["ceiling_score"], probed["ceiling"])
+
+
+class PrefillTermTests(unittest.TestCase):
+    def trace(self, terms, first=1000.0, busy=990.0):
+        return {"engine": {"name": "toy"}, "prefill_request": "one output token on a fresh prompt",
+                "cases": {"long": {"prefill": {"terms": terms, "first_token_ms": first, "gpu_before_first_ms": busy,
+                                               "classified_ms": {"rules": busy, "names": 0.0}}},
+                          "gone": {"prefill": {"terms": {"other": 1.0}}}}}
+
+    def test_a_kernel_trace_joins_the_prefill_floor_term_by_term(self):
+        base = ActivationCeilingTests()
+        result = base.result({"nvfp4": "fp16_acc"}, passed=True)
+        rates = base.RATES
+        # 10,000 tokens: floors nvfp4 12.5 ms at 800 TFLOPS (25 at fp16_acc), fp8 25 ms at 400; no attention/recurrence.
+        trace = self.trace({"matmul:nvfp4": 600.0, "matmul:fp8": 300.0, "matmul": 10.0, "other": 80.0})
+        found = headroom.prefill_terms(result, trace, rates, ["long"])
+        terms = found["cases"]["long"]["terms"]
+        self.assertEqual(list(found["cases"]), ["long"])   # a traced case the result did not measure is left out
+        self.assertAlmostEqual(terms["matmul:nvfp4"]["floor_ms"], 12.5)
+        self.assertAlmostEqual(terms["matmul:nvfp4"]["floor_own_ms"], 50.0)   # 10,000 x 1e9 at 200 TFLOPS
+        self.assertNotIn("floor_own_ms", terms["matmul:unknown"])
+        self.assertEqual(terms["matmul:unknown"], {"measured_ms": 10.0, "floor_ms": 0.0})
+        self.assertEqual(terms["host"], {"measured_ms": 10.0, "floor_ms": 0.0})
+        gaps = {gap["term"]: gap for gap in found["gaps"]}
+        # Each term at its floor, all else as traced: 1,000 ms -> 1,000 - (600 - 12.5) ms for the NVFP4 matmul.
+        self.assertAlmostEqual(gaps["matmul:nvfp4"]["projected_gain"], 1000 / (1000 - 587.5) - 1)
+        self.assertAlmostEqual(gaps["other"]["projected_gain"], 1000 / 920 - 1)
+        self.assertEqual(gaps["host"]["name"], "prefill the host's share of the first token at zero")
+        self.assertNotIn("attention", gaps)   # at its floor already: no gap
+        # Without a format of any matmul kernel, matmul is one term against the whole matmul floor.
+        whole = headroom.prefill_terms(result, self.trace({"matmul": 900.0}), rates, ["long"])["cases"]["long"]["terms"]
+        self.assertAlmostEqual(whole["matmul"]["floor_ms"], 37.5)
+        self.assertIsNone(headroom.prefill_terms({**result, "ceiling": None}, trace, rates, ["long"]))
+
+    def test_status_shows_the_traced_terms_and_their_gaps_after_the_prefills(self):
+        base = ActivationCeilingTests()
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
+        result = {**MEASURED, **base.result(), "device": {"mma_tflops": base.RATES}}
+        result["headroom"]["gaps"] = [{"kpi": "decode", "name": "d", "projected_gain": 0.1},
+                                      {"kpi": "ttft", "name": "t", "projected_gain": 0.1}]
+        # The engine reports its own prefill and first token (an adapter's generate, crit serve's telemetry).
+        result["speed"]["cases"]["long"]["samples"] = [{"warmup": False, "prefill_ms": 900.0, "first_token_ms": 950.0}]
+        with tempfile.TemporaryDirectory() as directory:
+            path, kernels = Path(directory) / "result.json", Path(directory) / "kernels.json"
+            path.write_text(json.dumps(result))
+            kernels.write_text(json.dumps(self.trace({"matmul:nvfp4": 600.0, "matmul:fp8": 300.0})))
+            current = status.status_of(path, protocol, kernels_path=kernels)
+            bare = Path(directory) / "bare.json"
+            bare.write_text(json.dumps({**result, "ceiling": None}))
+            with self.assertRaisesRegex(SystemExit, "no model arithmetic"):
+                status.status_of(bare, protocol, kernels_path=kernels)
+        names = [gap["name"] for gap in current["gaps"]]
+        self.assertEqual(names[0], "d")
+        self.assertEqual(names[1:4], ["prefill at its compute ceiling", "prefill matmul:nvfp4 at its floor",
+                                      "prefill matmul:fp8 at its floor"])
+        self.assertEqual(names[-1], "time to first token at its floor")
+        text = status.render(current)
+        self.assertIn("prefill by term (kernel trace of toy, prefill as one output token on a fresh prompt", text)
+        self.assertIn("long (10,000 tokens, 1,000.0 ms): matmul:nvfp4 600.0 vs 12.5, matmul:fp8 300.0 vs 25.0", text)
+        self.assertEqual(current["kpis"]["ttft"]["cases"]["long"]["outside_engine_ms"], 1050.0)
+        self.assertIn("ttft by part: long 2,000 ms: engine 950.0 ms (prefill 900.0) + outside the engine 1,050.0 ms; "
+                      "traced fresh first token 1,000.0 ms = GPU 990.0 + host 10.0", text)
+        self.assertNotIn("short", text.split("ttft by part:")[1].splitlines()[0])   # nothing reported for it
 
 
 class HeldoutTests(unittest.TestCase):
@@ -1025,6 +1282,79 @@ class SampledSpeedTests(unittest.TestCase):
                                          disturbed_spread=0.25)
         self.assertEqual(found["status"], "measured")   # judged on the two full-length replies alone
 
+    def test_adaptive_sampling_repeats_a_case_until_its_error_reaches_the_target(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"speed": [{"id": "a", "kind": "prose", "prompt_ids": [1, 2], "output_tokens": 17}],
+                    "sampling": {"temperature": 1.0}, "sampling_source": "protocol_default"}
+
+        class Engine:
+            """Seed 2's text drafts twice as many tokens per round as every other seed's."""
+            def __init__(self, uneven=True):
+                self.uneven, self.seeds = uneven, []
+
+            def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
+                self.seeds.append(sampling["seed"])
+                per_round = 4 if self.uneven and sampling["seed"] == 2 else 2
+                for i in range(0, n, per_round):
+                    time.sleep(0.02)
+                    on_tokens([5] * min(per_round, n - i))
+                return {"tokens": [5] * n, "rounds": -(-(n - 1) // per_round)}
+        rule = protocol["sampled_speed"]["adaptive"]
+        fixed = Engine()
+        found = runner.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None)
+        case = found["cases"]["a"]
+        self.assertEqual((fixed.seeds, case["repetitions"], found["adaptive"]), ([0, 1, 2, 3], 3, None))
+        self.assertGreater(case["decode_se"], rule["target_se"])
+        error, deviation = metrics.case_error([s["decode_tps"] for s in case["samples"] if not s["warmup"]])
+        self.assertEqual(case["repetitions_for_target"], math.ceil((deviation / rule["target_se"]) ** 2))
+        # On request: further seeds until the error reaches the target, here the cap, since seed 2 stays an outlier.
+        adaptive = Engine()
+        found = runner.run_sampled_speed(adaptive, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+                                         adaptive=True)
+        self.assertEqual(adaptive.seeds, [0, 1, 2, 3] + list(range(4, rule["max_repetitions"] + 1)))
+        self.assertEqual(found["cases"]["a"]["repetitions"], rule["max_repetitions"])
+        self.assertEqual(found["adaptive"], {"target_se": rule["target_se"], "max_repetitions": rule["max_repetitions"]})
+        even = Engine(uneven=False)
+        runner.run_sampled_speed(even, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None, adaptive=True)
+        self.assertEqual(even.seeds, [0, 1, 2, 3])   # already within the target
+        current = status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0}, "speed": {"cases": {}}},
+                               protocol)
+        text = status.render(current)
+        self.assertIn(f"repeated until each case's error reached {rule['target_se']:.0%} or {rule['max_repetitions']} "
+                      "repetitions; largest case errors a ", text)
+
+    def test_from_0_2_0_runs_repeat_sampled_cases_adaptively_unless_told_not_to(self):
+        from crit_eval import cli
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            seen = {}
+
+            def sampled(*args, adaptive=False, **kwargs):
+                seen.setdefault("adaptive", []).append(adaptive)
+                return {"status": "unsupported", "reason": "fixture"}
+            with patch.object(runner, "run_sampled_speed", sampled):
+                for options in ({}, {"adaptive_sampled": False}, {"repetitions": 2}):
+                    runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 128}, parts=("speed",),
+                               warmups=0, log=lambda message: None, **options)
+        # The default, the opt-out, and a fixed repetition count, which is never extended.
+        self.assertEqual(seen["adaptive"], [True, False, False])
+        parsed = {}
+        with patch.object(cli, "_command", lambda args: parsed.update(vars(args)) or 0):
+            cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o"])
+            self.assertTrue(parsed["adaptive_sampled"])
+            cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--no-adaptive-sampled"])
+            self.assertFalse(parsed["adaptive_sampled"])
+        # A sampled decode repeated adaptively compares only with one repeated the same way.
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.2.0",
+               "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
+                                 "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
+        before = copy.deepcopy(now)
+        before["sampled_speed"]["decode_score"] = 100.0
+        self.assertAlmostEqual(status.changes(now, before)["decode_score"], 0.1)
+        before["sampled_speed"]["adaptive"] = None
+        self.assertIsNone(status.changes(now, before)["decode_score"])
+
     def test_the_decode_score_carries_its_standard_error_and_small_changes_read_as_noise(self):
         # Two cases of three repetitions: log spreads give each case's variance of its mean.
         found = metrics.score_error([[100.0, 110.0, 90.0], [200.0, 200.0, 200.0]])
@@ -1115,7 +1445,8 @@ class StatusTests(unittest.TestCase):
             self.assertIsNone(current["kpis"]["perplexity"])
             self.assertIsNone(current["kpis"]["kl_divergence"])
             text = status.render(current)
-            self.assertIn("quality: quality is measured through crit serve's score call", text)
+            # The mock scores in process (development evidence) but the fixture's data holds no reference scores.
+            self.assertIn("quality: the data holds no reference scores", text)
             self.assertNotIn("polished", text)
             # The stop-record shape is what `crit run ... stop` validates.
             # crit run's records, from a crit checkout beside this one or the installed crit, when there is one.
@@ -1137,6 +1468,42 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(again["baseline"]["decode_score"], 0.0)
             self.assertEqual(again["stop_record_headroom"]["kpis"][0]["start"],
                              again["stop_record_headroom"]["kpis"][0]["reached"])  # the baseline is the start
+
+    def test_the_prefill_ceiling_takes_the_raw_tensor_core_rate_where_it_beats_the_gemm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            gemm = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}})
+            raw = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0},
+                                            "mma_tflops": {"fp8": 2.0, "bf16": 0.5}})
+        # The fixture's arithmetic is all FP8: twice the rate halves the compute floor.
+        compute = lambda result: result["headroom"]["ttft"]["cases"]["long"]["floor"]["compute_ms"]  # noqa: E731
+        self.assertAlmostEqual(compute(gemm), 2 * compute(raw))
+        self.assertEqual(raw["headroom"]["rates"], {"tflops": {"fp8": 2.0, "bf16": 1.0},
+                                                    "sources": {"fp8": "raw MMA", "bf16": "cuBLASLt GEMM"}})
+        self.assertEqual(raw["device"]["mma_tflops"], {"fp8": 2.0, "bf16": 0.5})
+        # The result records the arithmetic it was priced on, and the ceilings by prompt activation format.
+        self.assertEqual(raw["ceiling"]["matmul_flops_per_token"], {"fp8": 1e8})
+        self.assertEqual(list(raw["headroom"]["activations"]["modes"]), ["bf16", "fp16_acc", "fp8", "stored"])
+        self.assertTrue(any(m.startswith("prompt_activations from the adapter") for m in raw["headroom"]["missing"]))
+        with tempfile.TemporaryDirectory() as directory:
+            declared = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}},
+                                     prompt_activations="bf16")
+        self.assertEqual(declared["headroom"]["activations"]["declared"]["label"], "fp8 bf16")
+        self.assertIsNone(declared["headroom"]["activations"]["declared"]["state"])   # quality not scored
+        room = {**raw["headroom"], "prefill": {"score": 800.0, "ceiling_score": 1000.0, "fraction_of_ceiling": 0.8,
+                                               "cases": {}}}
+        text = status.render(status.build({**raw, "headroom": room}, runner.load_json(runner.EVAL_DIR / "protocol.json")))
+        self.assertIn("80% of its compute ceiling 1,000 (at fp8 2 TFLOPS raw MMA, bf16 1 TFLOPS cuBLASLt GEMM)", text)
+
+    def test_an_adapters_wider_draft_is_opened_after_its_engine_for_its_acceptance(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}},
+                                   wider_draft={"width": 6, "config": {"draft_tokens": 6}})
+        wider = result["speed"]["wider_draft"]
+        self.assertEqual((wider["width"], wider["engine_width"], wider["config"]), (6, 6, {"draft_tokens": 6}))
+        self.assertEqual(set(wider["cases"]), {"short", "long"})
+        self.assertIn("wider_draft", result["timing"]["parts"])
+        self.assertEqual(result["headroom"]["projection"]["probed_width"], 6)
+        self.assertEqual(len(result["headroom"]["cases"]["short"]["tokens_by_width"]), 7)
 
     def test_run_sets_its_own_drift_budget_and_can_require_exactness(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1609,6 +1976,36 @@ class ContextTests(unittest.TestCase):
         self.assertEqual([row["kpi"] for row in rows][-2:], ["context_decode", "context_ttft"])
         self.assertIn("context  8,192 tokens required (given); engine holds 8,192", status.render(current))
 
+    def test_free_device_memory_at_the_required_context_sits_beside_the_capacity_gate(self):
+        readings = iter([{"index": 0, "free_bytes": 3_000_000_000, "used_bytes": 29_000_000_000,
+                          "total_bytes": 32_000_000_000},
+                         {"index": 0, "free_bytes": 1_000_000_000, "used_bytes": 31_000_000_000,
+                          "total_bytes": 32_000_000_000}])
+        with tempfile.TemporaryDirectory() as directory, patch.object(runner.host, "device_memory",
+                                                                     side_effect=lambda: next(readings)):
+            data = Path(directory)
+            fixture(data)
+            result = runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 1 << 20},
+                                parts=("context",), log=lambda message: None, context_tokens=4096)
+        memory = result["context"]["device_memory"]
+        self.assertEqual((memory["free_bytes"], memory["least_at"]), (1_000_000_000, "after_curve"))
+        self.assertEqual(memory["after_load"]["free_bytes"], 3_000_000_000)
+        text = status.render(result["status"])
+        self.assertIn("device memory free 1.00 of 32.0 GB (after curve)", text)
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        before = {**result, "context": {**result["context"], "device_memory": {**memory, "free_bytes": 1_500_000_000}}}
+        compared = status.build(result, protocol, before)
+        self.assertAlmostEqual(compared["baseline"]["free_memory_bytes"], -500_000_000)
+        self.assertIn("device memory free -0.50 GB", status.render(compared))
+        with patch.object(host, "_nvidia_smi", return_value="nvidia-smi"), \
+                patch.object(host, "_query", return_value=[["0", "100", "200", "300"], ["1", "5", "6", "11"]]), \
+                patch.dict(host.os.environ, {"CUDA_VISIBLE_DEVICES": "1"}):
+            self.assertEqual(host.device_memory(), {"index": 1, "free_bytes": 5 * host.MIB, "used_bytes": 6 * host.MIB,
+                                                    "total_bytes": 11 * host.MIB})
+            self.assertEqual(host.device_memory(0)["free_bytes"], 100 * host.MIB)
+        with patch.object(host, "_nvidia_smi", return_value=None):
+            self.assertIsNone(host.device_memory())
+
     def test_context_gates_fail_when_the_engine_cannot_serve_a_context(self):
         with tempfile.TemporaryDirectory() as directory:
             failing = self.run_mock(directory, 8192, fails_above_context=4096)
@@ -1787,7 +2184,7 @@ class QualityTests(unittest.TestCase):
         protocol["quality"]["honesty"] = dict(protocol["quality"]["honesty"], sets=list(honesty_sets))
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
-        quality = runner.run_quality(engine, {"max_context": max_context}, {"quality": texts}, protocol,
+        quality = runner.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
                                      lambda message: None, self.reference(texts), thresholds, spread)
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
                   "protocol": protocol["protocol"], "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
@@ -1818,6 +2215,94 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(quality["passed"])
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("served replies scored alike", self.gate(current)["detail"])
+
+    def test_a_sets_share_of_the_budget_carries_its_spread_over_its_positions(self):
+        ref = {"logprob": -1.0, "top_ids": [7, 8], "top_logprobs": [math.log(0.6), math.log(0.3)]}
+        same = {"logprob": -1.0, "top": [[7, math.log(0.6)], [8, math.log(0.3)]]}
+        moved = {"logprob": -1.0, "top": [[7, math.log(0.3)], [8, math.log(0.6)]]}
+        limits = {"kld_mean_max": 0.05, "kld_p99_max": 0.5, "ppl_ratio_max": 1.05}
+        # 6,400 positions; one 64-position stretch moved: the p99 rests on whether a resample holds that stretch.
+        rows = [moved if 1000 <= i < 1064 else same for i in range(6400)]
+        found = metrics.budget_spread([ref] * 6400, rows, limits, block=64, draws=200, seed=0)
+        self.assertEqual(found, metrics.budget_spread([ref] * 6400, rows, limits, block=64, draws=200, seed=0))
+        whole = metrics.budget_used(metrics.text_quality([ref] * 6400, rows), limits)
+        self.assertLess(found["budget_used"]["p05"], whole)
+        self.assertGreater(found["budget_used"]["p95"], whole)
+        self.assertEqual(found["kld_p99"]["p05"], 0.0)   # resamples that miss the stretch
+        self.assertEqual(found["method"], "block bootstrap: 200 resamples of 64-position blocks")
+        even = metrics.budget_spread([ref] * 6400, [same] * 6400, limits)
+        self.assertEqual((even["budget_used"]["p05"], even["budget_used"]["p95"]), (0.0, 0.0))
+        self.assertIsNone(metrics.budget_spread([ref] * 10, [same] * 10, limits))   # a single block
+        # Every set and path carries it, and status prints the worst set's beside its share.
+        result, current = self.measure(self.Engine(self, drift_from=500, shift=0.3, prompt_only=True))
+        self.assertIsNone(result["quality"]["sets"]["conversations/served"].get("budget_spread"))   # one block
+        spread = result["quality"]["sets"]["long-600/prompt"]["budget_spread"]
+        self.assertEqual(current["kpis"]["kl_divergence"]["budget_used_spread"], spread["budget_used"])
+        self.assertIn(f"(long-600/prompt, {spread['budget_used']['p05']:.0%}-{spread['budget_used']['p95']:.0%} over "
+                      "resamples of its positions (5th-95th percentile))", status.render(current))
+
+    def test_an_in_process_adapters_scores_are_development_evidence_not_a_gate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            prepared = fixture(data)
+            texts = prepared["quality"]
+            with patch.object(runner.fixed, "load", return_value={t["id"]: [
+                    {"logprob": math.log(0.5), "top_ids": [token] + [(token + j) % 1000 for j in range(1, 16)],
+                     "top_logprobs": [math.log(0.5)] + [math.log(0.5 / 15)] * 15}
+                    for token in (t["prompt_ids"] + t["continuation_ids"])[1:]] for t in texts}):
+                result = runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 128},
+                                    parts=("quality",), log=lambda message: None)
+        quality = result["quality"]
+        self.assertEqual((quality["status"], quality["evidence"], quality["passed"]), ("scored", "development", True))
+        self.assertIsNone(quality["honesty"]["passed"])   # no chat API to reply over
+        gate = next(g for g in result["status"]["gates"] if g["name"] == "quality")
+        self.assertEqual(gate["state"], "unmeasured")
+        self.assertTrue(gate["detail"].startswith("development evidence from the adapter's own scores, not a gate result "
+                                                  "(every set within the budget)"))
+        self.assertIn("quality  pass (development evidence: the adapter's own scores, not a gate result)",
+                      status.render(result["status"]))
+
+    def test_drift_is_attributed_to_the_declared_exact_variants(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            texts = fixture(data)["quality"]
+            reference = {t["id"]: [{"logprob": math.log(0.5), "top_ids": [token] + [(token + j) % 1000 for j in range(1, 16)],
+                                    "top_logprobs": [math.log(0.5)] + [math.log(0.5 / 15)] * 15}
+                                   for token in (t["prompt_ids"] + t["continuation_ids"])[1:]] for t in texts}
+            # The mock moves 0.2 of the probability off each text token; one variant restores all of it, one half.
+            config = {"max_context": 128, "score_drift": 0.2,
+                      "exact_variants": {"all exact": {"score_drift": 0.0},
+                                         "half": {"config": {"score_drift": 0.1}, "description": "one group exact"}}}
+            opened = []
+            original = runner.open_engine
+
+            def counting(module, model, config, *args, **kwargs):
+                opened.append(config.get("score_drift"))
+                return original(module, model, config, *args, **kwargs)
+            with patch.object(runner.fixed, "load", return_value=reference), patch.object(runner, "open_engine", counting):
+                result = runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=("quality",),
+                                    log=lambda message: None, quality_budget={"ppl_ratio_max": 2.0, "kld_mean_max": 1.0,
+                                                                              "kld_p99_max": 1.0},
+                                    attribute_drift=True)
+                plain = runner.run(MOCK, "unused-model", data, data / "plain.json", config, parts=("quality",),
+                                   log=lambda message: None)
+        self.assertEqual(opened, [0.2, 0.0, 0.1, 0.2])   # the engine, each variant after it, then the plain run's
+        found = result["quality"]["attribution"]
+        base = found["base"]["conversations/served"]
+        self.assertGreater(base, 0)
+        whole, half = found["variants"]["all exact"], found["variants"]["half"]
+        self.assertAlmostEqual(whole["budget_used"]["conversations/served"], 0.0)
+        self.assertAlmostEqual(whole["share"]["conversations/served"], base)
+        self.assertTrue(0 < half["share"]["conversations/served"] < base)
+        self.assertEqual((half["description"], half["config"]), ("one group exact", {"score_drift": 0.1}))
+        self.assertNotIn("attribution", plain["quality"])   # only on request
+        text = status.render(result["status"])
+        self.assertIn("drift attribution (share of the budget each exact variant takes away", text)
+        self.assertIn(f"all exact conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact), "
+                      f"conversations/served {base:+.0%} (0% with it exact); half", text)
+        missing = runner.run_attribution(None, None, {}, {}, runner.load_json(runner.EVAL_DIR / "protocol.json"),
+                                         lambda m: None, None, {}, None, result["quality"], None)
+        self.assertEqual(missing["status"], "unmeasured")
 
     def test_a_set_far_over_the_budget_stops_the_scoring(self):
         # protocol quality.fail_fast: the conversations drift ten times the budget's mean KLD, so the long set is not

@@ -2,8 +2,10 @@
 
 Builds probe/device_probe.cu with nvcc (CUDA toolkit with cuBLASLt), runs it several times and
 keeps the median of each value: achievable copy bandwidth (GB/s, bytes read plus written) for
-the decode pass floor, and dense GEMM TFLOPS per weight format (bf16, fp8, nvfp4) for the
-prefill floor. It also keeps the least free device memory any run saw, for the max context,
+the decode pass floor, dense cuBLASLt GEMM TFLOPS per weight format (bf16, fp8, nvfp4) and raw
+tensor-core (mma.sync) TFLOPS per input and accumulator format (bf16, fp16, fp16_acc, fp8, nvfp4,
+fp4_fp8) for the prefill floor, which takes the better of the two per format
+(crit_eval.ceiling.best_rates). It also keeps the least free device memory any run saw, for the max context,
 the host's physical and available memory, and host-to-device rates per transfer size (pinned
 copy, pageable copy, mapped read) for engines that keep weights in host memory. Pass the file to `crit eval run --device
 device.json`. Probe on the machine and in the environment the engine runs in, with the same
@@ -55,15 +57,33 @@ def host_compiler():
     return ["-ccbin", str(max(compilers, key=version).parent)] if compilers else []
 
 
+def architecture():
+    """nvcc's target for the device the probe measures: its compute capability, with the architecture-specific
+    suffix from 9.0 on (sm_90a, sm_100a, sm_120a), whose raw FP4 tensor-core instructions the probe times;
+    -arch=native when nvidia-smi cannot name it."""
+    try:
+        done = subprocess.run(["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader", "-i", "0"],
+                              capture_output=True, text=True, timeout=30)
+        major, minor = done.stdout.strip().split(".")
+        cc = int(major) * 10 + int(minor)
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return ["-arch=native"]
+    suffix = "a" if cc >= 90 else ""
+    return ["-gencode", f"arch=compute_{cc}{suffix},code=sm_{cc}{suffix}"]
+
+
 def build(nvcc, directory):
     binary = Path(directory) / ("device_probe.exe" if os.name == "nt" else "device_probe")
     # The host measurements use this CPU's vector width (AVX2 on Windows, every extension elsewhere).
     vector = ["-Xcompiler", "/arch:AVX2"] if os.name == "nt" else ["-Xcompiler", "-march=native"]
     command = [nvcc, *host_compiler(), "-O2", "-std=c++17", *vector, "-o", str(binary), str(SOURCE), "-lcublasLt"]
-    done = subprocess.run(command, capture_output=True, text=True)
-    if done.returncode != 0:   # nvcc reports a missing host compiler on stdout
-        raise SystemExit("building the device probe failed:\n" + (done.stdout + done.stderr)[-4000:])
-    return binary
+    # The device's own architecture; an nvcc that does not know it builds for the native one.
+    for target in (architecture(), ["-arch=native"]):
+        done = subprocess.run(command[:1] + target + command[1:], capture_output=True, text=True)
+        if done.returncode == 0:
+            return binary
+    # nvcc reports a missing host compiler on stdout
+    raise SystemExit("building the device probe failed:\n" + (done.stdout + done.stderr)[-4000:])
 
 
 def host_to_device(samples, key="host_to_device_gbs"):
@@ -99,6 +119,8 @@ def combine(samples):
         "cuda_runtime": first.get("cuda_runtime"),
         "bandwidth_gbs": metrics.median([s["bandwidth_gbs"] for s in samples if s.get("bandwidth_gbs")]),
         "tflops": {f: metrics.median([s["tflops"][f] for s in samples if f in s.get("tflops", {})]) for f in formats},
+        # Raw tensor-core TFLOPS per input and accumulator format (mma.sync, operands in registers).
+        "mma_tflops": medians(samples, "mma_tflops"),
         # Host to device GB/s per kind (pinned, pageable, mapped_read) and transfer size in bytes, and back.
         "host_to_device_gbs": host_to_device(samples),
         "device_to_host_gbs": host_to_device(samples, "device_to_host_gbs"),
@@ -151,6 +173,7 @@ def probe(out, nvcc=None, repeats=3, log=print):
             samples.append(sample)
             log(f"probe {i + 1}/{repeats}: {sample['bandwidth_gbs']:.0f} GB/s, "
                 + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in sample.get("tflops", {}).items())
+                + "; raw MMA " + (", ".join(f"{k} {v:.0f}" for k, v in (sample.get("mma_tflops") or {}).items()) or "none")
                 + "; host memory read {read:.0f} GB/s, CPU {fp32:.0f} GFLOPS FP32".format(
                     read=(sample.get("host_memory_gbs") or {}).get("read", 0),
                     fp32=(sample.get("cpu_gflops") or {}).get("fp32", 0)))

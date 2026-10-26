@@ -29,7 +29,10 @@ the numbers about how to build.
 `run` writes the same status into the result and prints it. With --baseline, the KPIs also
 show the change from an earlier result of the same model and suite.
 """
+from pathlib import Path
+
 from . import headroom, load_json, metrics, protocol_series
+from .ceiling import best_rates
 
 
 def _gates(result):
@@ -98,6 +101,7 @@ def _quality_gate(result):
         return {"name": "quality", "state": "unmeasured", "detail": quality["reason"]}
     if state == "skipped":
         return {"name": "quality", "state": "fail", "detail": quality["reason"]}
+    development = quality.get("evidence") == "development"
     failures = [f"{name}: {', '.join(s['failures'])}" for name, s in quality["sets"].items() if not s["passed"]]
     honesty = quality.get("honesty") or {}
     if honesty.get("passed") is False:
@@ -114,6 +118,11 @@ def _quality_gate(result):
         detail += "; judged against the reference's own spread: " + ", ".join(
             f"{name} ({', '.join(f'{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}' for k in quality['sets'][name]['raised'])})"
             for name in raised)
+    if development:
+        # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).
+        return {"name": "quality", "state": "unmeasured",
+                "detail": "development evidence from the adapter's own scores, not a gate result ("
+                          + ("every set within the budget" if not failures else "over the budget") + "): " + detail}
     return {"name": "quality", "state": "fail" if failures else "pass", "detail": detail}
 
 
@@ -311,7 +320,10 @@ def _quality_kpi(quality, thresholds):
     worst = {key: max(((s[key], name) for name, s in sets.items()), key=lambda v: v[0])
              for key in ("kld_mean", "kld_p99", "ppl_ratio")}
     lowest_top1 = min(((s["top1_agreement"], name) for name, s in sets.items()), key=lambda v: v[0])
-    return {"passed": quality["passed"], "sets": list(sets),
+    spread = (sets.get(used[1]) or {}).get("budget_spread") or {}
+    return {"passed": quality["passed"], "sets": list(sets), "evidence": quality.get("evidence", "served"),
+            # The worst set's share over resamples of its positions (metrics.budget_spread), 5th to 95th percentile.
+            "budget_used_spread": spread.get("budget_used"), "budget_used_spread_method": spread.get("method"),
             "worst_kld_mean": worst["kld_mean"][0], "worst_kld_mean_set": worst["kld_mean"][1],
             "worst_kld_p99": worst["kld_p99"][0], "worst_kld_p99_set": worst["kld_p99"][1],
             "worst_ppl_ratio": worst["ppl_ratio"][0], "worst_ppl_ratio_set": worst["ppl_ratio"][1],
@@ -328,7 +340,8 @@ def _quality_kpis(quality, thresholds):
     if q is None:
         return None, None
     shared = {"passed": q["passed"], "sets": q["sets"], "budget_used": q["budget_used"],
-              "budget_used_set": q["budget_used_set"]}
+              "budget_used_set": q["budget_used_set"], "evidence": q["evidence"],
+              "budget_used_spread": q["budget_used_spread"], "budget_used_spread_method": q["budget_used_spread_method"]}
     perplexity = {"worst_ratio": q["worst_ppl_ratio"], "worst_set": q["worst_ppl_ratio_set"],
                   "limit": q["limits"]["ppl_ratio"], **shared}
     kl_divergence = {"worst_mean": q["worst_kld_mean"], "worst_mean_set": q["worst_kld_mean_set"],
@@ -336,6 +349,118 @@ def _quality_kpis(quality, thresholds):
                      "limits": {"mean": q["limits"]["kld_mean"], "p99": q["limits"]["kld_p99"]},
                      "lowest_top1": q["lowest_top1"], "lowest_top1_set": q["lowest_top1_set"], **shared}
     return perplexity, kl_divergence
+
+
+def _activations_kpi(found):
+    if not found:
+        return None
+    keep = ("ceiling_score", "ttft_floor_ms", "state", "evidence")
+    return {"formats": found["formats"],
+            "modes": {name: {k: row.get(k) for k in keep} | {"rates": row.get("rates")} for name, row in found["modes"].items()},
+            "declared": {k: found["declared"].get(k) for k in keep + ("activations", "label")} if found["declared"] else None,
+            "reachable": {k: v for k, v in found["reachable"].items() if k != "cases"} if found["reachable"] else None}
+
+
+def _render_activations(a, stored):
+    """The prefill ceilings by the quantized matrices' prompt activations, the evidence and the reachable limit."""
+    modes = a["modes"]
+    lines = [f"  prefill by prompt activations of the {' and '.join(a['formats'])} matrices: ceilings "
+             + ", ".join(f"{name} {_num(row['ceiling_score'], ',.0f')}" for name, row in modes.items()) + " tok/s"
+             + "; TTFT floors " + ", ".join(f"{name} {_num(row['ttft_floor_ms'], ',.0f')}" for name, row in modes.items())
+             + " ms (rates " + ", ".join(sorted({f"{r['rate']} {r['tflops']:,.0f}" for row in modes.values()
+                                                for r in row["rates"].values() if r.get("tflops")})) + " TFLOPS)"]
+    own = a.get("declared")
+    if own:
+        state = {"passes": "quality passes with it", "fails": "quality fails with it"}.get(own["state"], "quality not judged")
+        lines.append(f"    this engine's own ({own['label']}): {_num(own['ceiling_score'], ',.0f')} tok/s, TTFT floor "
+                     f"{_num(own['ttft_floor_ms'], ',.0f')} ms; {state}")
+    for kind, word in (("fails", "ruled out by quality"), ("passes", "shown passing by quality")):
+        named = [f"{name} ({'; '.join(row['evidence'])})" for name, row in modes.items() if row["state"] == kind]
+        if named:
+            lines.append(f"    {word}: " + ", ".join(named))
+    reach = a.get("reachable")
+    if reach:
+        lines.append(f"    reachable limit {reach['ceiling_score']:,.0f} tok/s (prompt activations {reach['label']}), "
+                     f"TTFT floor {_num(reach['ttft_floor_ms'], ',.0f')} ms, next to the stored-format "
+                     f"{_num(stored, ',.0f')} tok/s")
+    else:
+        lines.append("    reachable limit unknown: no prompt activations shown passing by quality")
+    return lines
+
+
+def _traced_first_token(room, case_id):
+    """A kernel trace's fresh first token of a case (status --kernels): its time, the GPU's busy time in it and the
+    host's rest."""
+    entry = (((room.get("prefill_terms") or {}).get("cases") or {}).get(case_id) or {})
+    host = (entry.get("terms") or {}).get("host")
+    if not host or entry.get("trace_ms") is None:
+        return {}
+    return {"trace_first_token_ms": entry["trace_ms"], "trace_gpu_ms": entry["trace_ms"] - host["measured_ms"],
+            "trace_host_ms": host["measured_ms"]}
+
+
+def _render_attribution(attribution, worst):
+    """Each exact variant's share of the drift budget (protocol quality.attribution), on the worst set first."""
+    if not attribution:
+        return []
+    if attribution.get("status") != "measured":
+        return [f"  drift attribution unmeasured: {attribution.get('reason')}"]
+    rows = []
+    for name, row in attribution["variants"].items():
+        shares = row.get("share") or {}
+        order = ([worst] if worst in shares else []) + [s for s in shares if s != worst]
+        rows.append(f"{name} " + ", ".join(f"{s} {shares[s]:+.0%} ({row['budget_used'][s]:.0%} with it exact)"
+                                           for s in order[:3]))
+    base = attribution.get("base", {}).get(worst)
+    return [f"  drift attribution (share of the budget each exact variant takes away; full engine {worst} "
+            f"{_pct(base)}; shares interact): " + "; ".join(rows)]
+
+
+def _render_ttft_parts(t):
+    """Each case's time to first token split into the engine's own time and the rest, and the trace's GPU and host."""
+    parts = []
+    for case_id, row in t["cases"].items():
+        bits = []
+        if row.get("outside_engine_ms") is not None:
+            engine = row.get("engine_first_token_ms", row.get("engine_prefill_ms"))
+            bits.append(f"engine {engine:,.1f} ms" + (f" (prefill {row['engine_prefill_ms']:,.1f})"
+                                                      if row.get("engine_prefill_ms") is not None
+                                                      and row.get("engine_first_token_ms") is not None else "")
+                        + f" + outside the engine {row['outside_engine_ms']:,.1f} ms")
+        if row.get("trace_first_token_ms") is not None:
+            bits.append(f"traced fresh first token {row['trace_first_token_ms']:,.1f} ms = GPU {row['trace_gpu_ms']:,.1f} "
+                        f"+ host {row['trace_host_ms']:,.1f}")
+        if bits:
+            parts.append(f"{case_id} {_num(row.get('ttft_ms'), ',.0f')} ms: " + "; ".join(bits))
+    return ["  ttft by part: " + "; ".join(parts)] if parts else []
+
+
+def _render_terms(terms):
+    """Each traced case's prefill GPU time per floor term against the term's floor."""
+    lines = [f"  prefill by term (kernel trace of {terms.get('engine')}, prefill as "
+             f"{terms.get('prefill_request') or 'the request up to its first token'}; measured vs floor ms):"]
+    for case_id, row in terms["cases"].items():
+        named = f"; {row['named_ms']:,.1f} ms of kernels classed by name" if row.get("named_ms") else ""
+        lines.append(f"    {case_id} ({row['prompt_tokens']:,} tokens, {row['trace_ms']:,.1f} ms): " + ", ".join(
+            f"{term} {t['measured_ms']:,.1f} vs {t['floor_ms']:,.1f}"
+            + (f" ({t['floor_own_ms']:,.1f} at its own prompt activations)" if t.get("floor_own_ms") is not None else "")
+            for term, t in row["terms"].items()) + named)
+    return lines
+
+
+def _case_errors(sampled, protocol):
+    """Each sampled case's relative standard error, repetitions and the repetitions the protocol's target_se would take
+    (runner.run_sampled_speed records them; a result from before crit-eval-v0.1.6 has them derived from its samples)."""
+    target = (protocol["sampled_speed"].get("adaptive") or {}).get("target_se")
+    found = {}
+    for case_id, case in sampled.get("cases", {}).items():
+        speeds = [s["decode_tps"] for s in case.get("samples", []) if not s.get("warmup") and s.get("decode_tps")]
+        error, deviation = metrics.case_error(speeds)
+        if case.get("status") == "measured" and error is not None:
+            found[case_id] = {"decode_se": case.get("decode_se", error), "repetitions": case.get("repetitions", len(speeds)),
+                              "repetitions_for_target": case.get("repetitions_for_target",
+                                                                 metrics.repetitions_for(deviation, target))}
+    return found
 
 
 def headline_decode(kpis):
@@ -354,6 +479,10 @@ def _context_kpi(result):
     return {"required": context.get("tokens"), "source": context.get("source"), "bound": context.get("bound"),
             "model_limit": context.get("model_limit"), "device_limit": context.get("device_limit"),
             "engine_max_context": context.get("engine_max_context"),
+            # The least device memory free with the engine at the requirement (protocol context.device_memory).
+            "free_memory_bytes": (context.get("device_memory") or {}).get("free_bytes"),
+            "memory_total_bytes": (context.get("device_memory") or {}).get("total_bytes"),
+            "free_memory_at": (context.get("device_memory") or {}).get("least_at"),
             "decode": room.get("decode") or {}, "ttft": room.get("ttft") or {},
             # The curve runs once per point: its noise is the speed suite's (greedy decode, prefill).
             "noise": {"decode": ((result.get("headroom") or {}).get("noise") or {}).get("context_decode"),
@@ -381,6 +510,11 @@ def build(result, protocol, baseline=None):
               "complete": decoded.get("complete"),
               # One standard error of the score, relative: device noise and, sampled, the texts the seeds drew.
               "standard_error": decoded.get("decode_se"),
+              # The sampled cases' own errors, the repetitions they took and would take for the protocol's target.
+              "case_errors": _case_errors(decoded, protocol) if suite == "sampled" else {},
+              "target_se": (decoded.get("target_se") or (protocol["sampled_speed"].get("adaptive") or {}).get("target_se")
+                            if suite == "sampled" else None),
+              "adaptive": decoded.get("adaptive") if suite == "sampled" else None,
               "speed_of_light": projection.get("speed_of_light_score"),
               "acceptance_bound": projection.get("acceptance_bound_score"),
               # "one token per pass": an engine that does not speculate, its ceiling every pass at its floor.
@@ -393,6 +527,13 @@ def build(result, protocol, baseline=None):
     spreads = room.get("noise") or {}
     prefill_kpi = {"score": prefill.get("score"), "ceiling": prefill.get("ceiling_score"),
                    "fraction_of_ceiling": prefill.get("fraction_of_ceiling"), "noise": spreads.get("prefill"),
+                   # The rate each format's floor takes and what achieved it (cuBLASLt GEMM or raw MMA).
+                   "rates": room.get("rates"),
+                   # Ceilings with the quantized matrices' prompt activations at each format, the engine's own, what
+                   # quality shows passing or rules out, and the reachable one (crit_eval.headroom.activation_ceilings).
+                   "activations": _activations_kpi(room.get("activations")),
+                   # A kernel trace joined to the floor's terms per case (crit eval status --kernels).
+                   "terms": room.get("prefill_terms"),
                    "cases": {cid: {k: row.get(k) for k in ("prompt_tokens", "ttft_ms", "prefill_tps", "ceiling_tps",
                                                             "efficiency")}
                              | {"floor_ms": (row.get("floor") or {}).get("total_ms")}
@@ -402,7 +543,12 @@ def build(result, protocol, baseline=None):
                 "fraction_of_floor": ttft.get("fraction_of_floor"),
                 "cases": {cid: {"prompt_tokens": row.get("prompt_tokens"), "ttft_ms": row.get("ttft_ms"),
                                 "floor_ms": (row.get("floor") or {}).get("total_ms"),
-                                "bound": (row.get("floor") or {}).get("bound"), "efficiency": row.get("efficiency")}
+                                "bound": (row.get("floor") or {}).get("bound"), "efficiency": row.get("efficiency"),
+                                # The engine's own prefill and first token and the rest (headroom.ttft_parts), and
+                                # with a kernel trace the GPU's busy time in its fresh first token.
+                                **{k: row[k] for k in ("engine_prefill_ms", "engine_first_token_ms",
+                                                       "outside_engine_ms") if row.get(k) is not None},
+                                **_traced_first_token(room, cid)}
                           for cid, row in ttft.get("cases", {}).items()}}
     e2e = room.get("end_to_end") or {}
     end_to_end = {"score": e2e.get("score"), "ceiling": e2e.get("ceiling_score"),
@@ -421,6 +567,9 @@ def build(result, protocol, baseline=None):
     greedy_kpi = ({"score": speed.get("decode_score"), "complete": speed.get("complete")}
                   if suite == "sampled" else None)
     perplexity, kl_divergence = _quality_kpis(result.get("quality"), protocol["quality"]["thresholds"])
+    attribution = (result.get("quality") or {}).get("attribution")
+    if kl_divergence is not None and attribution:
+        kl_divergence["attribution"] = attribution
     # The headline decode (with its ceilings) is the sampled suite's when it ran, else the greedy suite's.
     kpis = {"end_to_end": end_to_end, "decode_sampled": decode if suite == "sampled" else None,
             "decode_greedy": greedy_kpi if suite == "sampled" else decode, "prefill": prefill_kpi, "ttft": ttft_kpi,
@@ -461,6 +610,8 @@ def build(result, protocol, baseline=None):
     return status
 
 
+# The formats a checkpoint stores its matrices in (crit_eval.ceiling), whose rates the stored-format ceiling takes.
+STORED_FORMATS = ("bf16", "fp8", "nvfp4")
 GOAL_UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_decode": "tok/s", "context_ttft": "ms"}
 
 
@@ -565,7 +716,15 @@ def changes(result, baseline):
             if same_context else None,
             "worst_kld_mean": ratio(worst(q_now), worst(q_before)),
             "heldout_decode": ratio((result.get("heldout") or {}).get("decode_score"),
-                                    (baseline.get("heldout") or {}).get("decode_score"))}
+                                    (baseline.get("heldout") or {}).get("decode_score")),
+            # Device memory left free at the same required context, in bytes (more free is a gain).
+            "free_memory_bytes": (_free_memory(result) - _free_memory(baseline)
+                                  if same_context and _free_memory(result) is not None
+                                  and _free_memory(baseline) is not None else None)}
+
+
+def _free_memory(result):
+    return ((result.get("context") or {}).get("device_memory") or {}).get("free_bytes")
 
 
 def _change_error(result, baseline):
@@ -577,9 +736,9 @@ def _decode_change(result, baseline, same_text):
     """Change of the decode KPI: sampled decodes compare at the same sampling, greedy ones on the same text."""
     (suite, now), (suite_before, before) = headroom.decode_suite(result), headroom.decode_suite(baseline)
     if suite != suite_before or (suite == "greedy" and not same_text) or (
-            suite == "sampled" and (now.get("sampling"), now.get("sampling_source")) != (
-            before.get("sampling"), before.get("sampling_source"))):
-        return None
+            suite == "sampled" and (now.get("sampling"), now.get("sampling_source"), bool(now.get("adaptive"))) != (
+            before.get("sampling"), before.get("sampling_source"), bool(before.get("adaptive")))):
+        return None   # sampled decodes compare at the same sampling, both repeated adaptively or neither
     return now["decode_score"] / before["decode_score"] - 1 if now.get("decode_score") and before.get("decode_score") else None
 
 
@@ -656,6 +815,17 @@ def render(status):
         decode += f"; run-to-run spread {e['decode_noise']:.1%}"
     if d.get("standard_error") is not None:
         decode += f"; standard error {d['standard_error']:.1%}"
+    errors = d.get("case_errors") or {}
+    if errors:
+        worst = sorted(errors.items(), key=lambda item: -item[1]["decode_se"])[:2]
+        adaptive = d.get("adaptive")
+        decode += ("; repeated until each case's error reached "
+                   f"{adaptive['target_se']:.0%} or {adaptive['max_repetitions']} repetitions" if adaptive else "")
+        decode += "; largest case errors " + ", ".join(
+            f"{cid} {row['decode_se']:.1%} over {row['repetitions']} repetitions"
+            + (f" ({row['repetitions_for_target']} for {d['target_se']:.0%})"
+               if row.get("repetitions_for_target") and d.get("target_se") and row["decode_se"] > d["target_se"] else "")
+            for cid, row in worst)
     if d["complete"] is False:
         decode += "; incomplete (skipped cases)"
     lines.append(decode)
@@ -666,6 +836,10 @@ def render(status):
     prefill = f"  prefill  {_num(p['score'], ',.0f')} tok/s"
     if p["ceiling"]:
         prefill += f", {_pct(p['fraction_of_ceiling'])} of its compute ceiling {p['ceiling']:,.0f}"
+        rates = p.get("rates") or {}
+        if rates.get("tflops"):
+            prefill += " (at " + ", ".join(f"{name} {value:,.0f} TFLOPS {rates['sources'].get(name, '')}".rstrip()
+                                           for name, value in rates["tflops"].items() if name in STORED_FORMATS) + ")"
     for cid, row in p["cases"].items():
         if row.get("ttft_ms"):
             prefill += f"; {cid} {row['ttft_ms']:,.0f} ms to first token"
@@ -674,6 +848,10 @@ def render(status):
     if p.get("noise") is not None:
         prefill += f"; run-to-run spread {p['noise']:.1%}"
     lines.append(prefill)
+    if p.get("activations"):
+        lines += _render_activations(p["activations"], p["ceiling"])
+    if p.get("terms"):
+        lines += _render_terms(p["terms"])
     ttft = f"  ttft     {_num(t['score_ms'], ',.0f')} ms geometric mean over {len(t['cases'])} cases"
     if t["floor_ms"]:
         ttft += f", {_pct(t['fraction_of_floor'])} of its {t['floor_ms']:,.0f} ms floor"
@@ -682,12 +860,16 @@ def render(status):
     if e.get("ttft_noise") is not None:
         ttft += f"; run-to-run spread {e['ttft_noise']:.1%}"
     lines.append(ttft)
+    lines += _render_ttft_parts(t)
     c = k.get("context")
     if c and c.get("required"):
         line = (f"  context  {c['required']:,} tokens required ({c['source']}"
                 + (f", {c['bound']} bound" if c.get("bound") else "") + ")")
         if c.get("engine_max_context") is not None:
             line += f"; engine holds {c['engine_max_context']:,}"
+        if c.get("free_memory_bytes") is not None:
+            line += (f"; device memory free {c['free_memory_bytes'] / 1e9:.2f} of {c['memory_total_bytes'] / 1e9:.1f} GB "
+                     f"({(c.get('free_memory_at') or '').replace('_', ' ')})")
         cd, ct = c.get("decode") or {}, c.get("ttft") or {}
         if cd.get("score"):
             line += f"; decode {cd['score']:.1f} tok/s over {len(c['points'])} points"
@@ -711,11 +893,18 @@ def render(status):
                      f"{_num(h['tokens_per_round'], '.2f')} tokens/round (geometric means): "
                      + ", ".join(f"{pid} {_num(row['decode_tps'], '.0f')}" for pid, row in h["prompts"].items()))
     if ppl and kld:
-        used = "" if kld.get("budget_used") is None else f"{kld['budget_used']:.1%} of the drift budget used ({kld['budget_used_set']}); "
-        lines.append(f"  quality  {'pass' if kld['passed'] else 'FAIL'}: {used}worst KLD mean {kld['worst_mean']:.1e} "
+        noise = kld.get("budget_used_spread")
+        noise = (f", {noise['p05']:.0%}-{noise['p95']:.0%} over resamples of its positions (5th-95th percentile)"
+                 if noise else "")
+        used = ("" if kld.get("budget_used") is None else
+                f"{kld['budget_used']:.1%} of the drift budget used ({kld['budget_used_set']}{noise}); ")
+        evidence = " (development evidence: the adapter's own scores, not a gate result)" if kld.get(
+            "evidence") == "development" else ""
+        lines.append(f"  quality  {'pass' if kld['passed'] else 'FAIL'}{evidence}: {used}worst KLD mean {kld['worst_mean']:.1e} "
                      f"({kld['worst_mean_set']}, limit {kld['limits']['mean']}), p99 {kld['worst_p99']:.1e} "
                      f"(limit {kld['limits']['p99']}), PPL ×{ppl['worst_ratio']:.4f} (limit {ppl['limit']}), "
                      f"top-1 {kld['lowest_top1']:.3f}")
+        lines += _render_attribution(kld.get("attribution"), kld.get("budget_used_set"))
     else:
         lines.append("  quality  unmeasured")
     if e.get("score"):
@@ -751,6 +940,8 @@ def render(status):
                                                                             ("context_ttft", "context ttft"))
                            if base.get(key) is not None)
             held = f", held-out decode {_signed(base['heldout_decode'])}" if base.get("heldout_decode") is not None else ""
+            if base.get("free_memory_bytes") is not None:
+                held += f", device memory free {base['free_memory_bytes'] / 1e9:+.2f} GB"
             lines.append(f"vs {base['label']}: decode {decode}, prefill {change('prefill_score', 'prefill')}, "
                          f"ttft {change('ttft_score', 'ttft')} (speed){long}{held}, "
                          f"worst KLD mean {_signed(base['worst_kld_mean'])}")
@@ -768,13 +959,60 @@ def _within(value, noise):
     return f" (within the noise: spread {noise:.1%})" if value is not None and noise and abs(value) <= noise else ""
 
 
-def status_of(path, protocol, baseline_path=None):
+def with_trace(room, terms):
+    """A headroom with a kernel trace's prefill terms (headroom.prefill_terms) and their gaps after the prefill's."""
+    room = dict(room)
+    gaps = [g for g in room.get("gaps", []) if not g.get("term")]
+    at = max((i + 1 for i, g in enumerate(gaps) if g.get("kpi") == "prefill"), default=len(
+        [g for g in gaps if g.get("kpi") == "decode"]))
+    room["gaps"] = gaps[:at] + terms["gaps"] + gaps[at:]
+    room["prefill_terms"] = {k: v for k, v in terms.items() if k != "gaps"}
+    return room
+
+
+def status_of(path, protocol, baseline_path=None, device_path=None, data=None, kernels_path=None):
     """The status of the result at `path` under this protocol. A result of another protocol series keeps the status
-    stored in it when it was measured."""
+    stored in it when it was measured. device_path: a `crit eval probe` result whose rates price prefill and time to
+    first token instead of the result's own device; data: the data directory the result was measured on, whose model
+    arithmetic prices them for a result that does not record it (results before crit-eval-v0.1.2). Either prices
+    prefill and time to first token again (crit_eval.headroom.price_prompts), with the ceilings by prompt activation
+    format; a result that records its arithmetic but not those ceilings gets them from its own device. kernels_path: a
+    kernel trace (crit eval kernels) of the engine, joined to the prefill floor's terms (headroom.prefill_terms)."""
     result = load_json(path)
     if result.get("aborted"):
         raise SystemExit(f"{path} is an aborted round with no status: {result['aborted']['detail']}")
     if _major(result) != _major(protocol):
         raise SystemExit(f"{path} was measured with {result.get('protocol')}; its status is the one stored in it")
     baseline = load_json(baseline_path) if baseline_path else None
+    if data is not None:
+        from .prepare import PREPARED
+        prepared = load_json(Path(data) / PREPARED)
+        if prepared.get("model", {}).get("sha256") != result.get("model_sha256"):
+            raise SystemExit(f"{data} was prepared from another model than {path} measured")
+        result["ceiling"] = prepared.get("ceiling")
+    device = load_json(device_path) if device_path else None
+    room = result.get("headroom")
+    if room is not None and (device is not None or data is not None or (result.get("ceiling") and "activations" not in room)):
+        rates, sources = best_rates(device if device is not None else result.get("device"))
+        result["headroom"] = headroom.price_prompts(result, rates, sources, protocol["speed"].get("prefill_cases", []),
+                                                    [baseline] if baseline else [])
+    if kernels_path and room is not None:
+        rates, _ = best_rates(device if device is not None else result.get("device"))
+        terms = headroom.prefill_terms(result, load_json(kernels_path), rates, protocol["speed"].get("prefill_cases", []))
+        if terms is None:
+            raise SystemExit(f"{kernels_path} cannot be joined to the prefill floor: the result records no model arithmetic "
+                             "(pass --data) or its device no rates (pass --device)")
+        result["headroom"] = with_trace(result["headroom"], terms)
+        split = headroom.trace_decode_parts(result, load_json(kernels_path))
+        if split:
+            # The trace splits a round into its verify pass and its draft steps: two gaps where there was one.
+            room = dict(result["headroom"])
+            gaps = room.get("gaps", [])
+            at = next((i for i, g in enumerate(gaps) if g["name"] == "draft steps and verify columns at the draft floor"),
+                      sum(g.get("kpi") == "decode" for g in gaps))
+            gaps = [g for g in gaps if g["name"] != "draft steps and verify columns at the draft floor"]
+            room["gaps"] = gaps[:at] + split["gaps"] + gaps[at:]
+            room["missing"] = [m for m in room.get("missing", []) if not m.startswith("verify_ms and draft_ms")]
+            room["trace_decode_parts"] = split["cases"]
+            result["headroom"] = room
     return build(result, protocol, baseline)

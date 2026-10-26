@@ -24,7 +24,11 @@ decodes one token per model pass, so its ceiling is every pass at its floor: the
 
 Prefill is compute bound: its floor is the model's FLOPs over the device's GEMM rates per
 weight format (see ceiling.py). The prefill score is the geometric mean of prefill tok/s over
-the protocol's prefill cases, and its ceiling the same mean at the floor. Time to first token
+the protocol's prefill cases, and its ceiling the same mean at the floor. The stored-format floor
+multiplies NVFP4 matrices with NVFP4 activations (W4A4), which the quality budget may rule out, so
+the same ceilings are also priced with the quantized matrices' prompt activations at BF16, FP16
+accumulation and FP8 and at the engine's own declaration; quality evidence shows which pass, and the
+fastest shown passing is the reachable ceiling (activation_ceilings). Time to first token
 is measured on every case against the larger of its compute floor and one read of the weights
 at the device bandwidth; the TTFT score is the geometric mean in ms (lower is better).
 
@@ -234,12 +238,140 @@ def prefill_summary(speed, ceiling, tflops, prefill_cases):
             "missing": missing}
 
 
+def prompt_evidence(result, formats):
+    """What a result's quality says about its engine's prompt activations: (shares, "passes" or "fails" or None, detail).
+    shares: the engine's declared prompt_activations (ceiling.activation_shares) over the model's quantized `formats`;
+    the state is the quality gate's on the prompt paths (SET/prompt, the prefill's own arithmetic), None while the
+    engine declares none or quality was not scored."""
+    shares = model_ceiling.activation_shares((result.get("engine") or {}).get("prompt_activations"), formats)
+    quality = result.get("quality") or {}
+    if shares is None or quality.get("status") != "scored":
+        return shares, None, None
+    prompts = {name: s for name, s in quality.get("sets", {}).items() if name.endswith("/prompt")}
+    failed = [name for name, s in prompts.items() if not s.get("passed")]
+    label = result.get("label") or (result.get("engine") or {}).get("name") or "this result"
+    if failed:
+        return shares, "fails", f"quality failed on {', '.join(failed)} ({label})"
+    if not prompts:
+        return shares, None, None
+    return shares, "passes", f"quality passed on every prompt path ({label})"
+
+
+def activation_label(shares):
+    """An engine's prompt activations as text: "nvfp4 fp16_acc 93% + bf16 7%, fp8 fp8"."""
+    return ", ".join(f + " " + " + ".join(a if share == 1 else f"{a} {share:.0%}" for a, share in mix.items())
+                     for f, mix in shares.items())
+
+
+def uniform(shares):
+    """The one activation every quantized format takes in full, or None."""
+    found = {a for mix in shares.values() for a, share in mix.items() if share == 1}
+    return found.pop() if len(found) == 1 and all(len(mix) == 1 for mix in shares.values()) else None
+
+
+def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
+    """Prefill and TTFT ceilings with every quantized matrix group's prompt activations at each format of
+    ceiling.ACTIVATIONS (bf16, fp16_acc, fp8 and stored, the stored-format ceiling), and at the engine's declared
+    prompt_activations; which of them quality evidence shows passing or rules out, and the reachable ceiling: the
+    fastest shown to pass. evidence: earlier results of the same model (a baseline) whose quality judged their own
+    declared activations, beside this result's. None when the model stores no quantized matrices."""
+    ceiling = result.get("ceiling")
+    formats = model_ceiling.quantized_formats(ceiling)
+    speed, info = result.get("speed") or {}, result.get("engine") or {}
+    if not formats or not rates:
+        return None
+    measured = {cid: c for cid, c in speed.get("cases", {}).items() if c.get("status") == "measured" and c.get("ttft_ms")}
+
+    def priced(shares):
+        floors, ttfts, lacking = {}, [], []
+        for case_id, case in measured.items():
+            floor, missing = model_ceiling.ttft_floor_ms(ceiling, rates, result.get("bandwidth_gbs"), case["prompt_tokens"],
+                                                         info.get("bytes_per_pass"), shares)
+            compute, missing_compute = model_ceiling.prefill_floor_ms(ceiling, rates, case["prompt_tokens"], shares)
+            lacking += [m for m in missing + missing_compute if m not in lacking]
+            if compute and case_id in prefill_cases:
+                floors[case_id] = compute["total_ms"]
+            if floor:
+                ttfts.append(floor["total_ms"])
+        tps = [measured[cid]["prompt_tokens"] / ms * 1000 for cid, ms in floors.items()]
+        row = {"ceiling_score": metrics.geometric_mean(tps) if prefill_cases and len(tps) == len(prefill_cases) else None,
+               "ttft_floor_ms": metrics.geometric_mean(ttfts) if ttfts and len(ttfts) == len(measured) else None,
+               "cases": {cid: {"floor_ms": ms} for cid, ms in floors.items()}}
+        return row, lacking
+    modes, missing = {}, []
+    for activation in model_ceiling.ACTIVATIONS:
+        shares = {f: {activation: 1.0} for f in formats}
+        row, lacking = priced(shares)
+        row["rates"] = {}
+        for f in formats:
+            rate, key = model_ceiling.matmul_rate(rates, f, activation)
+            row["rates"][f] = {"tflops": rate, "rate": key if rate else None, "source": sources.get(key) if rate else None}
+        if lacking:
+            row["missing"] = lacking
+        modes[activation] = {**row, "state": None, "evidence": []}
+    judged = [prompt_evidence(result, formats)] + [prompt_evidence(other, formats) for other in evidence
+                                         if other.get("model_sha256") == result.get("model_sha256")]
+    declared, state, detail = judged[0]
+    own = None
+    if declared is not None:
+        own, _ = priced(declared)
+        own.update(activations=declared, label=activation_label(declared), state=state, evidence=[detail] if detail else [])
+    for shares, found, why in judged:
+        mode = uniform(shares) if shares else None
+        if mode and found:
+            modes[mode]["evidence"].append(why)
+            # One failure rules an activation out; it passes when every judged result passed with it.
+            modes[mode]["state"] = "fails" if "fails" in (found, modes[mode]["state"]) else "passes"
+    shown = [(row["ceiling_score"], name) for name, row in modes.items() if row["state"] == "passes" and row["ceiling_score"]]
+    if own and own["state"] == "passes" and own["ceiling_score"]:
+        shown.append((own["ceiling_score"], "declared"))
+    reachable = None
+    if shown:
+        score, name = max(shown)
+        row = own if name == "declared" else modes[name]
+        reachable = {"name": name, "label": own["label"] if name == "declared" else name, "ceiling_score": score,
+                     "ttft_floor_ms": row["ttft_floor_ms"], "cases": row["cases"]}
+    if declared is None:
+        missing.append("prompt_activations from the adapter (the activation format of each quantized matrix group's "
+                       "prompt GEMMs; with the quality gate it names the reachable prefill ceiling)")
+    return {"formats": formats, "modes": modes, "declared": own, "reachable": reachable, "missing": missing}
+
+
+def reachable_gap(prefill, activations):
+    """Prefill at the fastest ceiling quality evidence shows passing (activation_ceilings), all else as measured."""
+    reachable = (activations or {}).get("reachable")
+    if not reachable or not prefill.get("score") or reachable["ceiling_score"] <= prefill["score"]:
+        return []
+    detail = "; ".join(f"{cid} {prefill['cases'][cid]['ttft_ms']:,.0f} ms vs {row['floor_ms']:,.0f} ms floor"
+                       for cid, row in reachable["cases"].items() if (prefill["cases"].get(cid) or {}).get("ttft_ms"))
+    return [{"kpi": "prefill", "name": f"prefill at its reachable ceiling (prompt activations {reachable['label']})",
+             "projected_gain": reachable["ceiling_score"] / prefill["score"] - 1, "detail": detail,
+             "cases": list(reachable["cases"])}]
+
+
+def ttft_parts(case):
+    """Where a case's time to first token goes, from the engine's own times of its measured repetitions (medians):
+    engine_prefill_ms (its prefill), engine_first_token_ms (its first token, prefill included) and outside_engine_ms,
+    the rest of the time to first token the harness measured (a server's HTTP, templating, tokenizer and queue, an
+    adapter's host work); {} when the engine reports neither."""
+    samples = [s for s in case.get("samples", []) if not s.get("warmup")]
+    parts = {}
+    for key, name in (("prefill_ms", "engine_prefill_ms"), ("first_token_ms", "engine_first_token_ms")):
+        values = [s[key] for s in samples if s.get(key) is not None]
+        if values and len(values) == len(samples):
+            parts[name] = metrics.median(values)
+    engine = parts.get("engine_first_token_ms", parts.get("engine_prefill_ms"))
+    if engine is not None and case.get("ttft_ms"):
+        parts["outside_engine_ms"] = max(0.0, case["ttft_ms"] - engine)
+    return parts
+
+
 def ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs):
     cases, missing, measured, floors = {}, [], [], []
     for case_id, case in (speed or {}).get("cases", {}).items():
         if case.get("status") != "measured" or not case.get("ttft_ms"):
             continue
-        row = {"prompt_tokens": case["prompt_tokens"], "ttft_ms": case["ttft_ms"]}
+        row = {"prompt_tokens": case["prompt_tokens"], "ttft_ms": case["ttft_ms"], **ttft_parts(case)}
         floor, lacking = model_ceiling.ttft_floor_ms(ceiling, tflops, bandwidth_gbs, case["prompt_tokens"],
                                                     info.get("bytes_per_pass"))
         missing += [m for m in lacking if m not in missing]
@@ -254,6 +386,160 @@ def ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs):
     efficiency = floor_score / score if score and floor_score else None
     return {"cases": cases, "score_ms": score, "floor_ms": floor_score, "fraction_of_floor": efficiency,
             "missing": missing}
+
+
+def prompt_gaps(prefill, ttft, activations=None):
+    """The prefill gaps (at its stored-format ceiling, then at its reachable ceiling when quality evidence names one,
+    activation_ceilings) and the TTFT gap, with the warnings that state them."""
+    gaps, warnings = [], []
+    if prefill["fraction_of_ceiling"] is not None:
+        parts = [r["floor"] for r in prefill["cases"].values() if r.get("floor")]
+        detail = "; ".join(
+            f"{cid} {r['ttft_ms']:.0f} ms vs {r['floor']['total_ms']:.0f} ms floor (matmul {r['floor']['matmul_ms']:.0f}, "
+            f"attention {r['floor']['attention_ms']:.0f}, recurrent {r['floor']['recurrent_ms']:.0f})"
+            for cid, r in prefill["cases"].items() if r.get("floor") and r.get("ttft_ms"))
+        if parts and prefill["fraction_of_ceiling"] < 1:
+            gaps.append({"kpi": "prefill", "name": "prefill at its compute ceiling",
+                         "projected_gain": 1 / prefill["fraction_of_ceiling"] - 1, "detail": detail,
+                         "cases": list(prefill["cases"])})
+        warnings.append(f"prefill score {prefill['score']:.0f} tok/s is {prefill['fraction_of_ceiling']:.0%} "
+                        f"of its compute ceiling {prefill['ceiling_score']:.0f} tok/s")
+    gaps += reachable_gap(prefill, activations)
+    if ttft["fraction_of_floor"] is not None:
+        slowest = sorted(((cid, r) for cid, r in ttft["cases"].items() if r.get("efficiency")),
+                         key=lambda item: item[1]["efficiency"])[:3]
+        if ttft["fraction_of_floor"] < 1:
+            gaps.append({"kpi": "ttft", "name": "time to first token at its floor",
+                         "projected_gain": 1 / ttft["fraction_of_floor"] - 1, "cases": list(ttft["cases"]),
+                         "detail": "furthest from the floor: " + ", ".join(
+                             f"{cid} {r['ttft_ms']:,.0f} ms vs {r['floor']['total_ms']:,.0f} ms ({r['floor']['bound']} bound)"
+                             for cid, r in slowest)})
+        warnings.append(f"time to first token {ttft['score_ms']:,.0f} ms (geometric mean) is {ttft['fraction_of_floor']:.0%} "
+                        f"of its {ttft['floor_ms']:,.0f} ms floor")
+    return gaps, warnings
+
+
+def prefill_terms(result, trace, rates, prefill_cases):
+    """A kernel trace (crit eval kernels) joined to the prefill floor's terms: per traced speed case, the GPU time
+    each term took in its prefill (a fresh one-token request) against that term's floor at `rates` on the result's
+    model arithmetic: matmul per stored weight format (one matmul row when a kernel's format is unknown), attention,
+    recurrent, other kernels and draft work (floor 0), and the host's share of the first token (first-token time
+    beyond the GPU's busy time, floor 0). The gaps: each term at its floor, all else as the trace measured, on the
+    prefill score. None without a trace or the arithmetic."""
+    ceiling = result.get("ceiling")
+    measured = {cid: c for cid, c in (result.get("speed") or {}).get("cases", {}).items() if c.get("status") == "measured"}
+    if not trace or not ceiling or not rates:
+        return None
+    cases, speedups = {}, {}
+    # The engine's declared prompt activations price each format's matmul floor a second time (floor_own_ms).
+    own = prompt_evidence(result, model_ceiling.quantized_formats(ceiling))[0]
+    for case_id, phases in (trace.get("cases") or {}).items():
+        entry, case = phases.get("prefill") or {}, measured.get(case_id)
+        if not case or not entry.get("terms"):
+            continue
+        floor, _ = model_ceiling.prefill_floor_ms(ceiling, rates, case["prompt_tokens"])
+        if not floor:
+            continue
+        spent = dict(entry["terms"])
+        rows = {}
+        if not any(k.startswith("matmul:") for k in spent):   # no kernel of a known format: matmul as one term
+            rows["matmul"] = (spent.get("matmul", 0.0), floor["matmul_ms"])
+        else:
+            # Each format's matmul against its floor; matmul kernels of no known format have none of their own.
+            rows.update({f"matmul:{f}": (spent.get(f"matmul:{f}", 0.0), ms) for f, ms in floor["matmul_by_format"].items()})
+            rows.update({k: (v, 0.0) for k, v in spent.items() if k.startswith("matmul:") and k not in rows})
+            if spent.get("matmul"):
+                rows["matmul:unknown"] = (spent["matmul"], 0.0)
+        rows["attention"] = (spent.get("attention", 0.0), floor["attention_ms"])
+        rows["recurrent"] = (spent.get("recurrent", 0.0), floor["recurrent_ms"])
+        rows["other"] = (spent.get("other", 0.0), 0.0)
+        if spent.get("draft"):
+            rows["draft"] = (spent["draft"], 0.0)
+        first = entry.get("first_token_ms")
+        if first is not None and entry.get("gpu_before_first_ms") is not None:
+            rows["host"] = (max(0.0, first - entry["gpu_before_first_ms"]), 0.0)
+        total = first if first is not None else entry.get("wall_ms")
+        cases[case_id] = {"prompt_tokens": case["prompt_tokens"], "trace_ms": total,
+                          "named_ms": (entry.get("classified_ms") or {}).get("names", 0.0),
+                          "terms": {k: {"measured_ms": m, "floor_ms": f} for k, (m, f) in rows.items()}}
+        priced, _ = model_ceiling.prefill_floor_ms(ceiling, rates, case["prompt_tokens"], own) if own else (None, None)
+        for f, ms in ((priced or {}).get("matmul_by_format") or {}).items():
+            if f"matmul:{f}" in cases[case_id]["terms"]:
+                cases[case_id]["terms"][f"matmul:{f}"]["floor_own_ms"] = ms
+        if case_id in prefill_cases and total:
+            speedups[case_id] = {k: total / max(total - max(0.0, m - f), 1e-9) for k, (m, f) in rows.items()}
+    gaps = []
+    if speedups and len(speedups) == len(prefill_cases):
+        names = {"other": "other kernels at zero", "draft": "draft work in the prefill at zero",
+                 "host": "the host's share of the first token at zero",
+                 "matmul:unknown": "matmul kernels of no known format at zero"}
+        for term in dict.fromkeys(k for s in speedups.values() for k in s):
+            gain = metrics.geometric_mean([s.get(term, 1.0) for s in speedups.values()]) - 1
+            if gain > 0.005:
+                detail = "; ".join(f"{cid} {cases[cid]['terms'][term]['measured_ms']:,.1f} vs "
+                                   f"{cases[cid]['terms'][term]['floor_ms']:,.1f} ms" for cid in speedups
+                                   if term in cases[cid]["terms"])
+                gaps.append({"kpi": "prefill", "name": "prefill " + names.get(term, f"{term} at its floor"),
+                             "projected_gain": gain, "detail": f"kernel trace vs floor: {detail}", "term": term,
+                             "cases": list(speedups)})
+    return {"engine": (trace.get("engine") or {}).get("name"), "prefill_request": trace.get("prefill_request"),
+            "cases": cases, "gaps": gaps}
+
+
+def trace_decode_parts(result, trace):
+    """protocol headroom.trace_parts: each decode case's verify pass and draft step from a kernel trace's decode, for an
+    engine that reports neither: GPU time in kernels classed draft over the request's draft steps (rounds times the
+    draft width), the rest over its rounds; with the decode gaps they give apart (decode_gaps), in place of the one for
+    draft steps and verify columns together. None when nothing is to be split or the trace cannot."""
+    room, info = result.get("headroom") or {}, result.get("engine") or {}
+    width, cases = room.get("draft_width") or info.get("draft_width"), room.get("cases") or {}
+    if not width or not cases or all(row.get("verify_ms") is not None for row in cases.values()):
+        return None
+    parts = {}
+    for case_id, traced in (trace.get("cases") or {}).items():
+        decode, rounds = traced.get("decode") or {}, traced.get("rounds")
+        if not rounds or not decode.get("terms") or not decode["terms"].get("draft"):
+            continue
+        draft = decode["terms"]["draft"]
+        parts[case_id] = {"verify_ms": (decode["kernel_ms"] - draft) / rounds, "draft_step_ms": draft / (rounds * width)}
+    if not parts or set(parts) < set(cases):
+        return None
+    rows = {cid: {**row, **parts[cid]} for cid, row in cases.items()}
+    draft_floor = pass_floor_ms(info.get("draft_bytes_per_step"), room.get("bandwidth_gbs") or result.get("bandwidth_gbs"))
+    score = decode_suite(result)[1].get("decode_score")
+    gaps = [{**g, "detail": g["detail"] + " (kernel trace, GPU time)"}
+            for g in decode_gaps(rows, score, width, draft_floor, room.get("projection"))
+            if g["name"].startswith(("draft steps at", "verify pass of"))]
+    return {"cases": parts, "gaps": gaps}
+
+
+def price_prompts(result, rates, sources, prefill_cases, evidence=()):
+    """A result's headroom with prefill and time to first token priced at `rates` (crit_eval.ceiling.best_rates of a
+    device) on the model arithmetic it records (result ceiling): the stored-format prefill and TTFT summaries, the
+    ceilings by prompt activation format (activation_ceilings, judged with this result's and `evidence`'s quality),
+    and their gaps in place of the old ones. The run prices them so; `crit eval status --device/--data` prices a
+    result again with a newer probe or with the arithmetic of the data it was measured on."""
+    room = dict(result.get("headroom") or {})
+    info, speed, ceiling = result.get("engine") or {}, result.get("speed") or {}, result.get("ceiling")
+    bandwidth_gbs = room.get("bandwidth_gbs") or result.get("bandwidth_gbs")
+    tflops = rates or None
+    prefill = prefill_summary(speed, ceiling, tflops, prefill_cases)
+    ttft = ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs)
+    activations = activation_ceilings(result, rates, sources, prefill_cases, evidence)
+    gaps, _ = prompt_gaps(prefill, ttft, activations)
+    # The decode gaps before the prompt's, the long context's after them, as summarize orders them.
+    old = room.get("gaps", [])
+    room["gaps"] = ([g for g in old if g.get("kpi") == "decode"] + gaps
+                    + [g for g in old if g.get("kpi") not in ("decode", "prefill", "ttft")])
+    stale = set((room.get("prefill") or {}).get("missing", []) + (room.get("ttft") or {}).get("missing", []))
+    room["missing"] = [m for m in room.get("missing", []) if m not in stale and not m.startswith("prompt_activations")]
+    room["missing"] += [m for m in prefill["missing"] + ttft["missing"] + ((activations or {}).get("missing") or [])
+                        if m not in room["missing"]]
+    room.update(prefill=prefill, ttft=ttft, activations=activations,
+                rates={"tflops": rates, "sources": sources} if rates else None)
+    room["end_to_end"] = end_to_end_summary(decode_suite(result)[1], ttft, (decode_suite(result)[1]).get("decode_score"),
+                                            (room.get("projection") or {}).get("ceiling_score"))
+    return room
 
 
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
@@ -273,6 +559,9 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     steps = steps or {}
     cases, warnings, curves, case_floors, missing, bound_curves = {}, [], [], [], [], []
     bound_width = max(width or 0, thresholds.get("acceptance_ceiling_width", 8))
+    # Acceptance at a wider draft than the built one (protocol headroom.wider_draft): the projection's widths go on.
+    wider = (speed or {}).get("wider_draft") or {}
+    wider_width = int(wider.get("width") or 0)
     for case_id, case in (decode_speed or {}).get("cases", {}).items():
         if case.get("status") != "measured":
             continue
@@ -296,6 +585,13 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         if width and (accepted or greedy_accepted):
             row["tokens_by_width"] = (tokens_by_width(accepted, width) if accepted
                                       else [case.get("tokens_per_round") or 1.0] * (width + 1))
+            probed = ((wider.get("cases") or {}).get(case_id) or {}).get("accepted")
+            if probed and wider_width > width:
+                # Beyond the built width, each further draft adds what it added at the probed width.
+                far = tokens_by_width(probed, wider_width)
+                row["tokens_by_width"] = row["tokens_by_width"] + [row["tokens_by_width"][width] + far[k] - far[width]
+                                                                   for k in range(width + 1, wider_width + 1)]
+                row["probed_width"] = wider_width
             rate = 0.0
             if accepted:
                 row["conditional_acceptance"] = conditional_acceptance(accepted, width)
@@ -341,10 +637,14 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                 warnings.append(f"{decode_name} decode score {score:.1f} is {score / decode_ceiling:.0%} of its ceiling {decode_ceiling:.1f} "
                                 f"(this drafter at floor costs: {sol_score:.1f} at width {sol_width}; later drafts "
                                 f"accepted like the first: {bound_score:.1f} at width {bound_at})")
-        if width in (projection.get("best_width_now"), projection.get("best_width_at_floor")):
-            warnings.append(f"best projected width is the widest measured ({width}); "
+        widest = max(len(c) for c in curves) - 1 if curves and len({len(c) for c in curves}) == 1 else width
+        if widest > width:
+            projection["probed_width"] = widest
+        if widest in (projection.get("best_width_now"), projection.get("best_width_at_floor")):
+            warnings.append(f"best projected width is the widest measured ({widest}); "
                             "measure acceptance at a wider draft to see beyond it")
-            missing.append(f"acceptance beyond draft width {width} (run with a wider draft)")
+            missing.append(f"acceptance beyond draft width {widest} (declare wider_draft in the adapter, or run with a "
+                           "wider draft)")
     elif width:
         warnings.append("speed-of-light projection needs per-round `accepted` counts from generate() and an ordinary step")
         if not curves:
@@ -367,32 +667,11 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     if decode_speed is not speed:
         gaps += sampling_gaps(decode_speed, speed, score)
     prefill = prefill_summary(speed, ceiling, tflops, prefill_cases)
-    if prefill["fraction_of_ceiling"] is not None:
-        parts = [r["floor"] for r in prefill["cases"].values() if r.get("floor")]
-        detail = "; ".join(
-            f"{cid} {r['ttft_ms']:.0f} ms vs {r['floor']['total_ms']:.0f} ms floor (matmul {r['floor']['matmul_ms']:.0f}, "
-            f"attention {r['floor']['attention_ms']:.0f}, recurrent {r['floor']['recurrent_ms']:.0f})"
-            for cid, r in prefill["cases"].items() if r.get("floor") and r.get("ttft_ms"))
-        if parts and prefill["fraction_of_ceiling"] < 1:
-            gaps.append({"kpi": "prefill", "name": "prefill at its compute ceiling",
-                         "projected_gain": 1 / prefill["fraction_of_ceiling"] - 1, "detail": detail,
-                         "cases": list(prefill["cases"])})
-        warnings.append(f"prefill score {prefill['score']:.0f} tok/s is {prefill['fraction_of_ceiling']:.0%} "
-                        f"of its compute ceiling {prefill['ceiling_score']:.0f} tok/s")
-    missing += [m for m in prefill["missing"] if m not in missing]
     ttft = ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs)
-    if ttft["fraction_of_floor"] is not None:
-        slowest = sorted(((cid, r) for cid, r in ttft["cases"].items() if r.get("efficiency")),
-                         key=lambda item: item[1]["efficiency"])[:3]
-        if ttft["fraction_of_floor"] < 1:
-            gaps.append({"kpi": "ttft", "name": "time to first token at its floor",
-                         "projected_gain": 1 / ttft["fraction_of_floor"] - 1, "cases": list(ttft["cases"]),
-                         "detail": "furthest from the floor: " + ", ".join(
-                             f"{cid} {r['ttft_ms']:,.0f} ms vs {r['floor']['total_ms']:,.0f} ms ({r['floor']['bound']} bound)"
-                             for cid, r in slowest)})
-        warnings.append(f"time to first token {ttft['score_ms']:,.0f} ms (geometric mean) is {ttft['fraction_of_floor']:.0%} "
-                        f"of its {ttft['floor_ms']:,.0f} ms floor")
-    missing += [m for m in ttft["missing"] if m not in missing]
+    more, said = prompt_gaps(prefill, ttft)
+    gaps += more
+    warnings += said
+    missing += [m for m in prefill["missing"] + ttft["missing"] if m not in missing]
     decode_ceiling = (projection or {}).get("ceiling_score")
     end_to_end = end_to_end_summary(decode_speed, ttft, score, decode_ceiling)
     long_context = None

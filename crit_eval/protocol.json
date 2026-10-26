@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v0.1.0",
+  "protocol": "crit-eval-v0.2.0",
   "requests": {
     "timeout": {
       "rule": "an engine behind a server gets no fixed time budget: each request may take floor_seconds plus slack times its expected time from the requests the engine served in this Eval (a prompt of n tokens at most t * max(1, n/m)^2 for a prompt of m tokens that prefilled in t; an output token at context c at most d * max(1, c/k) for one that decoded in d at context k; the tightest bound counts), floor_seconds alone before any; a request past it stops the Eval as hung",
@@ -38,7 +38,12 @@
         3
       ]
     },
-    "repetitions": "warmup_runs, then one measured repetition per seed of seeds.repetitions and no extra repetition: different seeds decode different texts, whose tokens per round differ, so their speeds disagree by content; outputs are not compared",
+    "repetitions": "warmup_runs, then one measured repetition per seed of seeds.repetitions and none of speed.extra_repetition: different seeds decode different texts, whose tokens per round differ, so their speeds disagree by content; outputs are not compared. From crit-eval-v0.2.0 a case whose seeds leave its error above adaptive.target_se continues at further seeds (adaptive)",
+    "adaptive": {
+      "target_se": 0.03,
+      "max_repetitions": 9,
+      "rule": "every case reports its relative standard error (the spread of its repetitions' log decode speeds over the square root of their count) and the repetitions target_se would take at that spread. After the seeds' repetitions, a case whose error exceeds target_se gets one more repetition at the next seed (4, 5, ...) until it does not or it has max_repetitions; the case's KPIs are the medians over all of them and the result records the rule as sampled_speed.adaptive. A fixed repetition count (crit eval run --repetitions, a profile's sampled_repetitions) is not extended, and crit eval run --no-adaptive-sampled keeps the seeds' repetitions alone: overrides the result records (sampled_speed.adaptive null), whose decode compares only with results measured the same way"
+    },
     "disturbed": "a case whose measured repetitions' round_ms (time per target pass, which the text does not change) spreads by more than speed.disturbed_spread stops the round as speed.disturbed does; an engine that reports no rounds is judged on the greedy suite alone",
     "aggregate": "median per case; the sampled decode score is the geometric mean of the case medians. From crit-eval-v7 it is the headline decode: real requests sample. The greedy speed suite's decode score is reported next to it",
     "engines": "an adapter's engine samples through generate_sampled(prompt_ids, max_new_tokens, on_tokens, sampling); an engine behind a server gets the settings and the seed in the /chat/completions body (temperature, top_p, top_k, min_p, seed). An engine that cannot sample has no sampled decode"
@@ -98,7 +103,17 @@
       "kld_mean_factor": 10,
       "rule": "sets are scored in the prepared order and judged as each completes; when a set's prompt or served path drifts a mean KLD over kld_mean_factor times the budget's kld_mean_max, the remaining sets are not scored (skipped, with the reason) and the run skips the long-context curve, exactness and the repeated follow-up and history requests (result stopped_early), since no later part can make it pass; the speed parts before quality stand"
     },
-    "budget": "the thresholds are a drift budget to spend on speed, not a score to minimise; a run sets its own with --quality-budget"
+    "budget": "the thresholds are a drift budget to spend on speed, not a score to minimise; a run sets its own with --quality-budget",
+    "position_spread": {
+      "block": 64,
+      "draws": 200,
+      "seed": 0,
+      "rule": "reported, not judged: each set and path's share of the drift budget over draws block-bootstrap resamples of its positions (the set's length in blocks of block consecutive positions, drawn with replacement from a generator seeded with seed), as the 5th, 50th and 95th percentiles (budget_spread): how much the share depends on the positions the texts hold, since a few knife-edge positions decide the KLD p99"
+    },
+    "attribution": {
+      "rule": "reported, not judged, and only on request (crit eval run --attribute-drift): after quality, for each of the adapter's exact_variants (configuration overrides, each switching one matrix group or arithmetic choice back to exact), an engine opened with them scores the quality texts again, one engine at a time; per variant and set the budget it uses and its share, the full engine's budget used minus the variant's. Shares are not additive: the terms interact"
+    },
+    "development": "an engine opened in process by an adapter whose engine has score(prompt_ids, continuation_ids, top_k, prompt_rows) is scored and judged the same way, recorded as evidence development: its scores need not come from the paths it serves with and it has no served replies to check, so the quality gate stays unmeasured whatever the sets show; a served engine's are evidence served"
   },
   "exactness": {
     "rule": "greedy speculative output equals the engine's own non-speculative greedy output token for token (the greedy speed suite); under sampling, sampling_check judges the distribution instead",
@@ -113,10 +128,16 @@
   },
   "headroom": {
     "pass_floor": "bytes read per model pass (adapter bytes_per_pass plus KV bytes at the case's context) / achievable device bandwidth",
-    "prefill_floor": "model FLOPs per prompt token by stored weight format / device GEMM rate of that format, plus attention and recurrent FLOPs at the BF16 rate",
+    "prefill_floor": "model FLOPs per prompt token by stored weight format / the device's best probed rate of that format (the larger of its cuBLASLt GEMM rate and its raw tensor-core rate), plus attention at the faster of the BF16 and FP8 rates and recurrent FLOPs at the BF16 rate",
     "decode_ceiling": "the larger of this drafter's speed of light and a drafter whose later drafts are accepted as often as its first, at floor costs, up to acceptance_ceiling_width",
     "acceptance_ceiling_width": 8,
-    "ttft_floor": "the larger of the prompt's compute floor and one read of the weights plus its KV writes at the device bandwidth"
+    "wider_draft": "reported, not judged: an adapter that declares wider_draft ({width, config}) gets one more engine opened with that configuration after the run's own, which decodes each measured speed case once greedily for its drafts accepted per round; the projection then continues past the built width, each further draft adding what it added at the probed width",
+    "trace_parts": "with a kernel trace (crit eval status --kernels), a speculative engine that reports no verify_ms and draft_ms gets them from the trace's decode: kernels classed draft over its draft steps, the rest over its rounds (GPU time), and the draft and verify gaps apart",
+    "ttft_floor": "the larger of the prompt's compute floor and one read of the weights plus its KV writes at the device bandwidth",
+    "prompt_activations": {
+      "formats": ["bf16", "fp16_acc", "fp8", "stored"],
+      "rule": "reported, not judged: the prefill and TTFT floors again with every quantized matrix group's prompt GEMMs taking each of these activation formats (BF16 at the BF16 rate, FP16 accumulating in FP16 at its rate, FP8 at the FP8 rate or for FP4 weights the FP4 x FP8 rate where faster, stored the stored-format floor) and with the engine's declared prompt_activations; a result whose engine declares them and whose quality is scored shows them passing (every SET/prompt path within its budget) or rules them out (one failing), and so does a baseline of the same model; the fastest shown passing is the reachable ceiling, with a prefill gap of its own"
+    }
   },
   "context": {
     "max_context": "min(model limit, device limit): the positions config.json declares, and the KV cache that fits in the device's free memory (crit eval probe) after the VRAM headroom, the reserve, the weights read on every pass and the fixed state, at kv_precision, rounded down to granularity",
@@ -130,6 +151,7 @@
     "output_tokens": 256,
     "repetitions": 1,
     "capacity": "the engine reports max_context of at least the requirement and completes the request at the requirement",
+    "device_memory": "reported, not judged: the device memory free (nvidia-smi, the whole device) with the engine built for the requirement, after its load and after the curve filled the context up to it; the least of them, beside the capacity gate, and its change against a baseline",
     "lower_context": "the speed cases on an engine opened at lower_fraction of the requirement (never below the longest speed case), measured just before the engine built for the requirement; no case may decode slower or reach its first token later than at the requirement by more than its tolerance",
     "lower_fraction": 0.25,
     "tolerance": 0.05,

@@ -156,6 +156,26 @@ def gpus():
     return result
 
 
+def device_memory(index=None):
+    """Free, used and total memory of the GPU the engine runs on, in bytes, as nvidia-smi sees the whole device (other
+    processes' use included): `index`, else the one CUDA_VISIBLE_DEVICES names first when it names one by number, else
+    GPU 0. None where nvidia-smi is missing or fails."""
+    binary = _nvidia_smi()
+    rows = _query(binary, ["index", "memory.free", "memory.used", "memory.total"]) if binary else None
+    if rows is None:
+        return None
+    if index is None:
+        first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
+        index = int(first) if first.isdigit() else 0
+    for row in rows:
+        if _int(row[0]) == index:
+            free, used, total = (_int(v) for v in row[1:])
+            return {"index": index, "free_bytes": None if free is None else free * MIB,
+                    "used_bytes": None if used is None else used * MIB,
+                    "total_bytes": None if total is None else total * MIB}
+    return None
+
+
 def describe():
     """The result's `host`: platform and python as before, plus OS, CPU, RAM and GPUs."""
     def safely(probe, fallback=None):

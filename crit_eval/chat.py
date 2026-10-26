@@ -42,7 +42,7 @@ from .prepare import GREEDY_REQUEST, prepared_template, token_ids, with_document
 # The engine facts crit serve publishes for crit-eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
 # request decode plainly.
 FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "draft_bytes_per_step", "draft_ms",
-         "kv_bytes_per_token")
+         "kv_bytes_per_token", "prompt_activations")
 PLAIN_CAPABILITY = "chat-plain-v1"
 
 
@@ -316,8 +316,11 @@ class ChatEngine:
         accepted = (telemetry or {}).get("accepted")
         if isinstance(accepted, list) and all(type(a) is int for a in accepted):
             out.update(accepted=accepted, rounds=len(accepted))
-        out.update({key: telemetry[key] for key in ("verify_ms", "draft_ms")
+        out.update({key: telemetry[key] for key in ("verify_ms", "draft_ms", "prefill_ms")
                     if isinstance((telemetry or {}).get(key), (int, float))})
+        # crit serve's ttft_ms is the engine's own time to its first token: the client's beyond it is HTTP and serving.
+        if isinstance((telemetry or {}).get("ttft_ms"), (int, float)):
+            out["first_token_ms"] = telemetry["ttft_ms"]
         if logprobs and entries:
             # Tokens are named by their bytes (their text where a server gives none): the sampling check only matches
             # each token among its alternatives, and pieces of one character can share a text.

@@ -4,8 +4,9 @@
 //   #clock <cupti_ns> <realtime_ns>   pairs CUPTI's clock with CLOCK_REALTIME (at start and at exit)
 //   #device <sm_count> <name>
 //   <start_ns> <end_ns> <grid_x*grid_y*grid_z> <block_threads> <name>
-// Timestamps are CUPTI's; the clock lines convert them to the host's realtime clock, which the driver uses for
-// its phase marks. Linux only.
+// Timestamps are CUPTI's. The driver takes its phase marks on the same clock, through crit_ktrace_timestamp(); the
+// clock lines convert them to the host's realtime clock for marks taken on it (which drifts against CUPTI's by tens
+// of milliseconds over a trace under WSL). Linux only.
 #include <cuda.h>
 #include <cupti.h>
 
@@ -69,6 +70,13 @@ void finish() {
 }
 
 }  // namespace
+
+// CUPTI's clock now, for phase marks on the clock the kernel records are on.
+extern "C" unsigned long long crit_ktrace_timestamp() {
+    uint64_t now = 0;
+    cuptiGetTimestamp(&now);
+    return static_cast<unsigned long long>(now);
+}
 
 extern "C" int InitializeInjection() {
     const char* dir = getenv("CRIT_KTRACE_DIR");

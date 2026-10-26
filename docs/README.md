@@ -19,10 +19,10 @@ crit eval fetch --model MODEL_DIR --data EVAL_DATA_DIR [--packages FOLDER_OR_URL
 crit eval pack --data EVAL_DATA_DIR --packages FOLDER
 crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] --out result.json
 crit eval run --url http://127.0.0.1:8000/v1 --model MODEL_DIR --data EVAL_DATA_DIR --context TOKENS --out result.json
-crit eval status result.json [--baseline earlier.json]
+crit eval status result.json [--baseline earlier.json] [--device device.json] [--data EVAL_DATA_DIR] [--kernels kernels.json]
 crit eval compare a.json b.json
 crit eval ab --adapter my_adapter.py --config A.json --config-b B.json --model MODEL_DIR --data EVAL_DATA_DIR --out ab.json
-crit eval kernels --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json --out kernels.json
+crit eval kernels --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json --out kernels.json [--work RULES]
 ```
 
 Results report facts; crit-eval does not classify or rank. The builder reasons from them:
@@ -56,7 +56,7 @@ separately:
 
 | Command | Does | Needs |
 | --- | --- | --- |
-| `probe` | Device ceilings: free memory, copy bandwidth, GEMM TFLOPS per weight format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
+| `probe` | Device ceilings: free memory, copy bandwidth, GEMM and raw tensor-core TFLOPS per format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
 | `context` | The max context the engine must serve | the probe result, `config.json`, safetensors or GGUF headers |
 | `prepare --model M --data D` | Freeze the suite as token ids, with arithmetic per token; `--chat-template FILE` for a model without a [chat template](#chat-templates) of its own | `tokenizers`, `jinja2` |
 | `reference --model M --data D` | Score the quality texts once on the checkpoint `D` was prepared from and store the scores in `D` | `torch`, `transformers`, `safetensors` (`gguf` for a GGUF), a GPU |
@@ -272,14 +272,19 @@ scores the same tokens through the score call: the two must agree. Since that ne
 chat template, a round that measures quality requires every prompt sent as its frozen messages
 to render to its prepared token count from the first request on: a server on another template
 (thinking on, a default system prompt) fails at once, not after the speed parts. Run `crit eval
-reference --model M --data D` once before, with no engine on the device. An adapter's engine, or a
-server without the score call, gets no quality figures.
+reference --model M --data D` once before, with no engine on the device. A server without the score
+call gets no quality figures; an adapter's engine with `score()` gets them as development evidence
+(`crit eval run --adapter A --only quality`, no server needed), which is reported and never a gate
+result ([Adapter](ADAPTER.md)).
 
 ## Protocol versions
 
 Every prepared data directory and result records the protocol it ran under, `protocol` in
 [protocol.json](../crit_eval/protocol.json), versioned as crit-eval is: `crit-eval-v0.1.0` is
-version 0.1.0, the protocol crit-eval was released with (until then `crit-eval-v8`). Scores compare
+version 0.1.0, the protocol crit-eval was released with (until then `crit-eval-v8`); `crit-eval-v0.2.0` starts the
+next series (adaptive sampled repetitions move the sampled decode score), so data prepared under 0.1.x is prepared
+again and reference packages are packed again from it (the reference scores carry over: their identity is the model,
+the texts and the reference version, not the protocol). Scores compare
 within one series: one minor version before 1.0 (0.1.x), one major version from 1.0 on. A change
 that can move a score starts the next series: the speed, held-out, quality or long-context cases
 and their prompts, output lengths, warmups and repetitions, aggregation, the quality thresholds or
@@ -356,10 +361,17 @@ A successful exit does not mean quality or exactness passed: inspect the fields.
 
 ## Kernel profile
 
-`crit eval kernels` shows which kernels spend the GPU time. It runs each speed case once after
-a warmup in a child process with a CUPTI injection library, recording every kernel (CUDA-graph
-nodes included) without engine changes. It needs Linux (WSL works) and a CUDA toolkit with
-CUPTI; `--case` limits the cases. Per phase (prefill, decode) it reports wall, kernel and GPU
+`crit eval kernels` shows which kernels spend the GPU time. It runs the speed cases in a child
+process with a CUPTI injection library, recording every kernel (CUDA-graph nodes included) without
+engine changes. Each case first warms up on a prompt of its length (its own prompt rotated by half), then
+prefills a fresh prompt as a request of one output token: its own prompt with the first token changed to
+one no earlier request began with, so no prompt cache serves any of it (cases share prefixes such as tool
+definitions), then runs the whole request, whose kernels from the first delivered token on are its decode. A
+one-token request runs no verify round, so a speculative engine's verify and draft kernels are not
+counted as prefill. Each case's prefill also reports its time to first token and the GPU's busy time
+in it. The driver takes its phase marks on the tracer's own clock (CUPTI's), since the host's clock drifts
+against it by tens of milliseconds over a trace under WSL, enough to put one request's kernels into the
+next one's phase. It needs Linux (WSL works) and a CUDA toolkit with CUPTI; `--case` limits the cases. Per phase (prefill, decode) it reports wall, kernel and GPU
 idle time, then kernels ranked by total time with calls, average duration and launch width,
 flagging launches with fewer blocks than SMs, plus each case's heaviest kernels. When `info()` declares `kernel_work`, matching kernels also show achieved
 TFLOPS and GB/s against the `--device` ceilings:
@@ -370,10 +382,26 @@ TFLOPS and GB/s against the `--device` ceilings:
     {"match": "gemm_fp4", "flops_per_token": 2 * 56 * 3 * 5120 * 17408, "format": "nvfp4"},
     # Bytes one call reads and writes (weights, KV, state): memory-bound decode kernels.
     {"match": "gemv", "bytes_per_call": 89_128_960},
+    # The prefill-floor term a kernel's time joins (matmul, attention, recurrent, other, draft) and a matmul's
+    # stored weight format.
+    {"match": "a16_kernel", "term": "matmul", "format": "nvfp4"},
+    {"match": "fp8_kv::", "term": "attention"},
 ]
 ```
 
-`match` is a substring of the demangled name; the first matching rule applies. Times are
+`match` is a substring of the demangled name; for the work estimates, the first matching rule with
+`flops_per_token` or `bytes_per_call` applies, and for the terms the first with a `term`. Kernels no
+rule classes are classed by name (`gemm`, `gemv`, `matmul` as matmul of unknown format; `attn`, `flash`,
+`fmha` and KV kernels as attention; `delta`, `scan`, `ssm`, `mamba` and convolutions as recurrent;
+`draft` and `mtp` as draft work; anything else as other), and the report says how many milliseconds
+names classed. `--work JSON` (text or a file) puts rules ahead of the adapter's own, to class an
+engine's kernels without changing it. Each case's prefill reports its GPU time per term, and `crit eval
+status RESULT --kernels kernels.json` joins it to the prefill floor: per traced case, each term's
+measured milliseconds against its floor (each stored format's matmul at its best rate, and at the
+engine's declared `prompt_activations`; attention; the recurrence; other kernels, draft work and the
+host's share of the first token against zero), with a prefill gap per term (each term at its floor, all
+else as traced) after the prefill's own. The trace may run at a lower `--context` than the result.
+Times are Times are
 exclusive: a kernel that starts before the previous one ends (programmatic dependent launch,
 another stream) is charged only from that end, so a kernel waiting on its predecessor is not
 charged the wait and the kernel total never exceeds wall time; `span_ms` keeps raw durations.

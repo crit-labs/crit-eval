@@ -35,6 +35,22 @@ def score_error(case_values):
     return math.sqrt(sum(terms)) / len(terms) if terms else None
 
 
+def case_error(values):
+    """(relative standard error, standard deviation) of one case's repetitions on the log scale (score_error's term);
+    (None, None) with fewer than two."""
+    logs = [math.log(v) for v in values if v]
+    if len(logs) < 2:
+        return None, None
+    mean = sum(logs) / len(logs)
+    deviation = math.sqrt(sum((x - mean) ** 2 for x in logs) / (len(logs) - 1))
+    return deviation / math.sqrt(len(logs)), deviation
+
+
+def repetitions_for(deviation, target):
+    """Repetitions whose relative standard error reaches `target` at this standard deviation (log scale)."""
+    return max(2, math.ceil((deviation / target) ** 2)) if deviation is not None and target else None
+
+
 def percentile(values, fraction):
     """Nearest-rank percentile (fraction in (0, 1])."""
     values = sorted(values)
@@ -189,6 +205,33 @@ def text_quality(reference_rows, engine_rows):
         "top1_agreement": sum(r["top_ids"][0] == f for r, f in zip(reference_rows, first)) / len(kls),
         "max_abs_target_logprob_diff": max(abs(a - b) for a, b in zip(ref_nll, eng_nll)),
     }
+
+
+def budget_spread(reference_rows, engine_rows, thresholds, block=64, draws=200, seed=0):
+    """How much a set's share of the drift budget depends on which positions it holds: the budget used
+    (budget_used of text_quality's ppl_ratio, kld_mean and kld_p99) over `draws` block-bootstrap resamples of its
+    positions, each the set's length in blocks of `block` consecutive positions drawn with replacement from a seeded
+    generator, so neighbouring positions (which drift together) stay together. Returns the 5th, 50th and 95th
+    percentiles of the budget used and of the KLD p99, with the method; None for fewer than two blocks."""
+    import random
+    n = len(engine_rows)
+    blocks = -(-n // block)
+    if blocks < 2:
+        return None
+    kls = [partial_kl(r["top_ids"], r["top_logprobs"], dict(e["top"])) for r, e in zip(reference_rows, engine_rows)]
+    drift = [r["logprob"] - e["logprob"] for r, e in zip(reference_rows, engine_rows)]   # engine NLL - reference NLL
+    rng = random.Random(seed)
+    used, p99s = [], []
+    for _ in range(draws):
+        picked = [i for b in (rng.randrange(blocks) for _ in range(blocks)) for i in range(b * block, min(n, (b + 1) * block))][:n]
+        sample = [kls[i] for i in picked]
+        row = {"kld_mean": sum(sample) / len(sample), "kld_p99": percentile(sample, 0.99),
+               "ppl_ratio": math.exp(sum(drift[i] for i in picked) / len(picked))}
+        used.append(budget_used(row, thresholds))
+        p99s.append(row["kld_p99"])
+    return {"budget_used": {"p05": percentile(used, 0.05), "p50": percentile(used, 0.5), "p95": percentile(used, 0.95)},
+            "kld_p99": {"p05": percentile(p99s, 0.05), "p95": percentile(p99s, 0.95)},
+            "method": f"block bootstrap: {draws} resamples of {block}-position blocks"}
 
 
 def log2_bucket(value, smallest):

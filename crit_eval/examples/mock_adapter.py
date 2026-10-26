@@ -50,6 +50,15 @@ class MockEngine:
                 "draft_width": self.config["draft_tokens"], "bytes_per_pass": self.config.get("bytes_per_pass"),
                 "draft_bytes_per_step": self.config.get("draft_bytes_per_step"),
                 "kv_bytes_per_token": self.config.get("kv_bytes_per_token"),
+                # Optional: the activation format of each quantized matrix group's prompt GEMMs (bf16, fp16_acc, fp8 or
+                # stored, or shares of them per stored format), which with quality names the reachable prefill ceiling.
+                "prompt_activations": self.config.get("prompt_activations"),
+                # Optional: configuration overrides that each switch one matrix group or arithmetic choice back to
+                # exact, for crit eval run --attribute-drift ({name: overrides} or {name: {"config", "description"}}).
+                "exact_variants": self.config.get("exact_variants"),
+                # Optional: {"width": W, "config": overrides} opening this engine at a wider draft, for the drafts
+                # accepted beyond its own width.
+                "wider_draft": self.config.get("wider_draft"),
                 # Optional: replay(prompt, continuation, on_tokens) decodes a pinned continuation.
                 "replay": bool(self.config.get("replay", True)),
                 # Optional: generate_plain(prompt, max_new_tokens, on_tokens) decodes plain greedy on this
@@ -116,6 +125,21 @@ class MockEngine:
         if logprobs:
             out["logprobs"] = rows
         return out
+
+    def score(self, prompt, continuation, top_k, prompt_rows=True):
+        """Optional: fixed text scored as the engine computes it, for `crit eval run --only quality` during development
+        (development evidence, never a gate result): {"prompt": a row per prompt token after the first (none
+        without prompt_rows), "continuation": a row per continuation token}, rows {"logprob": the token's, "top":
+        [[id, logprob], ...top_k]}. This mock puts the mass on the text's own next token."""
+        # Test knob: score_drift moves this much probability off the text's own token (attribution tests).
+        mass = 0.5 - float(self.config.get("score_drift", 0.0))
+
+        def row(token):
+            top = [[token, math.log(mass)]] + [[(token + j) % 1000, math.log((1 - mass) / (top_k - 1))]
+                                               for j in range(1, top_k)]
+            return {"logprob": math.log(mass), "top": top}
+        return {"prompt": [row(t) for t in prompt[1:]] if prompt_rows else [],
+                "continuation": [row(t) for t in continuation]}
 
     def replay(self, prompt, continuation, on_tokens):
         """Decode `continuation` as if it were the engine's own greedy output (drafts accepted while

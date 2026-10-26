@@ -11,7 +11,7 @@ from pathlib import Path
 from . import CONTRACT, EVAL_DIR, __version__, load_json, portable_path, write_json
 from .hostload import HostLoad
 from . import fixed, headroom, host, metrics, status
-from .ceiling import model_ceiling
+from .ceiling import best_rates, model_ceiling
 from .chat import ChatEngine, Server
 from .deadline import Hung, RequestDeadline
 from .estimate import estimate, summary as estimate_summary
@@ -99,8 +99,10 @@ def _timed(call, prompt, output_tokens, expected=None, keep=()):
         sample["served"] = served
     sample["engine_timing"] = result.get("timing")
     sample["accepted"] = result.get("accepted")
-    # Optional engine-measured parts of the decode: time in verify passes and in draft steps (ms, whole request).
-    for key in ("verify_ms", "draft_ms"):
+    # Optional engine-measured times: the prefill and the first token from the engine's own clock (what the time to
+    # first token holds beyond them is the server's, the tokenizer's, transfer and scheduling), and the decode's time
+    # in verify passes and in draft steps (ms, whole request).
+    for key in ("prefill_ms", "first_token_ms", "verify_ms", "draft_ms"):
         value = result.get(key)
         sample[key] = float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
     sample.update({key: result[key] for key in keep if key in result})
@@ -278,13 +280,16 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
 
 
 def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, log, disturbed_spread=None,
-                      checked=None):
+                      checked=None, adaptive=False):
     """The speed cases again at the model's own sampling (protocol sampled_speed), each repetition with its own
     fixed seed: `repetitions` of them (None: one per protocol seed), with no extra repetition, since different seeds
     decode different texts. A disturbed device shows in the time per target pass, which the text does not change.
     The sampled decode score is the headline decode from crit-eval-v7 on. checked: a dict that gets each case's
     warmup reply with its log-probabilities (protocol sampling_check top_logprobs), the sampling check's replies;
-    a warmup the engine cannot serve with them runs without, and the check sends its own."""
+    a warmup the engine cannot serve with them runs without, and the check sends its own. adaptive (protocol
+    sampled_speed.adaptive, the default from crit-eval-v0.2.0): after its repetitions, a case whose relative standard
+    error exceeds target_se gets one more repetition at the next seed until it does not or it has max_repetitions.
+    Every case reports its standard error and the repetitions target_se would take."""
     rule = protocol["sampled_speed"]
     settings = prepared.get("sampling")
     if not hasattr(engine, "generate_sampled"):
@@ -301,6 +306,8 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
         return {"status": "unsupported", "reason": f"the engine does not apply the sampling's {', '.join(missing)}"}
     repetitions = len(rule["seeds"]["repetitions"]) if repetitions is None else repetitions
     seeds = [rule["seeds"]["warmup"]] * warmups + list(rule["seeds"]["repetitions"])
+    more = rule.get("adaptive") or {}
+    target, cap = float(more.get("target_se", 0.03)), int(more.get("max_repetitions", repetitions))
     cases = {}
     for case in prepared["speed"]:
         prompt, n = case["prompt_ids"], case["output_tokens"]
@@ -326,6 +333,16 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                 _, sample, _ = timed_sampled(engine, prompt, n, request)
             sample["warmup"] = i < warmups
             samples.append(sample)
+        speeds = lambda: [s["decode_tps"] for s in samples if not s["warmup"] and s.get("decode_tps")]  # noqa: E731
+        extra = 0
+        while adaptive and repetitions + extra < cap and (metrics.case_error(speeds())[0] or 0.0) > target:
+            # The next seed after the protocol's (4, 5, ...): one more text, until the case's error reaches the target.
+            seed = max(rule["seeds"]["repetitions"]) + 1 + extra
+            _, sample, _ = timed_sampled(engine, prompt, n, sampled_request(settings, seed))
+            sample.update(warmup=False, seed=seed)
+            samples.append(sample)
+            extra += 1
+        error, deviation = metrics.case_error(speeds())
         other = load.cores()
         # Only replies decoded to their full length show the device: one a server ended early, at an end token or a
         # tool call, has its time per pass from a few tokens and from how the server streamed the call.
@@ -336,13 +353,19 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
         summary = _summary([s for s in samples if not s["warmup"]])
         cases[case["id"]] = {"status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n,
                              **summary, "samples": samples,
-                             "host_other_cpu_cores": None if other is None else round(other, 2)}
+                             "host_other_cpu_cores": None if other is None else round(other, 2),
+                             # The case's relative standard error over its measured texts, the repetitions it took,
+                             # and how many target_se would take at its spread.
+                             "decode_se": error, "repetitions": repetitions + extra,
+                             "repetitions_for_target": metrics.repetitions_for(deviation, target)}
         log(f"sampled speed {case['id']}: decode {rate(summary['decode_tps'], 1)}, "
-            f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
+            f"tokens/round {summary['tokens_per_round'] or 0:.2f}"
+            + (f", standard error {error:.1%} over {repetitions + extra} repetitions" if error is not None else ""))
     measured = [c for c in cases.values() if c["status"] == "measured"]
     rounds = [c["tokens_per_round"] for c in measured if c.get("tokens_per_round")]
     return {"status": "measured", "sampling": settings, "sampling_source": prepared.get("sampling_source"),
             "warmup_runs": warmups, "repetitions": repetitions,
+            "adaptive": {"target_se": target, "max_repetitions": cap} if adaptive else None, "target_se": target,
             "decode_score": metrics.geometric_mean([c["decode_tps"] for c in measured]),
             "decode_se": metrics.score_error([[s["decode_tps"] for s in c["samples"] if not s["warmup"]]
                                               for c in measured]),
@@ -513,12 +536,19 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     the scoring, and the result says so (stopped_early). spread: the reference's own spread per set and path
     (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits)."""
     rule = protocol["quality"]
-    out = {"top_k": rule["top_k"], "continuation_tokens": rule["continuation_tokens"]}
+    # A served engine scores through the paths it serves with; an in-process adapter's score() is development evidence:
+    # reported, never a gate result (protocol quality.development).
+    out = {"top_k": rule["top_k"], "continuation_tokens": rule["continuation_tokens"],
+           "evidence": "served" if info.get("served") else "development"}
     if not callable(getattr(engine, "score", None)):
-        log("quality: not measured (an adapter's engine; quality is measured through crit serve's chat-score-v1)")
+        log("quality: not measured (the adapter's engine has no score(); served engines score through crit serve's "
+            "chat-score-v1)")
         return {**out, "status": "unsupported",
                 "reason": "quality is measured through crit serve's score call: serve the engine and run crit eval "
-                          "run --url"}
+                          "run --url (an adapter with score() gives development evidence)"}
+    if out["evidence"] == "development":
+        log("quality: development evidence (the adapter's own score(), not the served paths): reported, not a gate "
+            "result")
     if reference is None:
         log("quality: not measured (no reference scores for this data)")
         return {**out, "status": "unsupported",
@@ -562,8 +592,13 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             limits, raised = set_limits(thresholds, (spread or {}).get(name), float(rule["spread"]["factor"])
                                         if rule.get("spread") else 0.0)
             failures = metrics.judge(row, limits)
+            # The share's dependence on the positions the set holds (protocol quality.position_spread): reported.
+            noise = rule.get("position_spread") or {}
+            spread_found = metrics.budget_spread(reference_rows, found, limits, int(noise.get("block", 64)),
+                                                 int(noise.get("draws", 200)), int(noise.get("seed", 0))) if noise else None
             sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
                           "budget_used": metrics.budget_used(row, limits), "limits": limits,
+                          **({"budget_spread": spread_found} if spread_found else {}),
                           **({"reference_spread": spread[name], "raised": raised} if raised else {})}
             if raised:
                 log(f"quality {name}: judged against the reference's own spread, "
@@ -590,6 +625,65 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     return {**out, "status": "scored", "sets": sets, "buckets": buckets, "honesty": honesty,
             "skipped": skipped, "thresholds": thresholds, "passed": passed, "seconds": time.time() - started,
             "timing": timing, **({"stopped_early": stopped} if stopped else {})}
+
+
+def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
+                    context_tokens=None):
+    """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
+    exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
+    {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
+    uses and the share of the full engine's that the variant's exactness takes away. Shares need not add up: the
+    terms interact."""
+    rule = protocol["quality"].get("attribution") or {}
+    if quality.get("status") != "scored":
+        return {"status": "unmeasured", "reason": "quality was not scored"}
+    if not variants:
+        return {"status": "unmeasured", "reason": "the adapter declares no exact_variants (info): configuration "
+                                                   "overrides that switch one matrix group or arithmetic choice back to exact"}
+    base = {name: s["budget_used"] for name, s in quality["sets"].items()}
+    out = {"status": "measured", "base": base, "variants": {}}
+    for name, value in variants.items():
+        overrides = value.get("config", value) if isinstance(value, dict) else {}
+        described = value.get("description") if isinstance(value, dict) and "config" in value else None
+        engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
+        try:
+            scored = run_quality(engine, info, prepared, protocol, lambda line: log(f"attribution {name}: {line}"),
+                                 reference, thresholds, spread)
+        finally:
+            engine.close()
+        sets = {set_name: s["budget_used"] for set_name, s in (scored.get("sets") or {}).items()}
+        # The share of each set's budget the variant takes away: what this group's (or choice's) arithmetic spends.
+        shares = {set_name: (base[set_name] - used) for set_name, used in sets.items()
+                  if set_name in base and base[set_name] is not None and used is not None}
+        out["variants"][name] = {"config": overrides, "description": described, "budget_used": sets,
+                                 "share": shares, "status": scored.get("status"),
+                                 **({"stopped_early": scored["stopped_early"]} if scored.get("stopped_early") else {})}
+        worst = max(base, key=lambda s: -1 if base[s] is None else base[s])
+        log(f"attribution {name}: {worst} uses {sets.get(worst, float('nan')):.1%} of the budget with it exact "
+            f"(full engine {base[worst]:.1%})")
+    out["rule"] = rule.get("rule")
+    return out
+
+
+def run_wider_draft(module, model, config, prepared, speed, wider, log, context_tokens=None):
+    """protocol headroom.wider_draft: the drafts accepted per round at a wider draft width than the engine is built
+    with, on an engine the adapter's wider_draft ({"width": W, "config": overrides}) opens: one greedy request per
+    measured speed case, its acceptance only (its speed is not the engine's), so the headroom projects draft widths
+    up to W instead of stopping at the built one."""
+    width, overrides = int(wider["width"]), dict(wider.get("config") or {})
+    engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
+    cases = {}
+    try:
+        for case in prepared["speed"]:
+            if (speed["cases"].get(case["id"]) or {}).get("status") != "measured":
+                continue
+            _, sample = timed_generate(engine, case["prompt_ids"], case["output_tokens"])
+            if sample.get("accepted"):
+                cases[case["id"]] = {"accepted": sample["accepted"], "tokens_per_round": sample["tokens_per_round"]}
+    finally:
+        engine.close()
+    log(f"wider draft: acceptance at width {width} on " + (", ".join(cases) or "no case (no accepted counts)"))
+    return {"width": width, "engine_width": info.get("draft_width"), "config": overrides, "cases": cases}
 
 
 def clearly_failed(set_name, sets, thresholds, rule):
@@ -1030,7 +1124,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
         abort_disturbed=True, url=None, served_model=None, requested_context=None, context_basis=None, profile=None,
-        chat_template=None):
+        chat_template=None, attribute_drift=False, adaptive_sampled=True):
     """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
     (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
     url instead, the engine behind that OpenAI-compatible server (crit_eval.chat), served_model naming its model.
@@ -1052,7 +1146,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     profile: a protocol profile's name (protocol profiles), fixing the context, the curve and the lower-context
     gate as it says; the result records it.
     chat_template: the source of the --chat-template file the data must have been prepared with; the data's own
-    template (crit_eval.prepare.check_template) otherwise."""
+    template (crit_eval.prepare.check_template) otherwise.
+    attribute_drift: after quality, score it again on an engine per declared exact variant (run_attribution).
+    adaptive_sampled: repeat sampled cases past the protocol's seeds until their error reaches the protocol's target
+    (run_sampled_speed), the protocol's rule from crit-eval-v0.2.0; False (crit eval run --no-adaptive-sampled) keeps
+    the seeds' repetitions alone, an override the result records (sampled_speed.adaptive null), as --repetitions is.
+    A fixed repetition count (--repetitions, a profile's sampled_repetitions) is never extended."""
     times = PartTimes()
     protocol = load_json(EVAL_DIR / "protocol.json")
     thresholds = quality_thresholds(protocol, quality_budget)
@@ -1115,13 +1214,16 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "adapter_sha256": None if url or opener else file_sha256(adapter),
         "server": url or getattr(opener, "server", None),
         "device": {k: device.get(k) for k in ("device", "compute_capability", "cuda_runtime", "bandwidth_gbs", "tflops",
-                                               "host_to_device_gbs", "device_to_host_gbs", "host_threads", "cpu_isa",
+                                               "mma_tflops", "host_to_device_gbs", "device_to_host_gbs", "host_threads",
+                                               "cpu_isa",
                                                "host_memory_gbs", "cpu_gflops", "memory_total_bytes",
                                                "memory_free_bytes", "host_memory_total_bytes", "measured_at")}
                    if device else None,
         "bandwidth_gbs": bandwidth_gbs,
         "requirements": {"quality_budget": thresholds, "exactness": exactness},
         "context": requirement,
+        # The model's arithmetic per token and weight bytes (crit_eval.ceiling), which the floors are priced on.
+        "ceiling": ceiling,
     }
     log("host: " + host.summary(result["host"]))
     if required:
@@ -1139,7 +1241,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
                         continuations, required, settings, exactness, disturbed, bandwidth_gbs,
                         device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
-                        reference_spread)
+                        reference_spread, attribute_drift, adaptive_sampled)
     except Disturbed as error:
         log(f"aborted: {error}")
         result["aborted"] = {"reason": "disturbed", "detail": str(error)}
@@ -1151,7 +1253,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
 
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
-             out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None):
+             out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None,
+             attribute_drift=False, adaptive_sampled=True):
     times = times or PartTimes()
     lower = None
     if "context" in parts and "speed" in parts and required and settings.get("measure_lower") is False:
@@ -1170,6 +1273,8 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     result["load_ms"] = (time.perf_counter() - started) * 1000
     result["engine"] = info if not info.get("native_libraries") else         {**info, "native_libraries": [portable_path(p) for p in info["native_libraries"]]}
     result["context"]["engine_max_context"] = info["max_context"]
+    # protocol context.device_memory: what the device keeps free with this engine built for the required context.
+    memory = {"after_load": host.device_memory()}
     if info.get("native_libraries"):
         result["native_libraries"] = native_identity(info)
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
@@ -1217,7 +1322,8 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             checked = {}
             with times.part("sampled_speed"):
                 result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, warmups,
-                                                            sampled_repetitions, log, disturbed, checked)
+                                                            sampled_repetitions, log, disturbed, checked,
+                                                            adaptive=adaptive_sampled and sampled_repetitions is None)
             if result["sampled_speed"]["status"] == "measured":
                 with times.part("sampling_check"):
                     result["sampling_check"] = run_sampling_check(engine, info, prepared, protocol, log, checked)
@@ -1260,6 +1366,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 for key, row in result["context"]["interpolated"].items():
                     log(f"context {int(key):,}: interpolated decode {row['decode_tps']:.1f} tok/s, first token "
                         f"after {row['ttft_ms']:,.0f} ms")
+            memory["after_curve"] = host.device_memory()
             with times.part("retrieval"):
                 result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log,
                                                                asked)
@@ -1287,6 +1394,32 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                               f"differs at token {row['first_difference']} after {between}"))
     finally:
         engine.close()
+    measured_memory = {k: v for k, v in memory.items() if v and v.get("free_bytes") is not None}
+    if measured_memory:
+        # The least the device kept free while this engine held the required context (after its load, and after the
+        # curve filled the context up to it).
+        least = min(measured_memory.items(), key=lambda item: item[1]["free_bytes"])
+        result["context"]["device_memory"] = {**measured_memory, "free_bytes": least[1]["free_bytes"],
+                                              "total_bytes": least[1]["total_bytes"], "least_at": least[0]}
+        log(f"device memory: {least[1]['free_bytes'] / 1e9:.2f} of {least[1]['total_bytes'] / 1e9:.1f} GB free "
+            f"({least[0].replace('_', ' ')})")
+    if attribute_drift and "quality" in result:
+        # protocol quality.attribution: engines with one group or choice exact, one after another, after this one.
+        with times.part("attribution"):
+            if info.get("served"):
+                result["quality"]["attribution"] = {"status": "unmeasured",
+                                                    "reason": "a served engine cannot be opened with other arithmetic"}
+            else:
+                result["quality"]["attribution"] = run_attribution(
+                    module, model, config, prepared, protocol, log, reference_scores,
+                    result["requirements"]["quality_budget"], reference_spread, result["quality"],
+                    info.get("exact_variants"), required)
+    wider = info.get("wider_draft")
+    if (wider and "speed" in result and info.get("speculative") and not info.get("served")
+            and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
+        with times.part("wider_draft"):
+            result["speed"]["wider_draft"] = run_wider_draft(module, model, config, prepared, result["speed"], wider,
+                                                             log, required)
     if "exactness" in parts and "speed" in result and info.get("speculative") and "exactness" not in result \
             and not result.get("stopped_early"):
         if info.get("served"):
@@ -1330,14 +1463,21 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             except (OSError, ValueError, KeyError):
                 facts["draft_bytes_per_step"] = None
             draft_source = "model files" if facts["draft_bytes_per_step"] else None
+        # Each format's best probed rate, cuBLASLt's GEMM or the raw tensor cores' (crit_eval.ceiling.best_rates).
+        rates, rate_sources = best_rates(device)
         result["headroom"] = headroom.summarize(facts, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
-                                                ceiling=ceiling, tflops=device.get("tflops"), steps=steps,
+                                                ceiling=ceiling, tflops=rates or None, steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
                                                 context=result["context"], context_settings=settings,
                                                 decode_speed=decode_speed, decode_name=decode_name)
         # Bytes per pass from the engine, or from the stored model when it reports none (crit_eval.context.pass_bytes).
         result["headroom"]["bytes_per_pass_source"] = source
         result["headroom"]["draft_bytes_per_step_source"] = draft_source
+        # Prefill and TTFT priced again with the ceilings by prompt activation format, judged by this result's quality
+        # and the baseline's (crit_eval.headroom.price_prompts); the rates' sources recorded.
+        result["headroom"] = headroom.price_prompts(result, rates, rate_sources,
+                                                    protocol["speed"].get("prefill_cases", []),
+                                                    [baseline] if baseline else [])
         for warning in result["headroom"]["warnings"]:
             log("headroom: " + warning)
     result["timing"] = times.record()

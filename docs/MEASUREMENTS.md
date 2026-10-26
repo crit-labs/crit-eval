@@ -46,7 +46,14 @@ whose tokens per round differ, so their speeds disagree by content, not noise. F
 disturbed device is judged on the time per target pass (`round_ms`) of the sampled repetitions, not
 on their decode speed. Each decode score carries its relative standard error (`decode_se`: per
 case, the spread of the repetitions' logarithms over the square root of their count, combined over
-the cases), which for the sampled suite includes how much the drawn texts move it; `status` names a
+the cases), which for the sampled suite includes how much the drawn texts move it. Each sampled case reports its
+own error, its repetitions and how many would reach the protocol's `sampled_speed.adaptive.target_se` (3%) at its
+spread. From crit-eval-v0.2.0 a case whose three seeds leave its error above that target continues at the next
+seeds (4, 5, ...) until its error reaches the target or it has 9 repetitions, and its KPIs are the medians over all
+of them (`sampled_speed.adaptive` records the rule): one seed that drafts poorly no longer moves a three-seed median
+by its own text. `--no-adaptive-sampled` keeps the seeds alone, and a fixed count (`--repetitions`, the hub
+profile's two seeds) is never extended; such a decode compares only with decodes measured the same way.
+`status` names a
 baseline change within two standard errors of the difference as within the noise. The **sampled decode score**, the geometric mean of the case medians, is the decode KPI
 from v7 on (`status.kpis.decode`, with `suite` "sampled"): its headroom and ceiling, the decode goal
 and the stop record's decode follow it, and baselines compare it at the same sampling. The greedy
@@ -111,10 +118,18 @@ and exactness. `speed.decode_text` records which text was decoded.
 ## Limits
 
 **Device ceilings** come from `crit eval probe` on the target machine. It builds [probe/device_probe.cu](../crit_eval/probe/device_probe.cu) with
-`nvcc`, runs it three times and keeps medians: copy bandwidth (2 GiB device-to-device copies,
-read plus written) and dense cuBLASLt GEMM rates with FP32 accumulation at prefill-like shapes
-for BF16, FP8 E4M3 and NVFP4 (16-element E4M3 block scales), plus total and least free device
-memory and host memory. `host_to_device_gbs` records host-to-device rates per transfer size
+`nvcc` for the device's own architecture (`sm_120a` on an RTX 5090), runs it three times and keeps
+medians: copy bandwidth (2 GiB device-to-device copies, read plus written), dense cuBLASLt GEMM rates
+with FP32 accumulation at prefill-like shapes for BF16, FP8 E4M3 and NVFP4 (16-element E4M3 block
+scales) as `tflops`, raw tensor-core rates as `mma_tflops` (`mma.sync` with operands in registers on
+every SM: `bf16` and `fp16` into FP32, `fp16_acc` FP16 into FP16, `fp8` E4M3 into FP32 from sm_89, and
+on sm_120a `nvfp4`, E2M1 with E4M3 block scales, and `fp4_fp8`, E2M1 times E4M3 through
+`kind::f8f6f4`), plus total and least free device memory and host memory. cuBLASLt's GEMMs are not
+every device's best kernels: on an RTX 5090 its BF16 GEMM reached 185 to 215 TFLOPS where the BF16
+tensor cores run 251, and FP16 accumulation runs twice the FP32-accumulate rate (499). Every floor
+therefore takes each format's best probed rate, the larger of the two (`headroom.rates` records the
+rate and whether `cuBLASLt GEMM` or `raw MMA` achieved it, and `status` prints them beside the prefill
+ceiling); a device file from before the raw rates has the GEMM rates alone. `host_to_device_gbs` records host-to-device rates per transfer size
 (64 KiB to 256 MiB, keyed by bytes) for pinned copies, pageable copies and a kernel reading
 mapped pinned memory, for engines that keep weights in host memory (offloaded layers,
 host-resident experts) and size their transfers from it, and `device_to_host_gbs` the same curve back
@@ -132,11 +147,45 @@ projection in its stored format (BF16, FP8 or NVFP4; a GGUF's block types at the
 rate int8 tensor cores share, and its MXFP4/NVFP4 at the NVFP4 rate), excluding gathered embeddings, the vision
 tower, draft layers and the output head; 4 × heads × head dim per query-key pair in each
 full-attention layer; and the chunked linear-attention recurrence. The floor is matmul FLOPs at
-each format's GEMM rate, attention at the faster of the BF16 and FP8 rates (FP8 Q·Kᵀ and P·V fit
+each format's best probed rate, attention at the faster of the BF16 and FP8 rates (FP8 Q·Kᵀ and P·V fit
 the quality budget, so a BF16 attention floor can be beaten), and the recurrence at the BF16 rate.
 
 **TTFT floor:** the larger of the prompt's compute floor and one weight read (`bytes_per_pass`,
 else the language-model and output-head bytes) plus the prompt's KV writes at device bandwidth.
+
+**Where the time to first token goes.** A short prompt's time to first token is mostly not its
+prefill's arithmetic. Each speed sample keeps the engine's own `prefill_ms` and `first_token_ms` when
+the engine reports them (an adapter's `generate`, crit serve's telemetry), and each case of
+`headroom.ttft` the medians as `engine_prefill_ms` and `engine_first_token_ms` with
+`outside_engine_ms`, the rest of the measured time to first token: a server's HTTP, templating,
+tokenizer and queue, or an adapter's host work. With `--kernels`, `status` adds the trace's fresh
+first token per case, split into the GPU's busy time and the host's rest ("ttft by part").
+
+**Free device memory.** A run that builds the engine for the required context records the device memory
+nvidia-smi sees free (the whole device, other processes included) after the engine loads and after the
+long-context curve filled the context up to the requirement; `context.device_memory` keeps both and the
+least of them, which `status` prints beside the capacity gate, with its change in GB against a baseline at
+the same requirement (protocol `context.device_memory`; reported, not judged).
+
+**Ceilings by prompt activation format.** The stored-format ceiling prices an NVFP4 matrix at the
+NVFP4 rate, W4A4, and an FP8 one at the FP8 rate, W8A8: arithmetic the quality budget may not
+allow (on Qwen3.8-27B, W4A4 prompt GEMMs used 252% of it). So `headroom.activations` prices the
+prefill and TTFT floors again with every quantized matrix group's prompt activations at each of
+`bf16` (BF16 tensor cores, FP32 accumulation), `fp16_acc` (FP16 accumulating in FP16), `fp8` (FP8;
+FP4 weights times FP8 through `kind::f8f6f4`, or widened to FP8, whichever rate is faster) and `stored`
+(the stored-format ceiling), each at its best probed rate, and at the engine's own `prompt_activations`
+when its adapter declares them ([Adapter](ADAPTER.md)). The quality gate is the evidence: a result
+whose engine declares its prompt activations and whose every prompt path (`SET/prompt`, the prefill's
+own arithmetic) stays within the budget shows them passing, and one failing prompt path rules them out;
+a baseline of the same model (`--baseline`) counts as well. `status` prints the four ceilings and TTFT
+floors next to the stored one, which of them quality shows passing or rules out, and the **reachable
+limit**: the fastest shown passing, the engine's own declaration included, with a prefill gap of its own
+("prefill at its reachable ceiling"). These are reported, not judged. Without a declaration the
+reachable limit is unknown and `missing` asks for `prompt_activations`.
+
+`crit eval status RESULT --device DEVICE.json` prices prefill and time to first token with a newer
+probe's rates, and `--data DIR` with the model arithmetic of the data the result was measured on, for
+results before crit-eval-v0.1.2, which do not record it (`ceiling` in the result).
 
 **Decode headroom.** Every case reports `round_ms`, decode time per target pass. Optional
 adapter fields add the ceiling:
@@ -171,7 +220,15 @@ adapter fields add the ceiling:
   not the one-token-per-pass floor.
 
 When `generate()` reports `verify_ms` and `draft_ms`, draft steps are compared with the drafter's
-bandwidth floor and the verify pass with the ordinary pass; otherwise they form one term.
+bandwidth floor and the verify pass with the ordinary pass; otherwise they form one term. A kernel
+trace splits them for an engine that reports neither: `crit eval status RESULT --kernels kernels.json`
+takes each case's decode GPU time in kernels classed `draft` over its draft steps and the rest over its
+rounds (protocol `headroom.trace_parts`), and gives the two gaps apart.
+
+An adapter that declares `wider_draft` (`{"width": W, "config": overrides}`) gets one more engine after
+the run's own, opened at that width, which decodes each measured speed case once greedily for its drafts
+accepted per round (`speed.wider_draft`); the width projections then go on past the built width, each
+further draft adding what it added at the probed width (protocol `headroom.wider_draft`).
 
 **Gaps** state what each term would add at its floor, all else as measured: model pass, draft
 steps, verify pass at the ordinary pass cost, best draft width and drafter acceptance (on the
@@ -272,6 +329,22 @@ the budget and twice the reference's own spread (mean and p99 KLD; the PPL ratio
 the result records the spread and the limits it raised (`reference_spread`, `limits`, `raised`);
 `status` names the sets so judged. A dense model's two runs stay far inside the budget, so nothing
 changes for it.
+
+**Drift attribution.** `crit eval run --adapter A --attribute-drift` (with `--only quality` during development)
+scores the quality texts again after the run's own engine closes, on an engine opened with each of the adapter's
+`exact_variants`: configuration overrides that each switch one matrix group or arithmetic choice back to exact (the
+NVFP4 prompt GEMMs, FP16 accumulation, FP8 attention). `quality.attribution` holds, per variant and set, the budget
+used with it exact and its share, the full engine's budget used minus the variant's; `status` prints each variant's
+share on the worst set. Shares do not add up (the terms interact), and an engine behind a server cannot be opened
+with other arithmetic, so it has no attribution. Reported, not judged (protocol `quality.attribution`).
+
+**Position spread.** A set's share of the budget rests on its positions, and the KLD p99 on a few
+knife-edge ones (on a Qwen3.8-27B engine the 4K text's KL moved by ±30% under any small numeric
+change), so each set and path also reports `budget_spread` (protocol `quality.position_spread`): its
+share over 200 block-bootstrap resamples of its positions, each the set's length in blocks of 64
+consecutive positions drawn with replacement from a seeded generator, as the 5th, 50th and 95th
+percentiles, and the KLD p99's 5th and 95th. `status` prints the worst set's 5th to 95th percentile
+beside its share. It is reported, not judged: the gate judges the measured set.
 
 The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
