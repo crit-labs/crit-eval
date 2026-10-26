@@ -612,7 +612,7 @@ class ChatServerTests(unittest.TestCase):
         texts = fixed.texts(json.loads((self.data / "prepared.json").read_text()))
 
         class Reference:
-            def __init__(self, model):
+            def __init__(self, model, quality_mode="preserve"):
                 self.model = model
 
             def identity(self, model_sha):

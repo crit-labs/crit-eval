@@ -140,6 +140,21 @@ class KernelTraceTest(unittest.TestCase):
         self.assertEqual(kernels.classify(None, "void ns::(anonymous namespace)::delta_scan_kernel<128>"),
                          ("recurrent", None, "names"))
         self.assertEqual(kernels.classify(None, "convert_fp16_kernel"), ("other", None, "names"))
+        self.assertEqual(prefill["unclassed"], [{"kernel": "rmsnorm_kernel", "ms": 0.05}])
+        self.assertIn("other by name: rmsnorm_kernel 0.1 ms (class them with kernel_work rules)", text)
+
+    def test_projections_named_by_scheme_are_matmul_with_the_format_their_name_gives(self):
+        for name, found in (
+                # crit's stored-tile projections: the BF16-activation prompt GEMM and the decode GEMV.
+                ("void crit::stored_tile::(anonymous namespace)::a16_kernel<true, false>(crit::A16Args)", ("matmul", None)),
+                ("void crit::stored_tile::(anonymous namespace)::gemv_kernel<false, 1, 8, 2, 4>(Args)", ("matmul", None)),
+                ("void marlin::Marlin<256, 4>(int4 const*)", ("matmul", None)),
+                ("w4a16_gemm_kernel", ("matmul", None)),
+                ("void crit::stored_tile::gemm_fp4_kernel(unsigned char const*)", ("matmul", "nvfp4")),
+                ("cutlass::Kernel2<GemmUniversal<e4m3_t, float>>", ("matmul", "fp8")),
+                ("w4a8_gemm_fp4_fp8_kernel", ("matmul", "nvfp4")),   # FP4 weights times FP8 activations
+                ("fp8_kv_prefill_kernel", ("attention", None))):      # a format in the name of another term
+            self.assertEqual(kernels.classify(None, name)[:2], found, name)
 
     def test_short_name_drops_parameters_not_templates(self):
         self.assertEqual(kernels.short_name("void ns::k<a(b), 2>(float const*, int)"), "ns::k<a(b), 2>")

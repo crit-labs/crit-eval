@@ -34,6 +34,11 @@ matrix's element count from headers alone (no torch). dense(checkpoint, base, de
 with the same arithmetic the format's own library performs in FP32 (torch). Weight-only integer schemes count at
 the bf16 rate (engines widen their codes to 16 bits for the GEMM); 8-bit integer weights with per-row scales at
 the fp8 rate (int8 tensor cores run at the FP8 rate). A new scheme is one entry in SCHEMES.
+
+activations(checkpoint, base) says how the checkpoint's own inference quantizes the activations a quantized matrix
+multiplies (its declared input activations: compressed-tensors input_activations with base.input_global_scale or
+base.input_scale, ModelOpt base.input_scale), and quantize_activations applies it in FP32, the reference's
+quality_mode as_quantized (crit_eval.reference).
 """
 import json
 import math
@@ -95,19 +100,100 @@ def _mlx(quantization, base):
     return int(source.get("bits", 4)), int(source.get("group_size", 64)), str(source.get("mode", "affine"))
 
 
+def _ct_group(quantization, base, linear=False):
+    """The compressed-tensors config group with weights whose targets name matrix `base` (its module name, or `re:`
+    a pattern matched from its start, as compressed-tensors matches them), or None; with `linear`, else the first that
+    targets the class Linear (every linear matrix the config does not ignore)."""
+    groups = [group for group in ((quantization or {}).get("config_groups") or {}).values()
+              if base is not None and isinstance(group, dict) and group.get("weights")]
+    for group in groups:
+        if any(target == base or target.startswith("re:") and re.match(target[3:], base)
+               for target in group.get("targets") or ()):
+            return group
+    return next((group for group in groups if "Linear" in (group.get("targets") or ())), None) if linear else None
+
+
 def _ct_args(quantization, base=None):
     """compressed-tensors' weight quantization args (num_bits, strategy, group_size, symmetric) for matrix `base`:
-    of the config groups with weights, the one whose targets name it (its module name, or `re:` a pattern matched
-    from its start, as compressed-tensors matches them), else the first. A mixed-precision checkpoint has a group
-    per scheme (DeepSeek V4 W4A16-FP8: FP8 blocks for attention, packed int4 for the experts)."""
+    of the config groups with weights, the one whose targets name it (_ct_group), else the first. A mixed-precision
+    checkpoint has a group per scheme (DeepSeek V4 W4A16-FP8: FP8 blocks for attention, packed int4 for the
+    experts)."""
+    group = _ct_group(quantization, base)
+    if group is not None:
+        return group["weights"]
     groups = [group["weights"] for group in ((quantization or {}).get("config_groups") or {}).values()
               if isinstance(group, dict) and group.get("weights")]
-    for group in ((quantization or {}).get("config_groups") or {}).values():
-        if base is not None and isinstance(group, dict) and group.get("weights") and any(
-                target == base or target.startswith("re:") and re.match(target[3:], base)
-                for target in group.get("targets") or ()):
-            return group["weights"]
     return groups[0] if groups else {}
+
+
+FP8_MAX = 448.0
+E2M1_MAX = 6.0
+
+
+def activations(checkpoint, base):
+    """How the checkpoint's own inference quantizes the activations quantized matrix `base` multiplies: None when
+    it declares none (weight-only schemes, plain matrices), else (kind, scale):
+        ("nvfp4", g)      E2M1 values in groups of 16 along the input with E4M3 group scales, global scale g a
+                          divisor (compressed-tensors base.input_global_scale; ModelOpt 1 / base.input_scale)
+        ("fp8_token", None) E4M3 values with one scale per token, amax / 448 (dynamic, strategy token)
+        ("fp8_tensor", s) E4M3 values with the stored static scale s (base.input_scale, a multiplier)
+    SchemeError for activations declared in a form crit does not emulate."""
+    kind = scheme(checkpoint, base)
+    if kind not in ("fp8", "nvfp4"):
+        return None
+    quantization = checkpoint.quantization or {}
+    if _method(quantization) == "compressed-tensors":
+        group = _ct_group(quantization, base, linear=True)
+        args = (group or {}).get("input_activations")
+        if not args:
+            return None
+        bits, numeric = int(args.get("num_bits", 8)), str(args.get("type", "float"))
+        if numeric == "float" and bits == 4 and int(args.get("group_size") or 0) == 16:
+            if not checkpoint.has(base + ".input_global_scale"):
+                raise SchemeError(f"{base}: NVFP4 input activations without {base}.input_global_scale")
+            return "nvfp4", float(checkpoint.raw(base + ".input_global_scale").float().reshape(-1)[0])
+        if numeric == "float" and bits == 8 and args.get("dynamic") is True and args.get("strategy") == "token":
+            return "fp8_token", None
+        if numeric == "float" and bits == 8 and not args.get("dynamic") and checkpoint.has(base + ".input_scale"):
+            return "fp8_tensor", float(checkpoint.raw(base + ".input_scale").float().reshape(-1)[0])
+        raise SchemeError(f"{base}: input activations {args} are not a form crit emulates")
+    if checkpoint.has(base + ".input_scale"):   # ModelOpt: a static input scale per matrix
+        scale = float(checkpoint.raw(base + ".input_scale").float().reshape(-1)[0])
+        return ("nvfp4", 1.0 / scale) if kind == "nvfp4" else ("fp8_tensor", scale)
+    return None
+
+
+def _round_e2m1(magnitude):
+    """Magnitudes (at most 6) to the nearest E2M1 value, ties to the even code, as the hardware conversion rounds."""
+    import torch
+    grid = torch.tensor(E2M1, dtype=magnitude.dtype, device=magnitude.device)
+    middles = (grid[1:] + grid[:-1]) / 2
+    index = torch.bucketize(magnitude, middles)   # a tie goes to the lower value, code index
+    upward = (index < len(middles)) & (magnitude == middles[index.clamp(max=len(middles) - 1)]) & (index % 2 == 1)
+    return grid[index + upward.long()]
+
+
+def quantize_activations(x, kind, scale):
+    """FP32 activations `x` [..., in] quantized and dequantized as `activations()` describes (kind, scale)."""
+    import torch
+    if kind == "nvfp4":
+        shape = x.shape
+        if shape[-1] % 16:
+            raise SchemeError(f"NVFP4 activations need a multiple of 16 inputs, not {shape[-1]}")
+        blocks = x.reshape(*shape[:-1], shape[-1] // 16, 16)
+        amax = blocks.abs().amax(-1, keepdim=True)
+        stored = (amax / E2M1_MAX * scale).clamp(max=FP8_MAX).to(torch.float8_e4m3fn).float()
+        step = stored / scale
+        safe = torch.where(step > 0, step, torch.ones_like(step))
+        codes = _round_e2m1((blocks.abs() / safe).clamp(max=E2M1_MAX)) * blocks.sign()
+        return (codes * step).reshape(shape)
+    if kind == "fp8_token":
+        step = (x.abs().amax(-1, keepdim=True) / FP8_MAX).clamp(min=torch.finfo(torch.float32).tiny)
+    elif kind == "fp8_tensor":
+        step = torch.tensor(scale, dtype=x.dtype, device=x.device)
+    else:
+        raise SchemeError(f"unknown activation quantization {kind!r}")
+    return (x / step).clamp(-FP8_MAX, FP8_MAX).to(torch.float8_e4m3fn).float() * step
 
 
 # Each scheme: stored(tensors, base, quantization) -> (rate, elements) or None, and decode(checkpoint, base,

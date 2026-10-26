@@ -7,6 +7,38 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.1.2] - 2026-10-26
+
+### Added
+
+- Quality modes (protocol crit-eval-v0.1.2; no score of crit-eval-v0.1.0 moves): `preserve`, the default, judges
+  quality against the reference with exact activations as before; `as_quantized` against the checkpoint run as
+  quantized, the reference with the activations quantized as its stored scheme declares (NVFP4 in groups of 16 with
+  the stored global scale, FP8 per token or per tensor; `crit_eval.schemes.activations` and `quantize_activations`).
+  `crit eval reference --quality-mode as_quantized` scores them into `reference-as-quantized/`, reference packages
+  carry them, and `crit eval run --quality-mode as_quantized` judges against them; results record
+  `requirements.quality_mode`. A checkpoint whose declared matrices are fused experts is refused in that mode.
+- Status prices prefill and the first tokens at the quality mode's arithmetic: in `preserve` at the fastest 16-bit
+  prompt activations (or a faster one quality shows passing), in `as_quantized` at the stored format. Goals and
+  `kpis` carry these limits (`stored_ceiling`, `stored_floor_ms` keep the stored format's), so a quality-preserving
+  engine is measured against what it can reach, and status names the mode and the trade once ("as_quantized would
+  allow prefill 18,220 tok/s"). Results without a mode are read as `preserve`.
+
+### Changed
+
+- `crit eval kernels` classes weight-only GEMMs (`w4a16`, `marlin`) and crit's `stored_tile` projections as matmul
+  by name, with the weight format the name gives (`fp4`, `e2m1`: nvfp4; `fp8`, `e4m3`: fp8). Each traced prefill
+  lists its largest kernels classed other by name (`unclassed`), and the trace and `status --kernels` print them,
+  so a rule can class them. Before, crit's own BF16-activation prompt GEMMs counted as other kernels, and
+  matmul looked faster than its floor.
+- `crit eval status --kernels` shows each matmul row's achieved TFLOPS and its floor at the engine's declared
+  `prompt_activations` (also when matmul is one row of unknown format), and gives a matmul slower than that rate a
+  second prefill gap, at the rate of the arithmetic the engine already uses. A matmul faster than its floor is
+  flagged as kernels classed under other terms, and a trace without every prefill-scored case says which it lacks
+  (`untraced`), since the gaps per term need them all.
+- `crit eval status` names the prompt activation formats faster than the reachable limit that no quality evidence
+  judges yet ("not judged by quality"), beside those it shows passing or rules out.
+
 ## [0.1.1] - 2026-10-26
 
 ### Fixed

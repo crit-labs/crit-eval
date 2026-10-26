@@ -337,6 +337,53 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
     return {"formats": formats, "modes": modes, "declared": own, "reachable": reachable, "missing": missing}
 
 
+# A quality-preserving engine keeps its prompt activations in 16 bits (quality mode preserve): the fastest of these
+# prices its prompt arithmetic's limits, unless quality shows a faster arithmetic passing.
+PRESERVE_ACTIVATIONS = ("bf16", "fp16_acc")
+
+
+def quality_mode(result):
+    """The quality mode a result was judged in (requirements.quality_mode): preserve unless it says as_quantized."""
+    return (result.get("requirements") or {}).get("quality_mode") or "preserve"
+
+
+def mode_limits(result):
+    """The prefill ceiling, time-to-first-token floor and long-context first-token floor of the result's quality mode:
+    {"activations": label, "prefill": tok/s, "ttft": ms, "context_ttft": ms or None}, or None where the stored-format
+    limits stand. as_quantized runs the checkpoint's own activations, so its limits are the stored format's (None).
+    preserve keeps the activations exact: its limits take the fastest of the 16-bit prompt activations
+    (PRESERVE_ACTIVATIONS) and of any arithmetic quality shows passing (activation_ceilings' reachable one), priced on
+    the same cases and points as the stored ones. None too while the ceilings by activation are not priced."""
+    if quality_mode(result) != "preserve":
+        return None
+    room = result.get("headroom") or {}
+    found = room.get("activations") or {}
+    formats = found.get("formats") or ()
+    options = [(row["ceiling_score"], name, {f: {name: 1.0} for f in formats}, row.get("ttft_floor_ms"))
+               for name, row in (found.get("modes") or {}).items()
+               if name in PRESERVE_ACTIVATIONS and row.get("ceiling_score")]
+    reach = found.get("reachable")
+    if reach and reach.get("ceiling_score"):
+        shares = ((found.get("declared") or {}).get("activations") if reach["name"] == "declared"
+                  else {f: {reach["name"]: 1.0} for f in formats})
+        options.append((reach["ceiling_score"], reach["label"], shares, reach.get("ttft_floor_ms")))
+    if not options:
+        return None
+    score, label, shares, ttft_floor = max(options, key=lambda option: option[0])
+    # The long-context points' first-token floors at the same activations, as context_summary prices the stored ones.
+    points = [row for row in ((room.get("context") or {}).get("points") or {}).values() if row.get("ttft_floor")]
+    rates = (room.get("rates") or {}).get("tflops")
+    floors = []
+    for row in points:
+        floor, _ = model_ceiling.ttft_floor_ms(result.get("ceiling"), rates, room.get("bandwidth_gbs") or
+                                               result.get("bandwidth_gbs"), row["prompt_tokens"],
+                                               (result.get("engine") or {}).get("bytes_per_pass"), shares)
+        if floor:
+            floors.append(floor["total_ms"])
+    context = metrics.geometric_mean(floors) if points and len(floors) == len(points) else None
+    return {"activations": label, "prefill": score, "ttft": ttft_floor, "context_ttft": context}
+
+
 def reachable_gap(prefill, activations):
     """Prefill at the fastest ceiling quality evidence shows passing (activation_ceilings), all else as measured."""
     reachable = (activations or {}).get("reachable")
@@ -424,8 +471,11 @@ def prefill_terms(result, trace, rates, prefill_cases):
     each term took in its prefill (a fresh one-token request) against that term's floor at `rates` on the result's
     model arithmetic: matmul per stored weight format (one matmul row when a kernel's format is unknown), attention,
     recurrent, other kernels and draft work (floor 0), and the host's share of the first token (first-token time
-    beyond the GPU's busy time, floor 0). The gaps: each term at its floor, all else as the trace measured, on the
-    prefill score. None without a trace or the arithmetic."""
+    beyond the GPU's busy time, floor 0). Each matmul row also carries its floor at the engine's declared
+    prompt_activations (floor_own_ms) and the TFLOPS it achieved. The gaps: each term at its floor, and each matmul at
+    its own activations' rate where that is slower than the stored format's, all else as the trace measured, on the
+    prefill score, stated only when the trace holds every prefill-scored case (untraced names the ones it lacks). None
+    without a trace or the arithmetic."""
     ceiling = result.get("ceiling")
     measured = {cid: c for cid, c in (result.get("speed") or {}).get("cases", {}).items() if c.get("status") == "measured"}
     if not trace or not ceiling or not rates:
@@ -461,13 +511,29 @@ def prefill_terms(result, trace, rates, prefill_cases):
         total = first if first is not None else entry.get("wall_ms")
         cases[case_id] = {"prompt_tokens": case["prompt_tokens"], "trace_ms": total,
                           "named_ms": (entry.get("classified_ms") or {}).get("names", 0.0),
+                          "unclassed": entry.get("unclassed") or [],
                           "terms": {k: {"measured_ms": m, "floor_ms": f} for k, (m, f) in rows.items()}}
+        terms = cases[case_id]["terms"]
         priced, _ = model_ceiling.prefill_floor_ms(ceiling, rates, case["prompt_tokens"], own) if own else (None, None)
         for f, ms in ((priced or {}).get("matmul_by_format") or {}).items():
-            if f"matmul:{f}" in cases[case_id]["terms"]:
-                cases[case_id]["terms"][f"matmul:{f}"]["floor_own_ms"] = ms
+            if f"matmul:{f}" in terms:
+                terms[f"matmul:{f}"]["floor_own_ms"] = ms
+        if priced and "matmul" in terms:
+            terms["matmul"]["floor_own_ms"] = priced["matmul_ms"]
+        # The rate each matmul row achieved: its FLOPs over its measured time (a format's, or all of them together).
+        flops = ceiling.get("matmul_flops_per_token") or {}
+        for key, row in terms.items():
+            work = (sum(flops.values()) if key == "matmul" else flops.get(key[len("matmul:"):])
+                    if key.startswith("matmul:") else None)
+            if work and row["measured_ms"] > 0:
+                row["achieved_tflops"] = case["prompt_tokens"] * work / (row["measured_ms"] / 1000) / 1e12
         if case_id in prefill_cases and total:
             speedups[case_id] = {k: total / max(total - max(0.0, m - f), 1e-9) for k, (m, f) in rows.items()}
+            # A matmul at the rate of the engine's own prompt activations: the part of its gap the arithmetic it
+            # already uses leaves, beside the one at the stored format's rate.
+            speedups[case_id].update({f"{k}@own": total / max(total - max(0.0, row["measured_ms"] - row["floor_own_ms"]), 1e-9)
+                                      for k, row in terms.items()
+                                      if row.get("floor_own_ms") is not None and row["floor_own_ms"] > row["floor_ms"]})
     gaps = []
     if speedups and len(speedups) == len(prefill_cases):
         names = {"other": "other kernels at zero", "draft": "draft work in the prefill at zero",
@@ -476,14 +542,20 @@ def prefill_terms(result, trace, rates, prefill_cases):
         for term in dict.fromkeys(k for s in speedups.values() for k in s):
             gain = metrics.geometric_mean([s.get(term, 1.0) for s in speedups.values()]) - 1
             if gain > 0.005:
-                detail = "; ".join(f"{cid} {cases[cid]['terms'][term]['measured_ms']:,.1f} vs "
-                                   f"{cases[cid]['terms'][term]['floor_ms']:,.1f} ms" for cid in speedups
-                                   if term in cases[cid]["terms"])
-                gaps.append({"kpi": "prefill", "name": "prefill " + names.get(term, f"{term} at its floor"),
-                             "projected_gain": gain, "detail": f"kernel trace vs floor: {detail}", "term": term,
-                             "cases": list(speedups)})
+                key, at_own = term.removesuffix("@own"), term.endswith("@own")
+                floor_key = "floor_own_ms" if at_own else "floor_ms"
+                detail = "; ".join(f"{cid} {cases[cid]['terms'][key]['measured_ms']:,.1f} vs "
+                                   f"{cases[cid]['terms'][key][floor_key]:,.1f} ms" for cid in speedups
+                                   if floor_key in cases[cid]["terms"].get(key, {}))
+                name = (f"{key} at the rate of its own prompt activations ({activation_label(own)})" if at_own
+                        else names.get(term, f"{term} at its floor"))
+                gaps.append({"kpi": "prefill", "name": "prefill " + name, "projected_gain": gain,
+                             "detail": f"kernel trace vs floor: {detail}", "term": term, "cases": list(speedups)})
+    traced = set(cases)
     return {"engine": (trace.get("engine") or {}).get("name"), "prefill_request": trace.get("prefill_request"),
-            "cases": cases, "gaps": gaps}
+            "cases": cases, "gaps": gaps,
+            # Prefill-scored cases the trace lacks: without every one, no per-term gap is stated.
+            "untraced": [cid for cid in prefill_cases if cid not in traced]}
 
 
 def trace_decode_parts(result, trace):

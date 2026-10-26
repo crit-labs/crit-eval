@@ -43,6 +43,15 @@ every block type gguf-py decodes, with GGUF's reference converter layout undone 
 config.json its metadata derives (crit_core.model.gguf_files) unless its folder has the base model's.
 Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
 run once per prepared data.
+
+Quality mode as_quantized (`crit eval reference --quality-mode as_quantized`) scores the texts once more with the
+activations quantized as the checkpoint's own inference does: every matrix (and the output head) whose stored scheme
+declares input activations (crit_eval.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
+token or per tensor) multiplies its inputs quantized and dequantized in FP32, the weights as in preserve mode. The KV
+cache and every other operation stay as in preserve mode. Its scores have a store of their own (crit_eval.fixed
+STORES), so an engine that runs the checkpoint as quantized is judged against that arithmetic, not the exact one. A
+matrix with declared activations that the modeling code multiplies other than through an nn.Linear (fused experts) is
+refused rather than left exact.
 """
 import math
 import re
@@ -54,6 +63,7 @@ from types import SimpleNamespace
 from . import EVAL_DIR, load_json, write_json
 from .indexers import FORM_VERSIONS, exact_forms
 from .prepare import PREPARED, model_identity, prepared_template
+from .fixed import QUALITY_MODES, STORE, STORES
 from .schemes import PRIMARY, SchemeError, quantization_of, refuse_unread
 
 # torch dtype names -> safetensors dtype names
@@ -977,8 +987,13 @@ class StreamingReference:
     # would take more than half the device's free memory in FP32, True for every one, False for none.
     stream_experts = None
 
-    def __init__(self, model, device="cuda"):
+    def __init__(self, model, device="cuda", quality_mode="preserve"):
         import os
+        if quality_mode not in QUALITY_MODES:
+            raise SystemExit(f"quality mode must be one of {', '.join(QUALITY_MODES)}")
+        self.quality_mode = quality_mode
+        # as_quantized: {checkpoint base: crit_eval.schemes.activations} as found, and the output head's
+        self.inputs, self.head_inputs = {}, None
         # Chunked attention allocates a score block of another width for every block of query rows; torch's default
         # segments then fragment until the device is full (a 32K-token text on Gemma-4-31B), while expandable
         # segments reuse the memory. Read when the process first allocates on the device; arithmetic is unchanged.
@@ -1254,6 +1269,8 @@ class StreamingReference:
             state[name] = value if tensor is None else tensor
         module.load_state_dict(state, strict=True, assign=True)
         self._place(module)
+        if self.quality_mode == "as_quantized":
+            self._quantize_inputs(module, path)
         for name, experts in streamed.items():
             owner, _, attribute = name.rpartition(".")
             owner = module.get_submodule(owner) if owner else module
@@ -1261,6 +1278,44 @@ class StreamingReference:
             owner.__dict__[attribute] = experts
         self._config_dt_limit(module)
         return module
+
+    def _activations(self, base):
+        from .schemes import activations
+        if base not in self.inputs:
+            self.inputs[base] = activations(self.checkpoint, base)
+        return self.inputs[base]
+
+    def _quantize_inputs(self, module, path):
+        """Quality mode as_quantized: the nn.Linear matrices of `module` (modeling-code path `path`) whose checkpoint
+        declares input activations quantize their inputs as it declares (crit_eval.schemes.quantize_activations), by
+        a forward pre-hook set once per module. In a decoder layer, every stored matrix with declared activations must
+        be one of them: one the modeling code multiplies otherwise (fused experts, a converted parameter) is refused."""
+        from .schemes import quantize_activations
+        hooked = set()
+        for sub, child in module.named_modules():
+            if not isinstance(child, self.torch.nn.Linear):
+                continue
+            name = path + (sub + "." if sub else "") + "weight"
+            if name in self.converted:
+                continue
+            base = self._key(name)[: -len(".weight")]
+            declared = self._activations(base)
+            hooked.add(base)
+            if declared and getattr(child, "_crit_inputs", None) != declared:
+                if getattr(child, "_crit_hook", None) is not None:
+                    child._crit_hook.remove()
+                kind, scale = declared
+                child._crit_hook = child.register_forward_pre_hook(
+                    lambda _, args, kind=kind, scale=scale: (quantize_activations(args[0], kind, scale),) + tuple(args[1:]))
+                child._crit_inputs = declared
+        if path:
+            prefix = self.prefix + path
+            missed = sorted(base for base in self.members if base.startswith(prefix) and base not in hooked
+                            and self._activations(base))
+            if missed:
+                raise SchemeError(f"as_quantized: {', '.join(missed[:3])} declare quantized input activations, but the "
+                                  "modeling code multiplies them other than through an nn.Linear (fused experts or a "
+                                  "converted parameter); crit does not emulate their activations")
 
     def _streamed(self, module, path):
         """{name: _StreamedExperts} of `module`'s fused expert parameters to decode expert by expert: those whose
@@ -1464,6 +1519,7 @@ class StreamingReference:
         device = self.torch.cuda.get_device_name(self.device) if str(self.device).startswith("cuda") else "cpu"
         return {"reference": REFERENCE_VERSION, "transformers": transformers.__version__,
                 "torch": self.torch.__version__, "device": device, "model_sha256": model_sha,
+                **({"quality_mode": self.quality_mode} if self.quality_mode != "preserve" else {}),
                 **({"forms": [f"{name}@{FORM_VERSIONS.get(name, 1)}" for name in self.forms]} if self.forms else {}),
                 # Only attention with sinks runs its long texts otherwise (chunked_sink_attention).
                 **({"long_attention": self.chunked} if self.chunked != CHUNKED else {})}
@@ -1768,8 +1824,10 @@ class StreamingReference:
         tied = not _stored_tensor(self.checkpoint, stored) and getattr(self.config, "tie_word_embeddings", False)
         embedding = next(name for name, module in self.skeleton.named_modules()
                          if module is self.skeleton.get_input_embeddings())
-        head = self.checkpoint.dense((self._key(embedding + ".weight") if tied else stored)[: -len(".weight")],
-                                     self.device)[:valid_vocab]
+        base = (self._key(embedding + ".weight") if tied else stored)[: -len(".weight")]
+        head = self.checkpoint.dense(base, self.device)[:valid_vocab]
+        # as_quantized: the head's inputs quantized as the checkpoint declares for it (FP8 per token, typically).
+        self.head_inputs = self._activations(base) if self.quality_mode == "as_quantized" else None
         return head, getattr(self.config, "final_logit_softcapping", None)
 
     def _text_rows(self, ids, pieces, outputs, head, cap, top_k, long):
@@ -1783,7 +1841,11 @@ class StreamingReference:
             hidden = self._tail(piece, out.to(self.device))[0]
             following = torch.tensor(ids[start + 1:start + len(piece) + 1], device=self.device)
             for row in range(0, len(following), SCORE_ROWS):
-                logits = hidden[row:row + SCORE_ROWS][:len(following) - row] @ head.T
+                rows = hidden[row:row + SCORE_ROWS][:len(following) - row]
+                if self.head_inputs:
+                    from .schemes import quantize_activations
+                    rows = quantize_activations(rows, *self.head_inputs)
+                logits = rows @ head.T
                 if cap:
                     logits = torch.tanh(logits / cap) * cap
                 logprobs = torch.log_softmax(logits.double(), dim=-1)
@@ -1797,7 +1859,7 @@ class StreamingReference:
 
 
 def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print, check=lambda: None, spread=None,
-                layout=None):
+                layout=None, store=STORE):
     """Score every fixed text once per identity and store the scores under prepared data folder `data`
     (crit_eval.fixed: each position's target log-probability, top_k ids and their log-probabilities, with the identity:
     the reference's, top_k, valid_vocab and every text's ids). texts: {text id: (ids, long)}. Returns how they were
@@ -1806,32 +1868,34 @@ def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print
     spread["from_tokens"] tokens are scored once more under spread["perturbation"] (store_spread), the model's own
     arithmetic perturbed as an engine's would be, and how far that run lands from the stored scores is stored per set
     and path (fixed.write_spread), the spread a run judges those sets against; "spread" says whether it was stored or
-    scored."""
+    scored. store: the folder of the reference's quality mode (crit_eval.fixed STORES)."""
     import shutil
     from . import fixed
     identity = dict(reference.identity(model_sha), **fixed.identity(texts, top_k, valid_vocab))
     positions = sum(len(ids) - 1 for ids, _ in texts.values())
-    if fixed.load(data, identity) is not None:
+    if fixed.load(data, identity, store) is not None:
         out = {"method": "stored", "positions": positions}
     else:
-        shutil.rmtree(Path(data) / fixed.STORE, ignore_errors=True)
+        shutil.rmtree(Path(data) / store, ignore_errors=True)
         names = list(texts)
         started = time.time()
         rows = reference.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
-                                     Path(data) / fixed.STORE / "scratch", log=log,
+                                     Path(data) / store / "scratch", log=log,
                                      long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
         size = fixed.write(data, identity, {name: (target.tolist(), top.tolist(), values.tolist())
-                                            for name, (target, top, values) in zip(names, rows)})
+                                            for name, (target, top, values) in zip(names, rows)}, store)
         out = {"method": "scored", "seconds": round(time.time() - started, 1), "positions": positions, "bytes": size}
     if spread and layout:
-        out["spread"] = store_spread(reference, texts, top_k, valid_vocab, data, identity, spread, layout, log, check)
+        out["spread"] = store_spread(reference, texts, top_k, valid_vocab, data, identity, spread, layout, log, check,
+                                     store)
     return out
 
 
 SPREAD_PERTURBATIONS = ("tf32",)
 
 
-def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, layout, log=print, check=lambda: None):
+def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, layout, log=print, check=lambda: None,
+                 store=STORE):
     """The reference's own spread on the texts of at least rule["from_tokens"] tokens (store_texts): scored once more
     under rule["perturbation"] and compared with the stored scores by crit_eval.metrics.text_quality per set and path
     (SET/prompt: the prompt positions, SET/served: the continuation's), stored with the identity plus the perturbation
@@ -1849,7 +1913,7 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
     spread_identity = {**identity, "spread_perturbation": perturbation, "spread_texts": sorted(long_texts)}
     if not long_texts:
         return "none"
-    if fixed.load_spread(data, spread_identity) is not None:
+    if fixed.load_spread(data, spread_identity, store) is not None:
         return "stored"
     names = list(long_texts)
     log(f"reference spread: {len(names)} text(s) scored again with {perturbation} matmuls")
@@ -1858,11 +1922,11 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     try:
         rows = reference.score_texts([long_texts[name][0] for name in names], top_k, valid_vocab,
-                                     Path(data) / fixed.STORE / "scratch-spread", log=log,
+                                     Path(data) / store / "scratch-spread", log=log,
                                      long={i for i, name in enumerate(names) if long_texts[name][1]}, check=check)
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous
-    stored = fixed.load(data, identity)
+    stored = fixed.load(data, identity, store)
     parts = {}
     for name, (target, top, values) in zip(names, rows):
         set_name, prompt = layout[name]
@@ -1879,20 +1943,22 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
             sets[name] = metrics.text_quality(reference_rows, found)
             log(f"reference spread {name}: KLD mean {sets[name]['kld_mean']:.2e}, p99 {sets[name]['kld_p99']:.2e}, "
                 f"PPL x{sets[name]['ppl_ratio']:.4f} over {sets[name]['targets']:,} positions")
-    fixed.write_spread(data, spread_identity, sets)
+    fixed.write_spread(data, spread_identity, sets, store)
     return "scored"
 
 
-def score_data(model, data, log=print, check=lambda: None):
+def score_data(model, data, log=print, check=lambda: None, quality_mode="preserve"):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
-    store the scores under the data (crit_eval.fixed), unless they are stored already under the same identity.
-    check() runs between layers and texts: it raises to stop. Returns how they were obtained."""
+    store the scores under the data (crit_eval.fixed, the store of `quality_mode`), unless they are stored already
+    under the same identity. check() runs between layers and texts: it raises to stop. Returns how they were
+    obtained."""
     from . import fixed
     protocol = load_json(EVAL_DIR / "protocol.json")
     prepared = load_json(Path(data) / PREPARED)
     if model_identity(model, prepared_template(prepared))["sha256"] != prepared["model"]["sha256"]:
         raise SystemExit(f"{model} is not the checkpoint {data} was prepared from: the reference is that checkpoint")
     layout = {t["id"]: (t["set"], len(t["prompt_ids"])) for t in prepared["quality"]}
-    return store_texts(StreamingReference(model), fixed.texts(prepared), protocol["quality"]["top_k"],
-                       prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log, check=check,
-                       spread=protocol["quality"].get("spread"), layout=layout)
+    return store_texts(StreamingReference(model, quality_mode=quality_mode), fixed.texts(prepared),
+                       protocol["quality"]["top_k"], prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log,
+                       check=check, spread=protocol["quality"].get("spread"), layout=layout,
+                       store=STORES[quality_mode])

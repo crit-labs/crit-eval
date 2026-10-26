@@ -226,22 +226,29 @@ def _work_rule(rules, name):
 # The terms of the prefill floor a kernel's time joins (crit_eval.ceiling), and draft work kept apart from them.
 TERMS = ("matmul", "attention", "recurrent", "other", "draft")
 # Name heuristics for kernels no kernel_work rule classes, checked in order on the lower-cased demangled name.
+# Weight-only GEMMs go by their scheme (w4a16, marlin) and crit's stored-tile projections by their namespace.
 NAME_TERMS = (("draft", ("draft", "mtp", "speculat", "eagle")),
               ("attention", ("attn", "attention", "flash", "fmha", "sdpa", "_kv", "kv_", "rope")),
               ("recurrent", ("delta", "scan", "recurrent", "ssm", "mamba", "gdn", "conv_", "conv1d", "linear_att")),
-              ("matmul", ("gemm", "gemv", "matmul", "_mma", "mma_", "cutlass", "cublas", "xmma", "_dense", "linear")))
+              ("matmul", ("gemm", "gemv", "matmul", "_mma", "mma_", "cutlass", "cublas", "xmma", "_dense", "linear",
+                          "stored_tile", "a16_", "w4a", "w8a", "marlin")))
+# A matmul kernel's weight format from its name, checked in order (FP4 weights first: a W4A8 kernel names both).
+NAME_FORMATS = (("nvfp4", ("nvfp4", "fp4", "e2m1")), ("fp8", ("fp8", "e4m3", "e5m2")))
+UNCLASSED = 3   # the largest kernels classed "other" by name, listed per traced prefill
 
 
 def classify(rules, name):
     """(term, weight format or None, "rules" or "names") of a kernel: the first kernel_work rule matching it with a
-    `term` (one of TERMS) and its `format`, else NAME_TERMS on its name ("other" when none matches)."""
+    `term` (one of TERMS) and its `format`, else NAME_TERMS on its name ("other" when none matches), a matmul's
+    format from NAME_FORMATS."""
     rule = _work_rule([r for r in rules or [] if r.get("term") in TERMS], name)
     if rule:
         return rule["term"], rule.get("format"), "rules"
     lowered = name.lower()
     for term, needles in NAME_TERMS:
         if any(needle in lowered for needle in needles):
-            return term, None, "names"
+            fmt = next((f for f, marks in NAME_FORMATS if any(m in lowered for m in marks)), None) if term == "matmul" else None
+            return term, fmt, "names"
     return "other", None, "names"
 
 
@@ -278,19 +285,24 @@ def analyze(kernels, device, marks, device_ceilings=None):
             inside = exclusive([k for k in kernels if lo <= k[0] < hi])
             wall = (hi - lo) / 1e6
             busy = sum(ns for _, ns in inside) / 1e6
-            per, terms, sources = {}, {}, {"rules": 0.0, "names": 0.0}
+            per, terms, sources, unclassed = {}, {}, {"rules": 0.0, "names": 0.0}, {}
             for k, ns in inside:
                 name = names.get(k[4], k[4])
                 per[name] = per.get(name, 0.0) + ns / 1e6
                 term, fmt, source = classify(rules, name)
                 terms[term_key(term, fmt)] = terms.get(term_key(term, fmt), 0.0) + ns / 1e6
                 sources[source] += ns / 1e6
+                if term == "other" and source == "names":
+                    unclassed[name] = unclassed.get(name, 0.0) + ns / 1e6
             heavy = sorted(per.items(), key=lambda x: -x[1])[:5]
             cases[case["id"]][phase] = {"wall_ms": wall, "kernel_ms": busy, "launches": len(inside),
                                         "top": [{"kernel": short_name(n), "ms": t, "share": t / busy if busy else 0.0}
                                                 for n, t in heavy],
                                         # GPU time per prefill-floor term, and how much of it rules and names classed.
-                                        "terms": terms, "classified_ms": sources}
+                                        "terms": terms, "classified_ms": sources,
+                                        # The largest kernels neither a rule nor a name classes: candidates for rules.
+                                        "unclassed": [{"kernel": short_name(n), "ms": t} for n, t in
+                                                      sorted(unclassed.items(), key=lambda x: -x[1])[:UNCLASSED]]}
             if phase == "prefill" and "prefill_first" in case:
                 # The fresh request's time to its first token, and the GPU's busy time inside it: the rest is the
                 # engine's host work, launches and synchronization (crit_eval.status: the TTFT breakdown).
@@ -345,6 +357,14 @@ def analyze(kernels, device, marks, device_ceilings=None):
             else "the request up to its first delivered token"}
 
 
+def unclassed_note(rows):
+    """The largest kernels classed "other" by name, as text for a case's terms (empty without any)."""
+    if not rows:
+        return ""
+    return ("; other by name: " + ", ".join(f"{short_name(r['kernel'], 60)} {r['ms']:,.1f} ms" for r in rows)
+            + " (class them with kernel_work rules)")
+
+
 def render(result, top=TOP):
     sms = result["device"].get("sms")
     lines = [f"kernels: {result['engine'].get('name')} on {result['device'].get('name')} ({sms} SMs)"]
@@ -376,7 +396,8 @@ def render(result, top=TOP):
             lines.append(f"  {case:13s} " + ", ".join(f"{k} {v:.1f} ms" for k, v in sorted(terms.items(), key=lambda x: -x[1]))
                          + (f" ({named:.1f} ms classed by name)" if named else "")
                          + (f"; first token {entry['first_token_ms']:.1f} ms, GPU busy {entry['gpu_before_first_ms']:.1f} ms"
-                            " of it" if entry.get("first_token_ms") is not None else ""))
+                            " of it" if entry.get("first_token_ms") is not None else "")
+                         + unclassed_note(entry.get("unclassed")))
     lines.append("by case, top kernels per phase:")
     for case, phases in result["cases"].items():
         for phase, entry in ((p, e) for p, e in phases.items() if p in ("prefill", "decode")):

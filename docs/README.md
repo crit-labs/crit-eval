@@ -14,10 +14,10 @@ and quality references, so results from different runs, agents and machines comp
 crit eval probe --out device.json
 crit eval context --model MODEL_DIR --device device.json
 crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--context TOKENS]
-crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR
+crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR [--quality-mode as_quantized]
 crit eval fetch --model MODEL_DIR --data EVAL_DATA_DIR [--packages FOLDER_OR_URL]
 crit eval pack --data EVAL_DATA_DIR --packages FOLDER
-crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] --out result.json
+crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] [--quality-mode as_quantized] --out result.json
 crit eval run --url http://127.0.0.1:8000/v1 --model MODEL_DIR --data EVAL_DATA_DIR --context TOKENS --out result.json
 crit eval status result.json [--baseline earlier.json] [--device device.json] [--data EVAL_DATA_DIR] [--kernels kernels.json]
 crit eval compare a.json b.json
@@ -391,17 +391,23 @@ TFLOPS and GB/s against the `--device` ceilings:
 
 `match` is a substring of the demangled name; for the work estimates, the first matching rule with
 `flops_per_token` or `bytes_per_call` applies, and for the terms the first with a `term`. Kernels no
-rule classes are classed by name (`gemm`, `gemv`, `matmul` as matmul of unknown format; `attn`, `flash`,
-`fmha` and KV kernels as attention; `delta`, `scan`, `ssm`, `mamba` and convolutions as recurrent;
-`draft` and `mtp` as draft work; anything else as other), and the report says how many milliseconds
-names classed. `--work JSON` (text or a file) puts rules ahead of the adapter's own, to class an
+rule classes are classed by name (`gemm`, `gemv`, `matmul`, weight-only schemes such as `w4a16` and
+`marlin`, and crit's `stored_tile` projections as matmul, of the format the name gives (`fp4`, `e2m1`:
+nvfp4; `fp8`, `e4m3`: fp8) or else of unknown format; `attn`, `flash`, `fmha` and KV kernels as
+attention; `delta`, `scan`, `ssm`, `mamba` and convolutions as recurrent; `draft` and `mtp` as draft
+work; anything else as other), and the report says how many milliseconds names classed and lists each
+case's largest prefill kernels classed other by name, the ones a rule should class. `--work JSON` (text or a file) puts rules ahead of the adapter's own, to class an
 engine's kernels without changing it. Each case's prefill reports its GPU time per term, and `crit eval
 status RESULT --kernels kernels.json` joins it to the prefill floor: per traced case, each term's
 measured milliseconds against its floor (each stored format's matmul at its best rate, and at the
 engine's declared `prompt_activations`; attention; the recurrence; other kernels, draft work and the
 host's share of the first token against zero), with a prefill gap per term (each term at its floor, all
-else as traced) after the prefill's own. The trace may run at a lower `--context` than the result.
-Times are Times are
+else as traced) after the prefill's own. Each matmul row shows the TFLOPS it achieved, and one slower
+than the rate of the engine's own prompt activations gets a second gap at that rate: the part of its gap
+the arithmetic it already uses leaves open. A matmul faster than its floor is flagged as kernels classed
+under other terms. The gaps per term need every case the prefill score takes in the trace, and status
+names the ones it lacks. The trace may run at a lower `--context` than the result.
+Times are
 exclusive: a kernel that starts before the previous one ends (programmatic dependent launch,
 another stream) is charged only from that end, so a kernel waiting on its predecessor is not
 charged the wait and the kernel total never exceeds wall time; `span_ms` keeps raw durations.

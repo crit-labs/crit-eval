@@ -15,6 +15,10 @@ import sys
 from pathlib import Path
 
 STORE = "reference"
+# Each quality mode's reference scores: preserve, the model's own arithmetic with exact activations; as_quantized, with
+# the activations quantized as the checkpoint's own inference does (crit_eval.reference).
+STORES = {"preserve": STORE, "as_quantized": "reference-as-quantized"}
+QUALITY_MODES = tuple(STORES)
 # The reference's own spread (protocol quality.spread): how a second run of the long texts under an engine-sized
 # perturbation (TF32 matmuls) disagrees with the stored scores, per set and path, with the identity it was computed
 # under.
@@ -73,11 +77,11 @@ def safetensors(tensors, metadata=None):
     return struct.pack("<Q", len(encoded)) + encoded + b"".join(blobs)
 
 
-def write(data, identity_value, scores):
+def write(data, identity_value, scores, store=STORE):
     """Store scores ({text id: (target [n - 1], top ids [n - 1][k], top logprobs [n - 1][k])}, sequences of
-    numbers) under prepared data folder `data`: one file per text, then index.json with `identity_value` and each
-    file's sha256. Returns the bytes written."""
-    folder = Path(data) / STORE
+    numbers) under prepared data folder `data` (in `store`, a quality mode's of STORES): one file per text, then
+    index.json with `identity_value` and each file's sha256. Returns the bytes written."""
+    folder = Path(data) / store
     folder.mkdir(parents=True, exist_ok=True)
     files, size = {}, 0
     for text_id, (target, top, values) in scores.items():
@@ -95,19 +99,19 @@ def write(data, identity_value, scores):
     return size
 
 
-def write_spread(data, identity_value, sets):
+def write_spread(data, identity_value, sets, store=STORE):
     """Store the reference's spread ({"SET/path": text_quality row}) under prepared data folder `data`."""
-    folder = Path(data) / STORE
+    folder = Path(data) / store
     folder.mkdir(parents=True, exist_ok=True)
     temporary = folder / (SPREAD + ".tmp")
     temporary.write_text(json.dumps({"identity": identity_value, "sets": sets}, indent=1), encoding="utf-8")
     temporary.replace(folder / SPREAD)
 
 
-def load_spread(data, expected):
+def load_spread(data, expected, store=STORE):
     """The reference's spread stored under `data` whose identity holds every key of `expected`: {"SET/path": row};
     None when none is stored or it is another identity's."""
-    path = Path(data) / STORE / SPREAD
+    path = Path(data) / store / SPREAD
     if not path.is_file():
         return None
     stored = json.loads(path.read_text(encoding="utf-8"))
@@ -117,11 +121,11 @@ def load_spread(data, expected):
     return stored["sets"]
 
 
-def load(data, expected):
-    """The reference scores stored under prepared data folder `data` whose identity holds every key of
+def load(data, expected, store=STORE):
+    """The reference scores stored under prepared data folder `data` (in `store`) whose identity holds every key of
     `expected`: {text id: [{"logprob", "top_ids", "top_logprobs"} per position after the first]}; None when the
     store is missing or another identity's. A file whose bytes differ from its recorded sha256 is refused."""
-    folder = Path(data) / STORE
+    folder = Path(data) / store
     index = folder / "index.json"
     if not index.is_file():
         return None
