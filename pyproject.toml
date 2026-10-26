@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.1.0"
+version = "0.1.1"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"

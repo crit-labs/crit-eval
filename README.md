@@ -8,7 +8,7 @@
 
 ### Speed and quality measurement tool to compare inference engines honestly.
 
-[![Version 0.1.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.1.1](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![Python 3.11+](docs/assets/badge-python.svg)](pyproject.toml)
 

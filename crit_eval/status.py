@@ -116,7 +116,8 @@ def _quality_gate(result):
     raised = [name for name, s in quality["sets"].items() if s.get("raised")]
     if raised:
         detail += "; judged against the reference's own spread: " + ", ".join(
-            f"{name} ({', '.join(f'{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}' for k in quality['sets'][name]['raised'])})"
+            f"{name} (" + ", ".join(f"{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}"
+                                    for k in quality["sets"][name]["raised"]) + ")"
             for name in raised)
     if development:
         # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).

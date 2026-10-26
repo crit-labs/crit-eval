@@ -7,6 +7,13 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [0.1.1] - 2026-10-26
+
+### Fixed
+
+- crit-eval imports on Python 3.11 again: a status line's f-string reused its own quotes inside a replacement
+  field, which only Python 3.12 parses. The protocol stays crit-eval-v0.1.0.
+
 ## [0.1.0] - 2026-10-26
 
 ### Added
