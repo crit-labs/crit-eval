@@ -1,0 +1,15 @@
+# Publish only these root files and complete product folders.
+/*
+!/.gitignore
+!/.gitattributes
+!/README.md
+!/CHANGELOG.md
+!/LICENSE
+!/pyproject.toml
+!/crit_eval/
+!/docs/
+!/tests/
+
+# Python bytecode
+__pycache__/
+*.py[co]
