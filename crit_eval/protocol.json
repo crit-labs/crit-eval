@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v0.1.0",
+  "protocol": "crit-eval-v0.1.2",
   "requests": {
     "timeout": {
       "rule": "an engine behind a server gets no fixed time budget: each request may take floor_seconds plus slack times its expected time from the requests the engine served in this Eval (a prompt of n tokens at most t * max(1, n/m)^2 for a prompt of m tokens that prefilled in t; an output token at context c at most d * max(1, c/k) for one that decoded in d at context k; the tightest bound counts), floor_seconds alone before any; a request past it stops the Eval as hung",
@@ -60,6 +60,7 @@
     "logprobs": "the log-probabilities must be the model's own (before temperature and filters), the values the quality honesty check verifies for greedy replies"
   },
   "quality": {
+    "modes": "a run judges quality in one quality mode, recorded in requirements.quality_mode: preserve (the default) against the reference with exact activations; as_quantized against the same reference with the activations quantized as the checkpoint's own inference declares (every matrix and output head whose stored scheme declares input activations: NVFP4 in groups of 16 with the stored global scale, FP8 per token or per tensor), its scores stored apart (crit eval reference --quality-mode as_quantized). The drift budget and every other rule are the same in both. The mode also prices the limits prefill and the first tokens are measured against: preserve at the fastest 16-bit prompt activations (bf16, fp16_acc) or a faster arithmetic quality shows passing, as_quantized at the stored format",
     "top_k": 16,
     "continuation_tokens": 256,
     "rule": "every quality text is a conversation rendered by the model's chat template with its generation prompt (prompt_ids), followed by the conversation's written answer cut to continuation_tokens (continuation_ids); prepare freezes both. crit eval reference scores every position of every text once per model, suite and reference version, teacher-forced on the prepared checkpoint (FP32), and stores each position's target log-probability and top_k. The engine scores the same ids through its serving paths (crit serve's chat-score-v1): every prompt position and the first continuation token from one prefill of the prompt, every later continuation token from its decode, each step forced to the continuation (drafts accepted only while they equal it, every correction and bonus token taken from it)",

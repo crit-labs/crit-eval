@@ -362,6 +362,24 @@ def _activations_kpi(found):
             "reachable": {k: v for k, v in found["reachable"].items() if k != "cases"} if found["reachable"] else None}
 
 
+def _render_mode(p, t, ct):
+    """The quality mode the result was judged in, and what the other mode's limits are: the trade, stated once."""
+    mode = p.get("quality_mode") or "preserve"
+    if mode == "as_quantized":
+        return ["  quality mode as_quantized: quality judged against the checkpoint run as quantized (its own "
+                "activation quantization); prefill and first-token limits at its stored format"]
+    if p.get("ceiling_activations") in (None, "stored") or not p.get("stored_ceiling"):
+        return ["  quality mode preserve: quality judged against the checkpoint's exact activations"]
+    trade = f"prefill {p['stored_ceiling']:,.0f} tok/s"
+    if t.get("stored_floor_ms"):
+        trade += f", first token {t['stored_floor_ms']:,.0f} ms"
+    if ct.get("stored_floor_ms"):
+        trade += f", long-context first token {ct['stored_floor_ms']:,.0f} ms"
+    return [f"  quality mode preserve: quality judged against the checkpoint's exact activations, limits at "
+            f"{p['ceiling_activations']} prompt activations; running the checkpoint's own activation quantization "
+            f"(quality mode as_quantized) would allow {trade}"]
+
+
 def _render_activations(a, stored):
     """The prefill ceilings by the quantized matrices' prompt activations, the evidence and the reachable limit."""
     modes = a["modes"]
@@ -380,6 +398,13 @@ def _render_activations(a, stored):
         if named:
             lines.append(f"    {word}: " + ", ".join(named))
     reach = a.get("reachable")
+    # Faster ceilings no quality evidence judges yet: each is open until a result with it passes or fails.
+    open_ = [f"{name} {_num(row['ceiling_score'], ',.0f')}" for name, row in modes.items()
+             if row["state"] is None and row["ceiling_score"]
+             and (not reach or row["ceiling_score"] > reach["ceiling_score"])]
+    if open_:
+        lines.append("    not judged by quality: " + ", ".join(open_) + " tok/s (no result of this model with those "
+                     "prompt activations for every quantized matrix; one passed as --baseline judges them)")
     if reach:
         lines.append(f"    reachable limit {reach['ceiling_score']:,.0f} tok/s (prompt activations {reach['label']}), "
                      f"TTFT floor {_num(reach['ttft_floor_ms'], ',.0f')} ms, next to the stored-format "
@@ -438,15 +463,32 @@ def _render_ttft_parts(t):
 
 def _render_terms(terms):
     """Each traced case's prefill GPU time per floor term against the term's floor."""
-    lines = [f"  prefill by term (kernel trace of {terms.get('engine')}, prefill as "
+    from .kernels import unclassed_note
+    lines =[f"  prefill by term (kernel trace of {terms.get('engine')}, prefill as "
              f"{terms.get('prefill_request') or 'the request up to its first token'}; measured vs floor ms):"]
     for case_id, row in terms["cases"].items():
         named = f"; {row['named_ms']:,.1f} ms of kernels classed by name" if row.get("named_ms") else ""
         lines.append(f"    {case_id} ({row['prompt_tokens']:,} tokens, {row['trace_ms']:,.1f} ms): " + ", ".join(
-            f"{term} {t['measured_ms']:,.1f} vs {t['floor_ms']:,.1f}"
-            + (f" ({t['floor_own_ms']:,.1f} at its own prompt activations)" if t.get("floor_own_ms") is not None else "")
-            for term, t in row["terms"].items()) + named)
+            f"{term} {t['measured_ms']:,.1f} vs {t['floor_ms']:,.1f}" + _term_rate(t)
+            for term, t in row["terms"].items()) + named + unclassed_note(row.get("unclassed")))
+    if terms.get("untraced"):
+        lines.append(f"    not traced: {', '.join(terms['untraced'])}, scored for prefill (no gap per term without "
+                     "them; crit eval kernels --case each)")
     return lines
+
+
+def _term_rate(t):
+    """A matmul row's floor at the engine's own prompt activations and the rate it achieved, as text; a matmul faster
+    than its floor names the likelier cause, its kernels counted under other terms."""
+    if t.get("achieved_tflops") is not None and t["measured_ms"] < t["floor_ms"]:
+        return " (below its floor: its kernels are classed under other terms; class them with kernel_work rules)"
+    bits = []
+    if t.get("floor_own_ms") is not None:
+        bits.append(f"{t['floor_own_ms']:,.1f} at its own prompt activations"
+                    + (f", {t['floor_own_ms'] / t['measured_ms']:.0%} of that rate" if t["measured_ms"] > 0 else ""))
+    if t.get("achieved_tflops") is not None:
+        bits.append(f"{t['achieved_tflops']:,.0f} TFLOPS achieved")
+    return f" ({'; '.join(bits)})" if bits else ""
 
 
 def _case_errors(sampled, protocol):
@@ -567,14 +609,33 @@ def build(result, protocol, baseline=None):
                     if follow.get("status") == "measured" else None)
     greedy_kpi = ({"score": speed.get("decode_score"), "complete": speed.get("complete")}
                   if suite == "sampled" else None)
+    # Prefill's and the first tokens' limits are the quality mode's: preserve prices them at 16-bit prompt
+    # activations (or what quality shows passing), as_quantized at the stored format (headroom.mode_limits).
+    mode, limits = headroom.quality_mode(result), headroom.mode_limits(result)
+    prefill_kpi.update(quality_mode=mode, stored_ceiling=prefill_kpi["ceiling"],
+                       ceiling_activations=limits["activations"] if limits else "stored")
+    ttft_kpi.update(stored_floor_ms=ttft_kpi["floor_ms"])
+    if limits:
+        prefill_kpi["ceiling"] = limits["prefill"]
+        prefill_kpi["fraction_of_ceiling"] = (prefill_kpi["score"] / limits["prefill"]
+                                              if prefill_kpi["score"] and limits["prefill"] else None)
+        if limits["ttft"]:
+            ttft_kpi["floor_ms"] = limits["ttft"]
+            ttft_kpi["fraction_of_floor"] = limits["ttft"] / ttft_kpi["score_ms"] if ttft_kpi["score_ms"] else None
     perplexity, kl_divergence = _quality_kpis(result.get("quality"), protocol["quality"]["thresholds"])
     attribution = (result.get("quality") or {}).get("attribution")
     if kl_divergence is not None and attribution:
         kl_divergence["attribution"] = attribution
     # The headline decode (with its ceilings) is the sampled suite's when it ran, else the greedy suite's.
+    context_kpi = _context_kpi(result)
+    if limits and limits["context_ttft"] and context_kpi and (context_kpi.get("ttft") or {}).get("score_ms"):
+        first = dict(context_kpi["ttft"])
+        first.update(stored_floor_ms=first.get("floor_ms"), floor_ms=limits["context_ttft"],
+                     fraction_of_floor=limits["context_ttft"] / first["score_ms"])
+        context_kpi["ttft"] = first
     kpis = {"end_to_end": end_to_end, "decode_sampled": decode if suite == "sampled" else None,
             "decode_greedy": greedy_kpi if suite == "sampled" else decode, "prefill": prefill_kpi, "ttft": ttft_kpi,
-            "context": _context_kpi(result), "heldout": heldout_kpi, "followup": followup_kpi,
+            "context": context_kpi, "heldout": heldout_kpi, "followup": followup_kpi,
             "perplexity": perplexity, "kl_divergence": kl_divergence}
     missing = list(room.get("missing", []))
     # Older results call the gaps levers, tag them and add end-to-end gains; none of that is shown.
@@ -618,20 +679,22 @@ GOAL_UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_deco
 
 def _limits(result):
     """(kpi, score, limit) for decode, prefill and time to first token, and once the long-context curve
-    ran, decode and time to first token over it."""
+    ran, decode and time to first token over it; prefill's and the first tokens' limits are the result's quality
+    mode's (headroom.mode_limits)."""
     room = result.get("headroom") or {}
     speed = result.get("speed") or {}
     projection = room.get("projection") or {}
     prefill, ttft = room.get("prefill") or {}, room.get("ttft") or {}
+    mode = headroom.mode_limits(result) or {}
     rows = [("decode", headroom.decode_suite(result)[1].get("decode_score"),
              projection.get("ceiling_score") or projection.get("speed_of_light_score")),
-            ("prefill", prefill.get("score"), prefill.get("ceiling_score")),
-            ("ttft", ttft.get("score_ms") or speed.get("ttft_score_ms"), ttft.get("floor_ms"))]
+            ("prefill", prefill.get("score"), mode.get("prefill") or prefill.get("ceiling_score")),
+            ("ttft", ttft.get("score_ms") or speed.get("ttft_score_ms"), mode.get("ttft") or ttft.get("floor_ms"))]
     if (result.get("context") or {}).get("points"):
         long = room.get("context") or {}
         decode, first = long.get("decode") or {}, long.get("ttft") or {}
         rows += [("context_decode", decode.get("score"), decode.get("ceiling_score")),
-                 ("context_ttft", first.get("score_ms"), first.get("floor_ms"))]
+                 ("context_ttft", first.get("score_ms"), mode.get("context_ttft") or first.get("floor_ms"))]
     return rows
 
 
@@ -835,7 +898,16 @@ def render(status):
         lines.append(f"  greedy   {_num(greedy['score'], '.1f')} tok/s decode at temperature 0"
                      + ("; incomplete (skipped cases)" if greedy.get("complete") is False else ""))
     prefill = f"  prefill  {_num(p['score'], ',.0f')} tok/s"
-    if p["ceiling"]:
+    if p["ceiling"] and p.get("ceiling_activations") not in (None, "stored"):
+        prefill += (f", {_pct(p['fraction_of_ceiling'])} of its compute ceiling {p['ceiling']:,.0f} at "
+                    f"{p['ceiling_activations']} prompt activations (quality mode {p['quality_mode']}; the stored "
+                    f"format's {_num(p.get('stored_ceiling'), ',.0f')}")
+        rates = p.get("rates") or {}
+        if rates.get("tflops"):
+            prefill += " at " + ", ".join(f"{name} {value:,.0f} TFLOPS {rates['sources'].get(name, '')}".rstrip()
+                                          for name, value in rates["tflops"].items() if name in STORED_FORMATS)
+        prefill += ")"
+    elif p["ceiling"]:
         prefill += f", {_pct(p['fraction_of_ceiling'])} of its compute ceiling {p['ceiling']:,.0f}"
         rates = p.get("rates") or {}
         if rates.get("tflops"):
@@ -845,12 +917,14 @@ def render(status):
         if row.get("ttft_ms"):
             prefill += f"; {cid} {row['ttft_ms']:,.0f} ms to first token"
             if row.get("floor_ms"):
-                prefill += f" vs {row['floor_ms']:,.0f} ms floor"
+                prefill += (f" vs {row['floor_ms']:,.0f} ms floor" if p.get("ceiling_activations") in (None, "stored")
+                            else f" vs {row['floor_ms']:,.0f} ms stored-format floor")
     if p.get("noise") is not None:
         prefill += f"; run-to-run spread {p['noise']:.1%}"
     lines.append(prefill)
+    lines += _render_mode(p, t, (k.get("context") or {}).get("ttft") or {})
     if p.get("activations"):
-        lines += _render_activations(p["activations"], p["ceiling"])
+        lines += _render_activations(p["activations"], p.get("stored_ceiling", p["ceiling"]))
     if p.get("terms"):
         lines += _render_terms(p["terms"])
     ttft = f"  ttft     {_num(t['score_ms'], ',.0f')} ms geometric mean over {len(t['cases'])} cases"

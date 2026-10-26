@@ -22,12 +22,12 @@ from .prepare import PREPARED, check_prepared, check_template, model_description
 from .reference import REFERENCE_VERSION
 
 
-def reference_origin(data):
+def reference_origin(data, store=fixed.STORE):
     """Where the data's reference scores came from: the reference that computed them (its version, transformers,
-    torch and device, from reference/index.json) and the package they were fetched from (crit_eval.packages), or
-    package None for scores computed on this machine. None without stored scores."""
+    torch and device, from reference/index.json, or the quality mode's store) and the package they were fetched from
+    (crit_eval.packages), or package None for scores computed on this machine. None without stored scores."""
     from .packages import PACKAGE
-    index = Path(data) / fixed.STORE / "index.json"
+    index = Path(data) / store / "index.json"
     if not index.is_file():
         return None
     identity = load_json(index).get("identity", {})
@@ -552,7 +552,8 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if reference is None:
         log("quality: not measured (no reference scores for this data)")
         return {**out, "status": "unsupported",
-                "reason": "the data holds no reference scores: run crit eval reference --model --data first"}
+                "reason": "the data holds no reference scores for this quality mode: run crit eval reference "
+                          "--model --data (with the run's --quality-mode) first"}
     started, skipped, parts, labels, timings = time.time(), {}, {}, {}, []
     sets, buckets, judged, stopped = {}, {}, 0.0, None
     order = list(dict.fromkeys(text["set"] for text in prepared["quality"]))
@@ -1124,7 +1125,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
         abort_disturbed=True, url=None, served_model=None, requested_context=None, context_basis=None, profile=None,
-        chat_template=None, attribute_drift=False, adaptive_sampled=True):
+        chat_template=None, attribute_drift=False, adaptive_sampled=True, quality_mode="preserve"):
     """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
     (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
     url instead, the engine behind that OpenAI-compatible server (crit_eval.chat), served_model naming its model.
@@ -1151,8 +1152,14 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     adaptive_sampled: repeat sampled cases past the protocol's seeds until their error reaches the protocol's target
     (run_sampled_speed), the protocol's rule; False (crit eval run --no-adaptive-sampled) keeps
     the seeds' repetitions alone, an override the result records (sampled_speed.adaptive null), as --repetitions is.
-    A fixed repetition count (--repetitions, a profile's sampled_repetitions) is never extended."""
+    A fixed repetition count (--repetitions, a profile's sampled_repetitions) is never extended.
+    quality_mode: "preserve" judges quality against the reference with exact activations, "as_quantized" against the
+    checkpoint run as quantized (its own store of reference scores, crit eval reference --quality-mode as_quantized);
+    the result records it in requirements and its status prices prefill against that mode's arithmetic."""
     times = PartTimes()
+    if quality_mode not in fixed.QUALITY_MODES:
+        raise SystemExit(f"quality mode must be one of {', '.join(fixed.QUALITY_MODES)}")
+    store = fixed.STORES[quality_mode]
     protocol = load_json(EVAL_DIR / "protocol.json")
     thresholds = quality_thresholds(protocol, quality_budget)
     exactness = exactness or protocol["exactness"].get("default", "required")
@@ -1194,10 +1201,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
             ceiling = None
     continuations = load_continuations(data, prepared)
     reference_identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
+                          **({"quality_mode": quality_mode} if quality_mode != "preserve" else {}),
                           **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
-    reference_scores = fixed.load(data, reference_identity) if "quality" in parts else None
+    reference_scores = fixed.load(data, reference_identity, store) if "quality" in parts else None
     reference_spread = (fixed.load_spread(data, {**reference_identity,
-                                                 "spread_perturbation": protocol["quality"]["spread"]["perturbation"]})
+                                                 "spread_perturbation": protocol["quality"]["spread"]["perturbation"]},
+                                          store)
                         if "quality" in parts and protocol["quality"].get("spread") else None)
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
@@ -1207,7 +1216,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "crit_eval_version": __version__,
         "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
         "model": model_description(model),
-        "reference": reference_origin(data) if "quality" in parts else None,
+        "reference": reference_origin(data, store) if "quality" in parts else None,
         "host": host.describe(),
         # The adapter by its checkout-relative path (no user's home in results) and its bytes.
         "adapter": None if url or opener else portable_path(adapter),
@@ -1220,7 +1229,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                                                "memory_free_bytes", "host_memory_total_bytes", "measured_at")}
                    if device else None,
         "bandwidth_gbs": bandwidth_gbs,
-        "requirements": {"quality_budget": thresholds, "exactness": exactness},
+        "requirements": {"quality_budget": thresholds, "exactness": exactness, "quality_mode": quality_mode},
         "context": requirement,
         # The model's arithmetic per token and weight bytes (crit_eval.ceiling), which the floors are priced on.
         "ceiling": ceiling,

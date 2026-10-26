@@ -40,6 +40,8 @@ def main(argv=None):
     run.add_argument("--quality-budget", metavar="JSON",
                      help='Drift limits over the protocol defaults, e.g. \'{"ppl_ratio_max": 1.02}\'; '
                           'keys ppl_ratio_max, kld_mean_max, kld_p99_max')
+    run.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
+                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized: against the checkpoint run as quantized, its activations quantized as it declares (score that reference first: crit eval reference --quality-mode as_quantized)")
     run.add_argument("--exactness", choices=["reported", "required"],
                      help="reported (default): agreement with plain greedy is shown and the quality budget judges "
                           "the output; required: any difference fails the gate")
@@ -115,6 +117,10 @@ def main(argv=None):
                                                   "transformers, GPU; stop any engine first)")
     reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
     reference.add_argument("--data", required=True, help="Prepared suite directory")
+    reference.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
+                           help="preserve (default): exact activations; as_quantized: the activations quantized as the "
+                                "checkpoint declares, scored into a store of their own for runs with --quality-mode "
+                                "as_quantized")
 
     fetch = subs.add_parser("fetch", help="Fetch the checkpoint's reference package (prepared data and reference "
                                           "scores) into the data, so a run needs only the engine")
@@ -218,8 +224,10 @@ def _command(args):
         return 0
     if args.command == "reference":
         from .reference import score_data
-        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True))
-        print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / 'reference'}"
+        from .fixed import STORES
+        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), quality_mode=args.quality_mode)
+        print(f"reference scores of {how['positions']:,} positions {how['method']} in "
+              f"{Path(args.data) / STORES[args.quality_mode]}"
               + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else "")
               + (f"; the reference's own spread on the long texts {how['spread']}" if how.get("spread") else ""))
         return 0
@@ -315,7 +323,7 @@ def _command(args):
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
                     abort_disturbed=not args.keep_disturbed, url=args.url, served_model=args.served_model,
                     profile=args.profile, chat_template=template, attribute_drift=args.attribute_drift,
-                    adaptive_sampled=args.adaptive_sampled)
+                    adaptive_sampled=args.adaptive_sampled, quality_mode=args.quality_mode)
     print(f"wrote {args.out}")
     if result.get("aborted"):
         print(f"aborted: {result['aborted']['detail']}")

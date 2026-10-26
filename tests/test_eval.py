@@ -315,6 +315,7 @@ PROTOCOLS = {
     "crit-eval-v7.3": "f93174627087ca2f3b6ccff40d42790f2ad0dfbd8b2bde0844ccbfa3bdb7f9ae",  # hub: retrieval at 4K, 32K, max
     "crit-eval-v8": "f15b05a73387399d950ab3f31fe27dc4eec1b16662a65b91d0f9a583f44ac8ad",  # one long text per length, ...
     "crit-eval-v0.1.0": "a39facfb4d13d4054ab3da3445564606d4a0696f93e5583b8e0a076467858412",  # crit-eval's first release
+    "crit-eval-v0.1.2": "a373c9c54f5b00d8d986da7dac0a2480049b0bbef1999d4c9fdd8ac72bc3edad",  # quality modes
 }
 
 
@@ -797,6 +798,10 @@ class ActivationCeilingTests(unittest.TestCase):
         self.assertIn(f"reachable limit {reach['ceiling_score']:,.0f} tok/s (prompt activations fp8 fp8, nvfp4 fp16_acc)",
                       text)
         self.assertIn("rates bf16 100, fp16_acc 200, fp8 400, nvfp4 800 TFLOPS", text)
+        # FP8 for every quantized matrix would be faster than the reachable limit, and nothing judged it yet.
+        fp8 = current["kpis"]["prefill"]["activations"]["modes"]["fp8"]["ceiling_score"]
+        self.assertIn(f"not judged by quality: fp8 {fp8:,.0f} tok/s (no result of this model", text)
+        self.assertNotIn("bf16", text.split("not judged by quality:")[1].splitlines()[0])   # slower than the limit
 
     def test_status_prices_an_older_result_with_its_data_and_a_newer_probe(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
@@ -821,9 +826,41 @@ class ActivationCeilingTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "another model"):
                 status.status_of(path, protocol, data=other)
         stored = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
-        self.assertAlmostEqual(own["ceiling"], stored(100e12, 200e12))
-        self.assertAlmostEqual(probed["ceiling"], stored(400e12, 800e12))
-        self.assertAlmostEqual(probed["activations"]["modes"]["stored"]["ceiling_score"], probed["ceiling"])
+        self.assertAlmostEqual(own["stored_ceiling"], stored(100e12, 200e12))
+        self.assertAlmostEqual(probed["stored_ceiling"], stored(400e12, 800e12))
+        self.assertAlmostEqual(probed["activations"]["modes"]["stored"]["ceiling_score"], probed["stored_ceiling"])
+
+    def test_each_quality_mode_prices_prefill_at_its_own_arithmetic(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
+        floor = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
+        found = {}
+        for mode in ("preserve", "as_quantized"):
+            result = {**MEASURED, **self.result("fp16_acc", passed=True), "device": {"mma_tflops": self.RATES}}
+            result["requirements"] = {"quality_mode": mode}
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "result.json"
+                path.write_text(json.dumps(result))
+                found[mode] = status.status_of(path, protocol)
+        # preserve: the fastest 16-bit prompt activations (FP16 accumulation at 200 TFLOPS for both formats); the
+        # stored format (W8A8 at 400, W4A4 at 800) stays beside it as the trade.
+        prefill = found["preserve"]["kpis"]["prefill"]
+        self.assertEqual((prefill["quality_mode"], prefill["ceiling_activations"]), ("preserve", "fp16_acc"))
+        self.assertAlmostEqual(prefill["ceiling"], floor(200e12, 200e12))
+        self.assertAlmostEqual(prefill["stored_ceiling"], floor(400e12, 800e12))
+        self.assertAlmostEqual(prefill["fraction_of_ceiling"], 5000 / floor(200e12, 200e12))
+        goal = next(g for g in found["preserve"]["goals"] if g["kpi"] == "prefill")
+        self.assertAlmostEqual(goal["limit"], floor(200e12, 200e12))
+        text = status.render(found["preserve"])
+        self.assertIn(f"of its compute ceiling {floor(200e12, 200e12):,.0f} at fp16_acc prompt activations (quality "
+                      "mode preserve; the stored format's", text)
+        self.assertIn("would allow prefill " + f"{floor(400e12, 800e12):,.0f} tok/s", text)
+        # as_quantized: the checkpoint's own activations, the stored format.
+        prefill = found["as_quantized"]["kpis"]["prefill"]
+        self.assertEqual(prefill["ceiling_activations"], "stored")
+        self.assertAlmostEqual(prefill["ceiling"], floor(400e12, 800e12))
+        self.assertIn("quality mode as_quantized: quality judged against the checkpoint run as quantized",
+                      status.render(found["as_quantized"]))
 
 
 class PrefillTermTests(unittest.TestCase):
@@ -853,9 +890,29 @@ class PrefillTermTests(unittest.TestCase):
         self.assertAlmostEqual(gaps["other"]["projected_gain"], 1000 / 920 - 1)
         self.assertEqual(gaps["host"]["name"], "prefill the host's share of the first token at zero")
         self.assertNotIn("attention", gaps)   # at its floor already: no gap
-        # Without a format of any matmul kernel, matmul is one term against the whole matmul floor.
+        # The NVFP4 matmul also at the rate of the engine's own activations (FP16 accumulation): 50 ms, not 12.5.
+        own = gaps["matmul:nvfp4@own"]
+        self.assertAlmostEqual(own["projected_gain"], 1000 / (1000 - 550) - 1)
+        self.assertEqual(own["name"], "prefill matmul:nvfp4 at the rate of its own prompt activations "
+                                      "(fp8 stored, nvfp4 fp16_acc)")
+        self.assertNotIn("matmul:fp8@own", gaps)   # its own activations are the stored ones: the same floor
+        self.assertAlmostEqual(terms["matmul:nvfp4"]["achieved_tflops"], 10000 * 1e9 / 0.6 / 1e12)
+        self.assertEqual(found["untraced"], [])
+        # Without a format of any matmul kernel, matmul is one term against the whole matmul floor, and at the
+        # engine's own activations against theirs.
         whole = headroom.prefill_terms(result, self.trace({"matmul": 900.0}), rates, ["long"])["cases"]["long"]["terms"]
         self.assertAlmostEqual(whole["matmul"]["floor_ms"], 37.5)
+        self.assertAlmostEqual(whole["matmul"]["floor_own_ms"], 75.0)
+        self.assertAlmostEqual(whole["matmul"]["achieved_tflops"], 10000 * 2e9 / 0.9 / 1e12)
+        # A trace without every prefill-scored case states no gap per term and names the ones it lacks.
+        partial = headroom.prefill_terms(result, trace, rates, ["long", "longer"])
+        self.assertEqual((partial["gaps"], partial["untraced"]), ([], ["longer"]))
+        # A matmul under its floor is a classing fault, not a kernel faster than the device.
+        fast = headroom.prefill_terms(result, self.trace({"matmul": 10.0, "other": 890.0}), rates, ["long"])
+        self.assertIn("below its floor: its kernels are classed under other terms",
+                      status._term_rate(fast["cases"]["long"]["terms"]["matmul"]))
+        self.assertEqual(status._term_rate(whole["matmul"]),
+                         " (75.0 at its own prompt activations, 8% of that rate; 22 TFLOPS achieved)")
         self.assertIsNone(headroom.prefill_terms({**result, "ceiling": None}, trace, rates, ["long"]))
 
     def test_status_shows_the_traced_terms_and_their_gaps_after_the_prefills(self):
@@ -870,7 +927,9 @@ class PrefillTermTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             path, kernels = Path(directory) / "result.json", Path(directory) / "kernels.json"
             path.write_text(json.dumps(result))
-            kernels.write_text(json.dumps(self.trace({"matmul:nvfp4": 600.0, "matmul:fp8": 300.0})))
+            trace = self.trace({"matmul:nvfp4": 600.0, "matmul:fp8": 300.0})
+            trace["cases"]["long"]["prefill"]["unclassed"] = [{"kernel": "ns::mystery_kernel<1>", "ms": 40.0}]
+            kernels.write_text(json.dumps(trace))
             current = status.status_of(path, protocol, kernels_path=kernels)
             bare = Path(directory) / "bare.json"
             bare.write_text(json.dumps({**result, "ceiling": None}))
@@ -883,7 +942,9 @@ class PrefillTermTests(unittest.TestCase):
         self.assertEqual(names[-1], "time to first token at its floor")
         text = status.render(current)
         self.assertIn("prefill by term (kernel trace of toy, prefill as one output token on a fresh prompt", text)
-        self.assertIn("long (10,000 tokens, 1,000.0 ms): matmul:nvfp4 600.0 vs 12.5, matmul:fp8 300.0 vs 25.0", text)
+        self.assertIn("long (10,000 tokens, 1,000.0 ms): matmul:nvfp4 600.0 vs 12.5 (17 TFLOPS achieved), "
+                      "matmul:fp8 300.0 vs 25.0 (33 TFLOPS achieved)", text)
+        self.assertIn("other by name: ns::mystery_kernel<1> 40.0 ms (class them with kernel_work rules)", text)
         self.assertEqual(current["kpis"]["ttft"]["cases"]["long"]["outside_engine_ms"], 1050.0)
         self.assertIn("ttft by part: long 2,000 ms: engine 950.0 ms (prefill 900.0) + outside the engine 1,050.0 ms; "
                       "traced fresh first token 1,000.0 ms = GPU 990.0 + host 10.0", text)
@@ -1505,7 +1566,8 @@ class StatusTests(unittest.TestCase):
             result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, quality_budget=budget, exactness="required")
             # crit eval reference judges the quality sets by the run's budget (QualityTests).
-            self.assertEqual(result["requirements"], {"quality_budget": budget, "exactness": "required"})
+            self.assertEqual(result["requirements"], {"quality_budget": budget, "exactness": "required",
+                                                      "quality_mode": "preserve"})
             gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
             self.assertEqual(gates["exactness"], "pass")
             with self.assertRaises(SystemExit):

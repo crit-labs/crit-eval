@@ -178,8 +178,8 @@ when its adapter declares them ([Adapter](ADAPTER.md)). The quality gate is the 
 whose engine declares its prompt activations and whose every prompt path (`SET/prompt`, the prefill's
 own arithmetic) stays within the budget shows them passing, and one failing prompt path rules them out;
 a baseline of the same model (`--baseline`) counts as well. `status` prints the four ceilings and TTFT
-floors next to the stored one, which of them quality shows passing or rules out, and the **reachable
-limit**: the fastest shown passing, the engine's own declaration included, with a prefill gap of its own
+floors next to the stored one, which of them quality shows passing or rules out, the faster ones it has not
+judged yet, and the **reachable limit**: the fastest shown passing, the engine's own declaration included, with a prefill gap of its own
 ("prefill at its reachable ceiling"). These are reported, not judged. Without a declaration the
 reachable limit is unknown and `missing` asks for `prompt_activations`.
 
@@ -258,7 +258,31 @@ the model's chat template with its generation prompt, followed by its answer cut
 (`quality.continuation_tokens`); `prepare` freezes both as token ids.
 
 `crit eval reference` scores every position of every text once, teacher forced on the checkpoint,
-and stores each position's log-probability and the reference's top 16 under the data. The engine
+and stores each position's log-probability and the reference's top 16 under the data.
+
+**Quality modes.** A run judges quality in one of two modes, recorded in `requirements.quality_mode`.
+`preserve`, the default, judges against the checkpoint's arithmetic with exact (FP32) activations:
+what the engine loses on top of the weights the user chose. `as_quantized` judges against the
+checkpoint run as quantized: the same reference with the activations of every matrix and output head
+whose stored scheme declares input activations quantized as declared (NVFP4 in groups of 16 with the
+stored global scale, FP8 per token or per tensor; `crit_eval.schemes.activations`), the arithmetic
+serving stacks run such a checkpoint with (W4A4, W8A8). Its scores are a store of their own
+(`reference-as-quantized/`, `crit eval reference --quality-mode as_quantized`, and reference packages
+carry them), and `crit eval run --quality-mode as_quantized` judges against them with the same drift
+budget and rules. The KV cache stays exact in both, so an engine's KV quantization is drift in either
+mode. On Qwen3.8-27B NVFP4, 4-bit prompt activations on the MLP matrices use 244% of the preserve
+budget, and on both matrix groups 396%: an engine that runs the checkpoint as stored fails `preserve`
+and is judged on equal terms in `as_quantized`. A model whose declared matrices the modeling code
+multiplies other than through `nn.Linear` (fused experts) is refused in `as_quantized` rather than left
+exact.
+
+The mode also sets the limits prefill and the first tokens are measured against, since an engine that keeps the
+activations exact cannot reach the stored format's rate (W4A4 runs several times faster than 16-bit activations).
+In `preserve` the prefill ceiling and the time-to-first-token floors (headline and long-context) are priced at the
+fastest 16-bit prompt activations (BF16 or FP16 accumulation, `headroom.mode_limits`), or at a faster arithmetic
+quality shows passing (the reachable limit); in `as_quantized` at the stored format. Goals and `kpis` carry the
+mode's limits (`stored_ceiling` and `stored_floor_ms` keep the stored format's), and status names the mode and, in
+`preserve`, what `as_quantized` would allow, once. The engine
 scores the same ids through crit serve's score call (`chat-score-v1`): every prompt position and the
 first answer token from one prefill of the prompt, as it prefills any request, and every later
 answer token from its decode, each step forced to the answer (a speculative engine accepts drafts
