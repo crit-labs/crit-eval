@@ -3,7 +3,7 @@
 Every request a run sends is known before it starts: the prepared data fixes each prompt and output length (its
 speed, heldout, quality, followup and retrieval pieces) and the protocol how often each goes (warmups, repetitions
 and seeds, the curve and retrieval points). Only the engine's speed is unknown, and its first requests measure it as
-crit_eval.deadline keeps them: (prompt tokens, seconds to the first token) and (context tokens, seconds per later
+crit_eval.run.deadline keeps them: (prompt tokens, seconds to the first token) and (context tokens, seconds per later
 output token). Where deadline bounds a request from above, this fits the expected cost with the same shapes: a
 prompt of n tokens prefills in t0 + a * n + c * n^2 seconds (a fixed cost per request, the work per token, attention
 over every earlier token), and an output token at a context of k decodes in p + q * k (the weights and a KV cache
@@ -17,14 +17,14 @@ Left out: a speed case's third repetition (only when its first two disagree, whi
 prompt caches (follow-up turns and retrieval requests prefill in full) and replies ending early (each runs its
 length), so a cached or early-stopping engine takes less.
 """
-from .context import curve_points, lower_context, retrieval_points
+from ..limits.context import curve_points, lower_context, retrieval_points
 
 # Seconds per scored position of crit serve's score call beyond the engine's own prefill and decode: computing,
 # packing, sending and parsing its rows (a 27B model's packed rows took 0.35 ms each).
 SCORE_ROW_SECONDS = 3.5e-4
 
 # The parts of a run in the order they run (result timing.parts), and the timing parts each runner part
-# (crit_eval.runner PARTS) runs.
+# (crit_eval.run.runner PARTS) runs.
 ORDER = ("lower_context", "load", "history", "followup", "speed", "sampled_speed", "sampling_check", "heldout",
          "quality", "context", "retrieval", "exactness", "followup_again", "history_again")
 RUNS = {"speed": ("speed", "sampled_speed", "sampling_check"), "context": ("lower_context", "context", "retrieval"),
@@ -129,7 +129,7 @@ def _holds(pieces, length, tail):
 
 
 def _quality(prepared, protocol, max_context):
-    """The quality part's requests (runner.run_quality): every text of a set that fits scored, then the honesty
+    """The quality part's requests (quality_checks.run_quality): every text of a set that fits scored, then the honesty
     replies and their rescores. Requests are (prompt, output tokens, scored rows)."""
     rule, texts = protocol["quality"]["honesty"], prepared.get("quality") or []
     need = {}
@@ -150,12 +150,12 @@ def _quality(prepared, protocol, max_context):
 def requests(prepared, protocol, parts, required, settings=None, info=None, warmups=None, repetitions=None,
              sampled_repetitions=None, pinned=False, skip=()):
     """{timing part: [(prompt tokens, output tokens, scored rows, one token per pass)]} for every part of the run that
-    sends requests, as crit_eval.runner sends them. parts: runner parts (crit_eval.runner PARTS, each standing for its
+    sends requests, as crit_eval.run.runner sends them. parts: runner parts (crit_eval.run.runner PARTS, each standing for its
     timing parts: RUNS) or timing parts; skip: timing parts that will not run (lower_context for a server crit-eval did
     not start, sampled_speed for an engine that cannot sample, quality without reference scores). settings: the run's
     protocol context settings (profiles included); info: engine.info() (max_context, speculative, plain, served),
     without which the engine holds the required context and checks exactness on itself. warmups, repetitions and
-    sampled_repetitions as crit_eval.runner.run takes them; pinned: the speed cases replay a pinned continuation."""
+    sampled_repetitions as crit_eval.run.runner.run takes them; pinned: the speed cases replay a pinned continuation."""
     settings = settings if settings is not None else protocol["context"]
     names = {name for part in parts for name in RUNS.get(part, (part,))} - set(skip)
     held = (info or {}).get("max_context") or required or float("inf")
@@ -200,7 +200,7 @@ def requests(prepared, protocol, parts, required, settings=None, info=None, warm
                 curve += [(point - n, n)] * int(settings.get("repetitions", 1))
         add("context", curve)
         if curve and "quality" in names and out.get("quality"):
-            # The honesty check's long reply is the curve's first reply, scored once more (runner.run_honesty).
+            # The honesty check's long reply is the curve's first reply, scored once more (quality_checks.run_honesty).
             add("quality", [(curve[0][0], n, n)])
         asked = {p + m for p, m in curve}
         rule = settings["retrieval"]

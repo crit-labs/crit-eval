@@ -1,6 +1,6 @@
 """The fixed quality texts and their reference scores (protocol quality), read without torch.
 
-Every quality text is its prompt_ids followed by its continuation_ids (crit_eval.prepare). `crit eval reference
+Every quality text is its prompt_ids followed by its continuation_ids (crit_eval.quality.prepare). `crit eval reference
 --model --data` scores each text at every position once and stores the scores under the data (STORE): one
 safetensors file per text (`target` [n - 1] float64, the log-probability of each id after the first; `top_ids`
 [n - 1, top_k] int64 and `top_logprobs` [n - 1, top_k] float64, the reference's ranked top_k) and index.json,
@@ -16,7 +16,7 @@ from pathlib import Path
 
 STORE = "reference"
 # Each quality mode's reference scores: preserve, the model's own arithmetic with exact activations; as_quantized, with
-# the activations quantized as the checkpoint's own inference does (crit_eval.reference).
+# the activations quantized as the checkpoint's own inference does (crit_eval.quality.reference).
 STORES = {"preserve": STORE, "as_quantized": "reference-as-quantized"}
 QUALITY_MODES = tuple(STORES)
 # The reference's own spread (protocol quality.spread): how a second run of the long texts under an engine-sized

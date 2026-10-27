@@ -5,7 +5,7 @@ keeps the median of each value: achievable copy bandwidth (GB/s, bytes read plus
 the decode pass floor, dense cuBLASLt GEMM TFLOPS per weight format (bf16, fp8, nvfp4) and raw
 tensor-core (mma.sync) TFLOPS per input and accumulator format (bf16, fp16, fp16_acc, fp8, nvfp4,
 fp4_fp8) for the prefill floor, which takes the better of the two per format
-(crit_eval.ceiling.best_rates). It also keeps the least free device memory any run saw, for the max context,
+(crit_eval.limits.ceiling.best_rates). It also keeps the least free device memory any run saw, for the max context,
 the host's physical and available memory, and host-to-device rates per transfer size (pinned
 copy, pageable copy, mapped read) for engines that keep weights in host memory. Pass the file to `crit eval run --device
 device.json`. Probe on the machine and in the environment the engine runs in, with the same
@@ -21,7 +21,8 @@ import subprocess
 import sys
 import tempfile
 
-from . import EVAL_DIR, metrics, portable_path, write_json
+from .. import EVAL_DIR, portable_path, write_json
+from ..reports import metrics
 
 SOURCE = EVAL_DIR / "probe" / "device_probe.cu"
 

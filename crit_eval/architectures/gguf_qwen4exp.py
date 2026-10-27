@@ -1,5 +1,5 @@
 """The reference converter's qwen4exp layout undone (Qwen3.8-Flash-Next; transformers' qwen4_exp_text), for
-crit_eval.gguf_layout.
+crit_eval.architectures.gguf_layout.
 
 The converter (conversion/qwen4exp.py, Qwen4ExpTextModel) runs Qwen3.5's gated-delta-net steps (GatedDeltaNetLayout:
 value heads tiled, A_log as -exp(A_log), dt_bias renamed, convolution kernels squeezed, zero-centred norms stored as

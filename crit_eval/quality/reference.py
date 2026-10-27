@@ -6,7 +6,7 @@ Decoder layers are streamed onto the GPU one at a time, so a model larger than d
 stored bytes are read in large reads while the previous layer runs and reach the GPU in one transfer, where they are
 dequantized. It scores every position of the prepared quality texts (protocol quality: each conversation's prompt
 followed by its written answer) teacher-forced, once per model, suite and reference version, and stores each
-position's target log-probability and top-k under the data (score_data, crit_eval.fixed); every engine's scores of
+position's target log-probability and top-k under the data (score_data, crit_eval.quality.fixed); every engine's scores of
 the same texts are judged against them. The conversations use eager attention with the masks the modeling code
 builds; the long texts the same FP32 arithmetic in blocks of query rows (chunked_attention), with boolean masks only
 where the modeling code requires one (sdpa's mask rules), since a 32K-token float mask and score matrix would not
@@ -36,9 +36,9 @@ every GGUF block type: GgufCheckpoint.row_source; other schemes decode the table
 text model (vision towers, draft layers) are never read.
 
 Supported stored formats: safetensors, PyTorch state dicts and ONNX graphs (crit_core.model.open_model), their
-weights unquantized or in any scheme of crit_eval.schemes (FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX,
+weights unquantized or in any scheme of crit_eval.limits.schemes (FP8, NVFP4, compressed-tensors int, AWQ, GPTQ, MLX,
 bitsandbytes, ONNX Runtime's MatMulNBits), each decoded to exactly the FP32 values its own library produces.
-A GGUF (a lone .gguf, a split set or a folder holding one) is read through crit_eval.gguf_layout:
+A GGUF (a lone .gguf, a split set or a folder holding one) is read through crit_eval.architectures.gguf_layout:
 every block type gguf-py decodes, with GGUF's reference converter layout undone per architecture, and the
 config.json its metadata derives (crit_core.model.gguf_files) unless its folder has the base model's.
 Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
@@ -46,9 +46,9 @@ run once per prepared data.
 
 Quality mode as_quantized (`crit eval reference --quality-mode as_quantized`) scores the texts once more with the
 activations quantized as the checkpoint's own inference does: every matrix (and the output head) whose stored scheme
-declares input activations (crit_eval.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
+declares input activations (crit_eval.limits.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
 token or per tensor) multiplies its inputs quantized and dequantized in FP32, the weights as in preserve mode. The KV
-cache and every other operation stay as in preserve mode. Its scores have a store of their own (crit_eval.fixed
+cache and every other operation stay as in preserve mode. Its scores have a store of their own (crit_eval.quality.fixed
 STORES), so an engine that runs the checkpoint as quantized is judged against that arithmetic, not the exact one. A
 matrix with declared activations that the modeling code multiplies other than through an nn.Linear (fused experts) is
 refused rather than left exact.
@@ -58,457 +58,27 @@ import re
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from types import SimpleNamespace
 
-from . import EVAL_DIR, load_json, write_json
-from .indexers import FORM_VERSIONS, exact_forms
+from .. import EVAL_DIR, load_json
+from ..architectures.indexers import FORM_VERSIONS, exact_forms
 from .prepare import PREPARED, model_identity, prepared_template
 from .fixed import QUALITY_MODES, STORE, STORES
-from .schemes import PRIMARY, SchemeError, quantization_of, refuse_unread
+from ..limits.schemes import PRIMARY, SchemeError
+from .attention import CHUNKED, CHUNKED_SINKS, _sink_attention, chunked_attention, chunked_sink_attention
+from .checkpoints import (STAGE_LIMIT, TORCH_DTYPES, TensorCheckpoint, _Substituted, _stored_tensor, _text_config,
+                          open_checkpoint)
+from .prompt_state import (PROMPT_CHUNK, CacheUnsupported, PromptState, _Job, _OrderUnsafe, _Own, _Pass, _Prompt,
+                           _StateMemory, _apply, _hidden, _shared_chunks, _state, _watched)
 
-# torch dtype names -> safetensors dtype names
-TORCH_DTYPES = {"bfloat16": "BF16", "float16": "F16", "float32": "F32", "float64": "F64", "float8_e4m3fn": "F8_E4M3",
-                "float8_e5m2": "F8_E5M2", "float8_e8m0fnu": "F8_E8M0", "uint8": "U8", "int8": "I8", "int16": "I16",
-                "int32": "I32", "uint32": "U32", "int64": "I64", "bool": "BOOL"}
-CHUNKED = "crit_chunked"
-# Chunked attention for attention with sinks: the modeling code's eager attention in blocks of query rows, with
-# eager's additive masks (chunked_sink_attention).
-CHUNKED_SINKS = "crit_chunked_sinks"
-QUERY_BLOCK = 256
-# Tokens a text runs per chunk. REFERENCE_VERSION changes whenever what the reference computes does, so nothing
-# stored by another version is read.
-PROMPT_CHUNK = 8192
+# Changes whenever what the reference computes does, so nothing stored by another version is read.
 REFERENCE_VERSION = 3
-# Schemes whose stored rows are the table's rows, with scales per tensor or per row (crit_eval.schemes; None is
+# Schemes whose stored rows are the table's rows, with scales per tensor or per row (crit_eval.limits.schemes; None is
 # plain): an embedding stored so is gathered row by row.
 GATHERABLE = (None, "fp8", "nvfp4")
-# Readers that gather rows at once: enough to keep an NVMe queue busy with small reads.
-GATHER_THREADS = 16
-# A decoder layer's stored tensors are read ahead of it in large reads (Checkpoint.stage): neighbours in the file
-# closer than STAGE_GAP bytes are read with the bytes between them, in pieces of STAGE_READ bytes by STAGE_THREADS
-# readers, into one host buffer of at most STAGE_LIMIT bytes (a larger layer is read tensor by tensor).
-STAGE_GAP = 1 << 20
-STAGE_READ = 64 << 20
-STAGE_THREADS = 4
-STAGE_LIMIT = 8 << 30
 # Positions a fixed text scores through the head at once (a full row of logits per position, in FP64).
 SCORE_ROWS = 512
 # What a forward that cannot resume a stored cache raises.
 RESUME_ERRORS = (RuntimeError, NotImplementedError, TypeError, ValueError, AttributeError)
-LAYER_ZERO = re.compile(r"(?:^|(?<=\.))layers\.0\.")
-
-
-def chunked_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, sliding_window=None,
-                      **kwargs):
-    """Eager causal attention computed QUERY_BLOCK query rows at a time: FP32 scores, softmax over each whole
-    row, never a full length x length matrix. Registered with transformers' AttentionInterface as CHUNKED (and
-    sdpa's mask rules for its masks); causality and any sliding window come from positions, and a supplied mask
-    (boolean, or additive as eager's) further restricts each block of rows. Query heads share their key/value head
-    by broadcasting (transformers' repeat_kv without the copy), and a sliding-window layer reads only the columns
-    its block can see."""
-    import torch
-    batch, heads, length, _ = query.shape
-    kv_heads = key.shape[1]
-    groups = heads // kv_heads
-    query = query.view(batch, kv_heads, groups, length, query.shape[-1])
-    key, value = key[:, :, None], value[:, :, None]
-    scaling = query.shape[-1] ** -0.5 if scaling is None else scaling
-    offset = key.shape[3] - length
-    columns = torch.arange(key.shape[3], device=query.device)
-    out = torch.empty(batch, kv_heads, groups, length, value.shape[-1], dtype=query.dtype, device=query.device)
-    for start in range(0, length, QUERY_BLOCK):
-        stop = min(start + QUERY_BLOCK, length)
-        rows = torch.arange(start + offset, stop + offset, device=query.device)[:, None]
-        width = stop + offset
-        first = max(0, start + offset - sliding_window + 1) if sliding_window else 0
-        scores = torch.matmul(query[:, :, :, start:stop], key[:, :, :, first:width].transpose(-2, -1)).mul_(scaling)
-        allowed = columns[None, first:width] <= rows
-        if sliding_window:
-            allowed &= columns[None, first:width] > rows - sliding_window
-        if attention_mask is not None:
-            block = attention_mask[..., start:stop, first:width]
-            block = (block.view(batch, kv_heads, groups, *block.shape[-2:]) if block.shape[1] == heads
-                     else block[:, :, None])
-            if block.dtype == torch.bool:
-                allowed = allowed & block
-            else:
-                scores += block
-        weights = torch.softmax(scores.masked_fill_(~allowed, float("-inf")), dim=-1, dtype=torch.float32)
-        del scores
-        out[:, :, :, start:stop] = torch.matmul(weights.to(query.dtype), value[:, :, :, first:width])
-    return out.view(batch, heads, length, -1).transpose(1, 2).contiguous(), None
-
-
-def chunked_sink_attention(module, query, key, value, attention_mask, **kwargs):
-    """Attention with sinks as the modeling code's own eager attention computes it (its module's
-    eager_attention_forward), called on QUERY_BLOCK query rows at a time with those rows of the mask. Registered as
-    CHUNKED_SINKS with eager's additive masks: sinks have no sdpa form, so such modeling code is written for eager's
-    masks, and may extend them (DeepSeek V4 appends its compressed entries to the key/value axis after the sliding
-    window, and their visibility, its block bias, to the mask). Visibility so comes from the mask alone, never from
-    positions; every block reads every key column, and each row is the one eager computes, without the length x
-    length score matrix."""
-    import sys
-    import torch
-    eager = getattr(sys.modules[type(module).__module__], "eager_attention_forward", None)
-    if eager is None:
-        raise SchemeError(f"{type(module).__name__}: attention with sinks but no eager_attention_forward in "
-                          f"{type(module).__module__}; the reference cannot run its long texts in blocks")
-    pieces = []
-    for start in range(0, query.shape[2], QUERY_BLOCK):
-        stop = min(start + QUERY_BLOCK, query.shape[2])
-        rows = None if attention_mask is None else attention_mask[..., start:stop, :]
-        pieces.append(eager(module, query[:, :, start:stop], key, value, rows, **kwargs)[0])
-    return torch.cat(pieces, dim=1), None
-
-
-def _sink_attention(model):
-    """Whether `model`'s attention has sinks (a learned logit per head in every row's softmax, a `sinks`
-    parameter): chunked attention then runs as CHUNKED_SINKS."""
-    import torch
-    return any(isinstance(getattr(module, "sinks", None), torch.nn.Parameter) for module in model.modules())
-
-
-def _read_spans(reads, threads=None, random=True):
-    """Fill each (path, offset, out) of `reads` (out a contiguous uint8 numpy array) with the file's bytes at offset,
-    by `threads` readers (GATHER_THREADS), each reading its share in file order. random: the files are opened for
-    random reads, so the kernel reads no pages around them (Linux; elsewhere the reads are plain)."""
-    import os
-    from concurrent.futures import ThreadPoolExecutor
-    threads = threads or GATHER_THREADS
-    by_file = {}
-    for path, offset, out in reads:
-        by_file.setdefault(path, []).append((offset, out.reshape(-1)))
-    jobs = []
-    for path, spans in by_file.items():
-        spans.sort(key=lambda span: span[0])
-        share = max(1, math.ceil(len(spans) / (4 * threads)))
-        jobs += [(path, spans[i:i + share]) for i in range(0, len(spans), share)]
-
-    def read(job):
-        path, spans = job
-        with open(path, "rb", buffering=0) as f:
-            if random and hasattr(os, "posix_fadvise"):
-                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_RANDOM)
-            for offset, out in spans:
-                f.seek(offset)
-                view, done = memoryview(out), 0
-                while done < len(view):
-                    count = f.readinto(view[done:])
-                    if not count:
-                        raise OSError(f"{path}: ends before byte {offset + len(view)}")
-                    done += count
-    if len(jobs) == 1:
-        read(jobs[0])
-    elif jobs:
-        with ThreadPoolExecutor(min(threads, len(jobs))) as pool:
-            list(pool.map(read, jobs))
-
-
-def _view(flat, start, nbytes, dtype, shape):
-    """Bytes [start, start + nbytes) of uint8 `flat` as a tensor of `dtype` and `shape`; copied first when they do
-    not start at a multiple of the dtype's size, as a view of another dtype requires."""
-    piece = flat[start:start + nbytes]
-    if start % dtype.itemsize:
-        piece = piece.clone()
-    return piece.view(dtype).reshape(shape)
-
-
-def _stored_tensor(checkpoint, key):
-    """Whether `key` names a stored tensor, or (for a .weight name) a matrix stored in a quantized layout."""
-    if checkpoint.has(key):
-        return True
-    return key.endswith(".weight") and any(checkpoint.has(key[: -len(".weight")] + s) for s in PRIMARY)
-
-
-class TensorCheckpoint:
-    """A checkpoint keyed by Hugging Face tensor names (has, raw, rows), which dense() decodes to FP32 with the scheme
-    its tensors are stored in (crit_eval.schemes). quantization: the config's quantization_config (or MLX's
-    quantization) as a dict."""
-    where = {}
-    quantization = {}
-
-    def has(self, key):
-        return key in self.where
-
-    def rows(self, key, index):
-        """Rows `index` (a 1-D int64 CPU tensor) of stored tensor `key`, as stored."""
-        return self.raw(key)[index]
-
-    def rows_many(self, requests):
-        """rows(key, index) for each (key, index) of `requests`."""
-        return [self.rows(key, index) for key, index in requests]
-
-    def fit(self, key, tensor, shape):
-        """The tensor as the module stores it: Hugging Face checkpoints keep the modeling code's shapes."""
-        return tensor
-
-    def prefix(self, names=()):
-        """The prefix of the text model's tensors: of the candidates the checkpoint's decoder layer 0 tensors give
-        (vision towers and draft layers have their own), the one under which most of `names` (the modeling code's
-        parameter names, such as layers.0.mlp.gate.weight) are stored."""
-        candidates = {key[: match.start()] for key in self.where for match in [LAYER_ZERO.search(key)] if match}
-        names = list(names) or ["layers.0.input_layernorm.weight"]
-        scored = sorted(((sum(_stored_tensor(self, p + n) for n in names), p) for p in candidates), reverse=True)
-        if not scored or scored[0][0] == 0:
-            raise KeyError("cannot find the decoder layer prefix in the checkpoint")
-        return scored[0][1]
-
-    def dense(self, base, device):
-        """FP32 weight for module path `base` (without the .weight suffix)."""
-        from .schemes import dense
-        return dense(self, base, device)
-
-    def embedding(self, base):
-        """The embedding table for gathering rows: as stored when it is plain, else decoded to FP32 on the CPU."""
-        from .schemes import scheme
-        if scheme(self, base) is None:
-            return self.raw(base + ".weight")
-        return self.dense(base, "cpu")
-
-
-class _Substituted(TensorCheckpoint):
-    """A view of `checkpoint` in which the tensors of `replace` ({key: tensor}) stand for stored ones (gathered rows,
-    or parts joined), so crit_eval.schemes decodes them with the checkpoint's other tensors."""
-
-    def __init__(self, checkpoint, replace):
-        self.checkpoint, self.replace, self.quantization = checkpoint, replace, checkpoint.quantization
-
-    def has(self, key):
-        return key in self.replace or self.checkpoint.has(key)
-
-    def raw(self, key):
-        return self.replace[key] if key in self.replace else self.checkpoint.raw(key)
-
-    def header(self, key):
-        if key not in self.replace:
-            return self.checkpoint.header(key)
-        tensor = self.replace[key]
-        return SimpleNamespace(dtype=TORCH_DTYPES[str(tensor.dtype).removeprefix("torch.")], shape=tuple(tensor.shape))
-
-
-class Checkpoint(TensorCheckpoint):
-    """A safetensors checkpoint."""
-
-    def __init__(self, model, quantization=None):
-        from crit_core.model import inspect_model
-        from safetensors import safe_open
-        self.model = Path(model)
-        self.quantization = dict(quantization or {})
-        self.files = {}
-        self.where = {}
-        self.info = {}
-        # The files and headers Core validates (crit_core.model.inspect_model) before torch reads any tensor.
-        for shard in inspect_model(self.model).shards:
-            handle = safe_open(str(shard.path), "pt", device="cpu")
-            self.files[shard.path.name] = handle
-            for key in handle.keys():
-                self.where[key] = handle
-            for tensor in shard.tensors:
-                self.info[tensor.name] = tensor
-
-    def _mapped(self, key, read):
-        """read(bytes [rows, row bytes]) over a mapping of tensor `key`'s bytes, viewed as its dtype; None when the
-        tensor is empty or of a dtype torch lacks. The file is mapped per call: the pages read stay in the page
-        cache, not in this process, and no open mapping keeps the file from being moved or deleted (Windows)."""
-        import numpy as np
-        import torch
-        tensor = self.info.get(key)
-        name = next((name for name, short in TORCH_DTYPES.items() if short == getattr(tensor, "dtype", None)), None)
-        if tensor is None or name is None or not tensor.nbytes:
-            return None
-        rows = tensor.shape[0] if tensor.shape else 1
-        mapped = np.memmap(tensor.shard, dtype=np.uint8, mode="r", offset=tensor.data_begin,
-                           shape=(rows, tensor.nbytes // rows))
-        picked = torch.from_numpy(np.array(read(mapped)))
-        del mapped
-        return picked.view(getattr(torch, name))
-
-    def raw(self, key):
-        if key in self.placed:
-            return self.placed[key]
-        tensor = self._mapped(key, lambda data: data)
-        if tensor is None:
-            return self.where[key].get_tensor(key)
-        return tensor.reshape(self.info[key].shape)
-
-    placed = {}
-
-    def stage(self, keys, buffer=None, pin=False):
-        """Read stored tensors `keys` into one uint8 host buffer (`buffer` when it is large enough, else a new one,
-        pinned when `pin`), in large reads in file order: (buffer, {key: (start, nbytes, dtype, shape)}). Each run
-        of tensors keeps its offset modulo 64 from the file, so the tensors stay as aligned as they are stored.
-        place() then puts them on a device for raw()."""
-        import torch
-        known = set(TORCH_DTYPES.values())
-        keys = [key for key in keys if key in self.info and self.info[key].nbytes and self.info[key].dtype in known]
-        runs = []
-        for key in sorted(keys, key=lambda k: (str(self.info[k].shard), self.info[k].data_begin)):
-            tensor = self.info[key]
-            if runs and runs[-1][0] == tensor.shard and tensor.data_begin - runs[-1][2] <= STAGE_GAP:
-                runs[-1][2] = max(runs[-1][2], tensor.data_begin + tensor.nbytes)
-                runs[-1][3].append(key)
-            else:
-                runs.append([tensor.shard, tensor.data_begin, tensor.data_begin + tensor.nbytes, [key]])
-        layout, starts, size = {}, [], 0
-        for _, begin, end, members in runs:
-            size += (begin - size) % 64
-            starts.append(size)
-            for key in members:
-                tensor = self.info[key]
-                name = next(name for name, short in TORCH_DTYPES.items() if short == tensor.dtype)
-                layout[key] = (size + tensor.data_begin - begin, tensor.nbytes, getattr(torch, name), tuple(tensor.shape))
-            size += end - begin
-        if buffer is None or buffer.numel() < size:
-            buffer = None
-            try:
-                buffer = torch.empty(size, dtype=torch.uint8, pin_memory=pin)
-            except RuntimeError:   # no page-locked memory to be had: pageable
-                buffer = torch.empty(size, dtype=torch.uint8)
-        host = buffer.numpy()
-        reads = [(shard, begin + offset, host[start + offset:start + min(end - begin, offset + STAGE_READ)])
-                 for (shard, begin, end, _), start in zip(runs, starts)
-                 for offset in range(0, end - begin, STAGE_READ)]
-        _read_spans(reads, STAGE_THREADS, random=False)
-        return buffer, layout
-
-    def place(self, buffer, layout, device):
-        """Make raw() read the staged tensors from `device`: the buffer copied there in one transfer (a copy on the
-        CPU too, so the buffer can be read into again). Returns the placed copy."""
-        size = max((start + nbytes for start, nbytes, _, _ in layout.values()), default=0)
-        placed = buffer[:size].to(device, copy=True)
-        self.placed = {key: _view(placed, *where) for key, where in layout.items()}
-        return placed
-
-    def rows(self, key, index):
-        return self.rows_many([(key, index)])[0]
-
-    def rows_many(self, requests):
-        """Rows read from the files: each distinct row once, with a read of exactly its bytes (consecutive rows in
-        one read), the reads of every request issued together by GATHER_THREADS readers. A lookup touches rows
-        scattered over a table far larger than memory; faulting them in through a mapping reads one page at a time
-        and around it, the readers keep the device's queue full and the file is read only where asked."""
-        import numpy as np
-        import torch
-        plans, reads = [], []
-        for key, index in requests:
-            tensor = self.info.get(key)
-            name = next((name for name, short in TORCH_DTYPES.items() if short == getattr(tensor, "dtype", None)), None)
-            if tensor is None or name is None or not tensor.nbytes or not tensor.shape:
-                plans.append(None)
-                continue
-            unique, inverse = np.unique(index.numpy(), return_inverse=True)
-            width = tensor.nbytes // tensor.shape[0]
-            out = np.empty((len(unique), width), dtype=np.uint8)
-            cuts = np.flatnonzero(np.diff(unique) != 1) + 1
-            for start, stop in zip([0, *cuts.tolist()], [*cuts.tolist(), len(unique)]):
-                if stop > start:
-                    reads.append((tensor.shard, tensor.data_begin + int(unique[start]) * width, out[start:stop]))
-            plans.append((out, inverse, name, tensor.shape))
-        _read_spans(reads)
-        found = []
-        for (key, index), plan in zip(requests, plans):
-            if plan is None:
-                found.append(super().rows(key, index))
-                continue
-            out, inverse, name, shape = plan
-            if not len(index):
-                found.append(torch.empty((0, *shape[1:]), dtype=getattr(torch, name)))
-                continue
-            picked = torch.from_numpy(out).view(getattr(torch, name))
-            found.append(picked[torch.from_numpy(inverse.reshape(-1))].reshape(len(index), *shape[1:]))
-        return found
-
-    def header(self, key):
-        part = self.where[key].get_slice(key)
-        return SimpleNamespace(dtype=part.get_dtype(), shape=tuple(part.get_shape()))
-
-
-class StateDictCheckpoint(TensorCheckpoint):
-    """PyTorch state dicts (crit_core.model.TorchCheckpoint), memory-mapped by torch.load once Core has read
-    their pickles without running them; weights_only keeps torch's own loader to tensors as well."""
-
-    def __init__(self, weights, quantization=None):
-        import torch
-        self.quantization = dict(quantization or {})
-        self.where = {}
-        for shard in weights.shards:
-            state = torch.load(shard.path, map_location="cpu", weights_only=True, mmap=True)
-            for tensor in shard.tensors:
-                self.where[tensor.name] = state[tensor.name]
-
-    def raw(self, key):
-        return self.where[key]
-
-    def header(self, key):
-        tensor = self.where[key]
-        return SimpleNamespace(dtype=TORCH_DTYPES[str(tensor.dtype).removeprefix("torch.")], shape=tuple(tensor.shape))
-
-
-class OnnxCheckpoint(TensorCheckpoint):
-    """An ONNX graph's weights (crit_core.model.OnnxModel) under Hugging Face names, read from the bytes Core
-    located; a weight stored as its transpose (a MatMul's [in, out] operand) is transposed back."""
-
-    def __init__(self, weights, quantization=None):
-        self.quantization = dict(quantization or {})
-        self.where = {tensor.name: tensor for tensor in weights.tensors}
-
-    def raw(self, key):
-        import numpy as np
-        import torch
-        tensor = self.where[key]
-        values = np.fromfile(tensor.shard, dtype=np.uint8, count=tensor.nbytes, offset=tensor.data_begin)
-        dtype = getattr(torch, next(name for name, short in TORCH_DTYPES.items() if short == tensor.dtype))
-        out = torch.from_numpy(values.copy()).view(dtype).reshape(tensor.shape)
-        return out.T.contiguous() if tensor.transposed else out
-
-    def header(self, key):
-        tensor = self.where[key]
-        shape = tuple(reversed(tensor.shape)) if tensor.transposed else tuple(tensor.shape)
-        return SimpleNamespace(dtype=tensor.dtype, shape=shape, attributes=tensor.attributes)
-
-
-def open_checkpoint(model, config):
-    """The reference's checkpoint for the model (crit_core.model.open_model): its safetensors (Checkpoint), its
-    PyTorch state dicts (StateDictCheckpoint) or its GGUF (GgufCheckpoint). config: transformers' text config."""
-    from crit_core.model import open_model
-    source = open_model(model)
-    if source.format == "gguf":
-        from .gguf_layout import GgufCheckpoint
-        return GgufCheckpoint(source.weights, config)
-    quantization = quantization_of(source.config())
-    refuse_unread(quantization)
-    if source.format == "torch":
-        return StateDictCheckpoint(source.weights, quantization)
-    if source.format == "onnx":
-        return OnnxCheckpoint(source.weights, quantization)
-    if source.format != "safetensors":
-        raise SystemExit(f"{model}: no weight files the reference reads (safetensors, GGUF, PyTorch or ONNX)")
-    return Checkpoint(source.path, quantization)
-
-
-def _text_config(model):
-    """transformers' own config object, which its modeling classes need, from the model's config.json (the
-    folder's own, or the one a GGUF derives); it must first pass Core's rules (crit_core.model.ModelSource.config),
-    as it did when the suite was prepared."""
-    import json
-    from crit_core.model import CONFIG_NAME, open_model
-    from transformers import AutoConfig, CONFIG_MAPPING
-    source = open_model(model)
-    source.config()
-    if CONFIG_NAME in source.derived:
-        data = json.loads(source.files.read(CONFIG_NAME))
-        if data.get("model_type") not in CONFIG_MAPPING:
-            raise SystemExit(f"{model}: the config derived from the GGUF names no transformers model type "
-                             f"({data.get('model_type')!r}); the reference needs config rules for its architecture "
-                             "(crit_core.model.gguf_files) or the base model's config.json beside it")
-        config = CONFIG_MAPPING[data["model_type"]].from_dict(data)
-    else:
-        config = AutoConfig.from_pretrained(str(source.folder or model))
-    text = getattr(config, "text_config", None) or config
-    text._attn_implementation = "eager"
-    # The modeling code's own per-expert loop (FP32 matmuls), not a grouped GEMM kernel.
-    text._experts_implementation = "eager"
-    return text
 
 
 @contextmanager
@@ -596,386 +166,6 @@ class _Captured(Exception):
     """Raised by the last decoder layer's stand-in once a forward has handed every layer its arguments."""
 
 
-class CacheUnsupported(Exception):
-    """The model's forward or its cache cannot be resumed after a stored prompt; the reference scores full passes."""
-
-
-def _encode(value, path, tensors):
-    """A JSON description of cache state `value` (a cache or cache layer attribute at `path`), its tensors put in
-    `tensors` under their paths. Tensors, plain values, dtypes, devices, and dicts, lists and tuples of them are
-    stored; a class is kept as the fresh cache's own (checked by name). Anything else cannot be resumed."""
-    import torch
-    if isinstance(value, torch.Tensor):
-        tensors[path] = value.detach().to("cpu").clone().contiguous()
-        return {"tensor": path}
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return {"value": value}
-    if isinstance(value, torch.dtype):
-        return {"dtype": str(value).removeprefix("torch.")}
-    if isinstance(value, torch.device):
-        return {"device": str(value)}
-    if isinstance(value, dict) and all(isinstance(k, (int, str)) for k in value):
-        return {"dict": [[k, _encode(v, f"{path}.{k}", tensors)] for k, v in value.items()]}
-    if isinstance(value, (list, tuple)):
-        return {type(value).__name__: [_encode(v, f"{path}.{i}", tensors) for i, v in enumerate(value)]}
-    if isinstance(value, type):
-        return {"class": f"{value.__module__}.{value.__qualname__}"}
-    raise CacheUnsupported(f"cache state {path} is a {type(value).__name__}, which the reference cannot store")
-
-
-def _decode(spec, tensor, current=None):
-    """The value `spec` describes, its tensors made by tensor(path); current: the attribute's present value."""
-    import torch
-    (kind, body), = spec.items()
-    if kind == "tensor":
-        return tensor(body)
-    if kind == "value":
-        return body
-    if kind == "dtype":
-        return getattr(torch, body)
-    if kind == "device":
-        return torch.device(body)
-    if kind == "dict":
-        return {k: _decode(v, tensor) for k, v in body}
-    if kind in ("list", "tuple"):
-        return (list if kind == "list" else tuple)(_decode(v, tensor) for v in body)
-    if not isinstance(current, type) or f"{current.__module__}.{current.__qualname__}" != body:
-        raise CacheUnsupported(f"the fresh cache holds another class than the stored {body}")
-    return current
-
-
-def _state(obj, path, skip=()):
-    """(description, tensors) of every attribute of cache or cache layer `obj` but `skip`."""
-    tensors = {}
-    return {name: _encode(value, f"{path}{name}", tensors) for name, value in vars(obj).items()
-            if name not in skip}, tensors
-
-
-def _apply(obj, spec, tensor):
-    for name, value in spec.items():
-        setattr(obj, name, _decode(value, tensor, getattr(obj, name, None)))
-
-
-class PromptState:
-    """The reference's cache after a prompt (the transformers Cache its own forward created, one entry per decoder
-    layer), stored in `folder` as one safetensors file per decoder layer and one for the cache's own attributes, in
-    FP32 as the reference computed them, with index.json (identity, files and their sha256) written last. Between
-    uses a layer's tensors are meta placeholders of their shapes: the forward still reads lengths from them, only the
-    layer being run holds its tensors on the device."""
-
-    def __init__(self, folder, identity, ids, memory=None):
-        self.folder, self.identity, self.ids, self.memory = Path(folder), identity, ids, memory
-        self.cache, self.done, self.files = None, 0, {}
-
-    def ready(self):
-        index = self.folder / "index.json"
-        if not index.is_file():
-            return False
-        stored = load_json(index)
-        if stored.get("identity") != self.identity:
-            return False
-        self.files = stored["files"]
-        return True
-
-    def _file(self, name):
-        return self.folder / name
-
-    def _bytes(self, name):
-        """A stored file's bytes, from host memory where it is kept there (_StateMemory), else from disk."""
-        held = self.memory.get(self._file(name)) if self.memory is not None else None
-        return held if held is not None else self._file(name).read_bytes()
-
-    def _read(self, name):
-        """(description, tensors) of a stored file, its bytes checked against the recorded sha256 (a file kept in
-        memory has none: it is the bytes written)."""
-        import hashlib
-        import json
-        from safetensors.torch import load
-        data = self._bytes(name)
-        if self.files.get(name) not in (None, hashlib.sha256(data).hexdigest()):
-            raise SystemExit(f"{self._file(name)}: its bytes differ from the sha256 recorded in index.json")
-        size = int.from_bytes(data[:8], "little")
-        spec = json.loads(json.loads(data[8:8 + size])["__metadata__"]["state"])
-        return spec, load(data)
-
-    def _put(self, name, data, sha=None):
-        """Store a file's bytes: in host memory while the scoring's budget allows (_StateMemory), else on disk with
-        their sha256 (`sha` when the caller knows it)."""
-        import hashlib
-        path = self._file(name)
-        if self.memory is not None and self.memory.put(path, data):
-            path.unlink(missing_ok=True)
-            self.files[name] = None
-            return
-        self.folder.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(data)
-        self.files[name] = sha or hashlib.sha256(data).hexdigest()
-
-    def _write(self, name, spec, tensors):
-        import json
-        from safetensors.torch import save
-        self._put(name, save(tensors, metadata={"state": json.dumps(spec)}))
-
-    @staticmethod
-    def _layer(index):
-        return f"layer-{index:03d}.safetensors"
-
-    def _placeholders(self, layer, spec, tensors):
-        import torch
-        _apply(layer, spec, lambda path: torch.empty(tensors[path].shape, dtype=tensors[path].dtype, device="meta"))
-
-    def adopt(self, cache):
-        """Take the cache a forward created (None when it created none)."""
-        from transformers.cache_utils import Cache
-        if not isinstance(cache, Cache):
-            raise CacheUnsupported("the model's forward creates no transformers Cache")
-        self.cache = cache
-
-    def restore(self, cache, device):
-        """Make `cache`, freshly created by the forward, this prompt's: its own attributes as stored, every layer's
-        tensors placeholders until the layer runs."""
-        self.adopt(cache)
-        spec, tensors = self._read("cache.safetensors")
-        _apply(cache, spec, lambda path: tensors[path].to(device))
-        self._grow(len([n for n in self.files if n.startswith("layer-")]))
-        for index in range(len(cache.layers)):
-            name = self._layer(index)
-            if name in self.files:
-                header = self._header(name)
-                self._placeholders(cache.layers[index], *header)
-
-    def _header(self, name):
-        """(description, {path: meta tensor}) of a stored layer from its header only."""
-        import json
-        import torch
-        held = self.memory.get(self._file(name)) if self.memory is not None else None
-        if held is not None:
-            size = int.from_bytes(held[:8], "little")
-            header = json.loads(held[8:8 + size])
-        else:
-            with self._file(name).open("rb") as f:
-                size = int.from_bytes(f.read(8), "little")
-                header = json.loads(f.read(size))
-        spec = json.loads(header.pop("__metadata__")["state"])
-        names = {short: name for name, short in TORCH_DTYPES.items()}
-        return spec, {path: torch.empty(info["shape"], dtype=getattr(torch, names[info["dtype"]]), device="meta")
-                      for path, info in header.items()}
-
-    def _grow(self, count):
-        """Layers a cache without a config creates as they are first updated."""
-        layers, make = self.cache.layers, getattr(self.cache, "layer_class_to_replicate", None)
-        while len(layers) < count and make is not None:
-            layers.append(make())
-        if len(layers) < count:
-            raise CacheUnsupported("the cache holds fewer layers than the model has decoder layers")
-
-    def enter(self, index, device):
-        """Before decoder layer `index` runs: its stored tensors (if any) on the device."""
-        name = self._layer(index)
-        if name in self.files:
-            self._grow(index + 1)
-            spec, tensors = self._read(name)
-            _apply(self.cache.layers[index], spec, lambda path: tensors[path].to(device))
-
-    def leave(self, index, keep):
-        """After decoder layer `index` ran: stored back (keep) or dropped, placeholders in its place."""
-        self._grow(index + 1)
-        layer = self.cache.layers[index]
-        if keep:
-            spec, tensors = _state(layer, f"{index}.")
-            self._write(self._layer(index), spec, tensors)
-        else:
-            spec, tensors = self._header(self._layer(index))
-        self._placeholders(layer, spec, tensors)
-
-    def seal(self):
-        """Store the cache's own attributes and the index: the prompt's state is complete."""
-        import hashlib
-        spec, tensors = _state(self.cache, "cache.", skip=("layers",))
-        self._write("cache.safetensors", spec, tensors)
-        for name in [name for name, sha in self.files.items() if sha is None]:   # sealed states live on disk
-            data = self._bytes(name)
-            self.memory.drop(self._file(name))
-            self.folder.mkdir(parents=True, exist_ok=True)
-            self._file(name).write_bytes(data)
-            self.files[name] = hashlib.sha256(data).hexdigest()
-        write_json(self.folder / "index.json", {"identity": self.identity, "files": self.files})
-
-
-class _StateMemory:
-    """Prompt-state files (PromptState) kept in host memory instead of on disk while their bytes stay within `limit`
-    (shared by every text of one scoring); a file that does not fit goes to disk as before. The bytes are the same
-    either way, so the scores are too; memory only saves writing and reading them back."""
-
-    def __init__(self, limit):
-        self.limit, self.used, self.blobs = limit, 0, {}
-
-    def get(self, path):
-        return self.blobs.get(path)
-
-    def drop(self, path):
-        held = self.blobs.pop(path, None)
-        if held is not None:
-            self.used -= len(held)
-
-    def put(self, path, data):
-        """Keep `data` as `path`'s bytes if it fits (replacing what `path` held); False when it goes to disk."""
-        self.drop(path)
-        if self.used + len(data) > self.limit:
-            return False
-        self.blobs[path] = data
-        self.used += len(data)
-        return True
-
-    @staticmethod
-    def budget():
-        """Bytes of prompt state to keep in memory: half the host memory available now, less the layer staging
-        buffer (STAGE_LIMIT); none where the platform does not report it."""
-        import os
-        try:
-            available = os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE")
-        except (AttributeError, ValueError, OSError):
-            return 0
-        return max(0, available // 2 - STAGE_LIMIT)
-
-
-class _Pass:
-    """One forward over `ids` streamed through the decoder layers. state: the PromptState it resumes or extends
-    (None: no cache); keep: whether the layers' new state is stored (a prompt chunk) or dropped (a reply)."""
-
-    def __init__(self, ids, long, state=None, keep=False):
-        self.ids, self.long, self.state, self.keep = ids, long, state, keep
-
-
-def _hidden(args, kwargs):
-    """(slot, hidden states) of a decoder layer call: the first positional argument, else hidden_states."""
-    return (0, args[0]) if args else ("hidden_states", kwargs["hidden_states"])
-
-
-class _OrderUnsafe(Exception):
-    """The model's forward or a decoder layer read cache state that the layer-major order holds at another point
-    than the chunk-major order does: the prompts run chunk by chunk instead."""
-
-
-def _fingerprint(value):
-    """What identifies a cache attribute and its contents: tensors by identity and version (an in-place change
-    bumps it), containers by their items, plain values by value, anything else by identity."""
-    import torch
-    if isinstance(value, torch.Tensor):
-        return ("tensor", id(value), value._version)
-    if isinstance(value, dict):
-        return ("dict", tuple((key, _fingerprint(item)) for key, item in value.items()))
-    if isinstance(value, (list, tuple)):
-        return (type(value).__name__, tuple(_fingerprint(item) for item in value))
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return ("value", value)
-    return ("object", id(value))
-
-
-class _Own:
-    """A cache's own attributes (all but its layers) at one point: what each pass after it reads."""
-
-    def __init__(self, cache):
-        self.order = list(vars(cache))
-        self.values = {key: value for key, value in vars(cache).items() if key != "layers"}
-        self.mark = _fingerprint(self.values)
-
-    def held_by(self, cache):
-        return _fingerprint({key: value for key, value in vars(cache).items() if key != "layers"}) == self.mark
-
-    def apply(self, cache):
-        """Make them the cache's again, in their order; their objects must be as they were."""
-        if _fingerprint(self.values) != self.mark:
-            raise _OrderUnsafe("the cache's own state was changed in place")
-        attributes = vars(cache)
-        layers = attributes["layers"]
-        attributes.clear()
-        attributes.update((key, layers if key == "layers" else self.values[key]) for key in self.order)
-
-
-@contextmanager
-def _watched(cache):
-    """The indices of the cache's layers whose state (their own attributes, read by any code, their methods' included)
-    is read while the block runs; class attributes (is_sliding) are no state. The layers' classes read through a
-    recording __getattribute__ for the block's duration (not a subclass: transformers registers cache layer
-    subclasses by type)."""
-    ids = {id(layer): index for index, layer in enumerate(cache.layers)}
-    seen = set()
-    classes = {type(layer) for layer in cache.layers}
-    saved = {cls: cls.__dict__.get("__getattribute__") for cls in classes}
-    reads = {cls: cls.__getattribute__ for cls in classes}
-
-    def recording(read):
-        def __getattribute__(self, name):
-            index = ids.get(id(self))
-            if index is not None and not name.startswith("__"):
-                try:
-                    own = name in object.__getattribute__(self, "__dict__")
-                except AttributeError:   # a layer without a __dict__: every read counts
-                    own = True
-                if own:
-                    seen.add(index)
-            return read(self, name)
-        return __getattribute__
-    for cls in classes:
-        cls.__getattribute__ = recording(reads[cls])
-    try:
-        yield seen
-    finally:
-        for cls, original in saved.items():
-            if original is None:
-                del cls.__getattribute__
-            else:
-                cls.__getattribute__ = original
-
-
-class _Prompt:
-    """A text's state and its chunks in the layer-major order: per decoder layer the chunks it ran (done), and
-    the cache's own attributes after the forward handed each chunk to the layers (own). A text whose first `shared`
-    chunks are another text's (its leader's: the same ids, positions and attention) runs only the chunks after them:
-    its cache starts as the leader's after those chunks, copied layer by layer as the leader leaves each layer
-    (StreamingReference._fork, _fork_layer), and its outputs of the shared chunks are the leader's."""
-
-    def __init__(self, state, long, count, leader=None, shared=0, chunk=PROMPT_CHUNK):
-        self.state, self.long = state, long
-        self.chunks = [state.ids[c:c + chunk] for c in range(0, len(state.ids), chunk)]
-        self.done = [0] * count
-        self.own = []
-        self.leader, self.shared, self.followers = leader, shared, []
-        if leader is not None:
-            leader.followers.append(self)
-
-
-def _shared_chunks(chunks, long):
-    """Per text (leader index, chunks shared): the earliest text with the same attention whose leading chunks are
-    this text's (the most of them, at least one), or (None, 0). A text keeps at least its last chunk to run, and a
-    leader is never itself a follower."""
-    out = []
-    for t, own in enumerate(chunks):
-        best = (None, 0)
-        for s in range(t):
-            if out[s][0] is not None or (s in long) != (t in long):
-                continue
-            k = 0
-            while k < min(len(own) - 1, len(chunks[s])) and own[k] == chunks[s][k]:
-                k += 1
-            if k > best[1]:
-                best = (s, k)
-        out.append(best)
-    return out
-
-
-class _Job:
-    """One pass of the layer-major order: chunk `chunk` (its ids) of `prompt`. calls: what the forward hands each
-    layer; hidden: its hidden states before layer `at` (after the last, its output), on the host; waiting: the
-    layers whose state its last capture read too early."""
-
-    def __init__(self, prompt, ids, chunk):
-        self.prompt, self.ids, self.chunk, self.long = prompt, ids, chunk, prompt.long
-        self.calls = self.hidden = None
-        self.at, self.waiting = 0, set()
-
-
 class StreamingReference:
     # Texts whose leading chunks are the same (the long quality texts share their document) run them once in the
     # layer-major order (_Prompt); the rows are the same bytes as running each text on its own.
@@ -992,10 +182,10 @@ class StreamingReference:
         if quality_mode not in QUALITY_MODES:
             raise SystemExit(f"quality mode must be one of {', '.join(QUALITY_MODES)}")
         self.quality_mode = quality_mode
-        # as_quantized: {checkpoint base: crit_eval.schemes.activations} as found, and the output head's
+        # as_quantized: {checkpoint base: crit_eval.limits.schemes.activations} as found, and the output head's
         self.inputs, self.head_inputs = {}, None
         # Chunked attention allocates a score block of another width for every block of query rows; torch's default
-        # segments then fragment until the device is full (a 32K-token text on Gemma-4-31B), while expandable
+        # segments then fragment until the device is full (a 32K-token text on a 31B model), while expandable
         # segments reuse the memory. Read when the process first allocates on the device; arithmetic is unchanged.
         os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
         import torch
@@ -1008,9 +198,9 @@ class StreamingReference:
         with _meta_parameters():
             self.skeleton = AutoModel.from_config(self.config)
         # Faster forms of modeling-code loops, bound where the code is the one they were checked against
-        # (crit_eval.indexers): the same selection, without a Python loop per token.
+        # (crit_eval.architectures.indexers): the same selection, without a Python loop per token.
         self.forms = exact_forms(self.skeleton)
-        # The buffers each decoder layer computes when built (rotary frequencies a layer holds itself, as DeepSeek V4's
+        # The buffers each decoder layer computes when built (rotary frequencies a layer holds itself, as attention
         # compressors do): a used layer is released to meta, and its next load puts them back (_restore).
         self.built = [{name: buffer for name, buffer in layer.named_buffers() if not buffer.is_meta}
                       for layer in self.skeleton.layers]
@@ -1063,7 +253,7 @@ class StreamingReference:
 
     def _renamed(self):
         """{modeling-code name: stored key} of the checkpoint's tensors that transformers' renamings for the model
-        type give another name (a checkpoint in the model's own original layout, DeepSeek V4's): a matrix under its
+        type give another name (a checkpoint in the model's own original layout): a matrix under its
         .weight name in whatever layout it is stored. Read only for a name not stored under the prefix (_key)."""
         if not isinstance(self.checkpoint, TensorCheckpoint):
             return {}
@@ -1095,7 +285,7 @@ class StreamingReference:
         """Parameter `name` in FP32 from its sources through its converter's operations. Sources are decoded one by
         one, unless the checkpoint stores scales for the converted tensor itself: then they are its stored parts,
         joined before decoding with those scales."""
-        from .schemes import dense
+        from ..limits.schemes import dense
         converter, parts = self.converted[name]
         target = self._target(name)
         joined = target in self.members
@@ -1143,7 +333,7 @@ class StreamingReference:
 
     def _decode_rows(self, base, gathered):
         """FP32 rows of matrix `base` on the device from its gathered stored rows ({key: rows})."""
-        from .schemes import dense
+        from ..limits.schemes import dense
         return dense(_Substituted(self.checkpoint, gathered), base, self.device)
 
     def _gather_rows(self, base, primary, index, full_rows, rows=None):
@@ -1161,7 +351,7 @@ class StreamingReference:
 
     def _gatherable(self, base, primary, rows=None):
         """Whether matrix `base` is stored as rows of the table (GATHERABLE schemes)."""
-        from .schemes import scheme
+        from ..limits.schemes import scheme
         if primary is None:
             return False
         view = self.checkpoint if rows is None else _Substituted(self.checkpoint, {primary: rows})
@@ -1280,17 +470,17 @@ class StreamingReference:
         return module
 
     def _activations(self, base):
-        from .schemes import activations
+        from ..limits.schemes import activations
         if base not in self.inputs:
             self.inputs[base] = activations(self.checkpoint, base)
         return self.inputs[base]
 
     def _quantize_inputs(self, module, path):
         """Quality mode as_quantized: the nn.Linear matrices of `module` (modeling-code path `path`) whose checkpoint
-        declares input activations quantize their inputs as it declares (crit_eval.schemes.quantize_activations), by
+        declares input activations quantize their inputs as it declares (crit_eval.limits.schemes.quantize_activations), by
         a forward pre-hook set once per module. In a decoder layer, every stored matrix with declared activations must
         be one of them: one the modeling code multiplies otherwise (fused experts, a converted parameter) is refused."""
-        from .schemes import quantize_activations
+        from ..limits.schemes import quantize_activations
         hooked = set()
         for sub, child in module.named_modules():
             if not isinstance(child, self.torch.nn.Linear):
@@ -1843,7 +1033,7 @@ class StreamingReference:
             for row in range(0, len(following), SCORE_ROWS):
                 rows = hidden[row:row + SCORE_ROWS][:len(following) - row]
                 if self.head_inputs:
-                    from .schemes import quantize_activations
+                    from ..limits.schemes import quantize_activations
                     rows = quantize_activations(rows, *self.head_inputs)
                 logits = rows @ head.T
                 if cap:
@@ -1861,14 +1051,14 @@ class StreamingReference:
 def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print, check=lambda: None, spread=None,
                 layout=None, store=STORE):
     """Score every fixed text once per identity and store the scores under prepared data folder `data`
-    (crit_eval.fixed: each position's target log-probability, top_k ids and their log-probabilities, with the identity:
+    (crit_eval.quality.fixed: each position's target log-probability, top_k ids and their log-probabilities, with the identity:
     the reference's, top_k, valid_vocab and every text's ids). texts: {text id: (ids, long)}. Returns how they were
     obtained: "stored" when the data holds them under the same identity, else "scored" with its seconds and bytes.
     spread (protocol quality.spread) with layout ({text id: (set, prompt tokens)}): the texts of at least
     spread["from_tokens"] tokens are scored once more under spread["perturbation"] (store_spread), the model's own
     arithmetic perturbed as an engine's would be, and how far that run lands from the stored scores is stored per set
     and path (fixed.write_spread), the spread a run judges those sets against; "spread" says whether it was stored or
-    scored. store: the folder of the reference's quality mode (crit_eval.fixed STORES)."""
+    scored. store: the folder of the reference's quality mode (crit_eval.quality.fixed STORES)."""
     import shutil
     from . import fixed
     identity = dict(reference.identity(model_sha), **fixed.identity(texts, top_k, valid_vocab))
@@ -1897,15 +1087,16 @@ SPREAD_PERTURBATIONS = ("tf32",)
 def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, layout, log=print, check=lambda: None,
                  store=STORE):
     """The reference's own spread on the texts of at least rule["from_tokens"] tokens (store_texts): scored once more
-    under rule["perturbation"] and compared with the stored scores by crit_eval.metrics.text_quality per set and path
+    under rule["perturbation"] and compared with the stored scores by crit_eval.reports.metrics.text_quality per set and path
     (SET/prompt: the prompt positions, SET/served: the continuation's), stored with the identity plus the perturbation
     (fixed.write_spread). "tf32": the FP32 matmuls run with TF32 inputs (10-bit mantissas, about 1e-3 relative), the
     size of perturbation a BF16 or FP8 engine's arithmetic introduces, so a model that amplifies rounding (routing
     near-ties, hard top-k, a recurrent state) shows how far such an engine must be expected to land; FP32 rounding alone
-    (another chunking, 1e-6) proved a hundred times too small on Qwen3.8-Flash-Next. On a device without TF32 (the
+    (another chunking, 1e-6) proved a hundred times too small on a sparse MoE model. On a device without TF32 (the
     CPU) the pass is the same arithmetic and the spread is zero. Returns "stored", "scored" or "none" (no text that
     long)."""
-    from . import fixed, metrics
+    from . import fixed
+    from ..reports import metrics
     perturbation = rule.get("perturbation", "tf32")
     if perturbation not in SPREAD_PERTURBATIONS:
         raise SystemExit(f"quality.spread.perturbation must be one of {', '.join(SPREAD_PERTURBATIONS)}")
@@ -1932,7 +1123,7 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
         set_name, prompt = layout[name]
         again = [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
                  for lp, ids, tops in zip(target.tolist(), top.tolist(), values.tolist())]
-        last = prompt - 1   # as runner.run_quality splits a text's positions
+        last = prompt - 1   # as quality_checks.run_quality splits a text's positions
         for part, pick in (("prompt", slice(0, last)), ("served", slice(last, None))):
             reference_rows, found = parts.setdefault(f"{set_name}/{part}", ([], []))
             reference_rows += stored[name][pick]
@@ -1949,7 +1140,7 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
 
 def score_data(model, data, log=print, check=lambda: None, quality_mode="preserve"):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
-    store the scores under the data (crit_eval.fixed, the store of `quality_mode`), unless they are stored already
+    store the scores under the data (crit_eval.quality.fixed, the store of `quality_mode`), unless they are stored already
     under the same identity. check() runs between layers and texts: it raises to stop. Returns how they were
     obtained."""
     from . import fixed

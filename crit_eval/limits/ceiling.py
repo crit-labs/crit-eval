@@ -9,7 +9,7 @@ Prefill is compute bound. Its floor for a prompt of N tokens is
     recurrent   N x linear-attention FLOPs per token / the BF16 rate (chunked form, approximate)
 
 A projection weight of R x K elements costs 2RK FLOPs per token at the rate of the format it is stored in
-(crit_eval.schemes): BF16/F16/F32 (bf16), FP8 (fp8), NVFP4 (nvfp4), weight-only integer codes (AWQ, GPTQ,
+(crit_eval.limits.schemes): BF16/F16/F32 (bf16), FP8 (fp8), NVFP4 (nvfp4), weight-only integer codes (AWQ, GPTQ,
 MLX, bitsandbytes NF4, compressed-tensors pack-quantized: bf16, as engines widen them for the GEMM) and 8-bit
 integer weights with per-row scales (bitsandbytes LLM.int8, compressed-tensors int-quantized: fp8, the int8 rate).
 A GGUF's ggml block types
@@ -18,7 +18,7 @@ the same rate), its MXFP4 and NVFP4 at the nvfp4 rate and its F32/F16/BF16 at bf
 (gathered), vision towers, norms, convolutions and the output head (one row of logits per
 prompt) are left out. Engines may compute in other formats; the floor uses the stored ones, and
 prefill_floor_ms prices the quantized matrices with other prompt activations on request (ACTIVATIONS:
-BF16, FP16 accumulation, FP8), as crit_eval.headroom.activation_ceilings reports them.
+BF16, FP16 accumulation, FP8), as crit_eval.limits.headroom.activation_ceilings reports them.
 
 Time to first token cannot beat either floor: the prompt's arithmetic, or reading the weights
 once (language-model tensors and the output head, not embeddings, vision or draft layers)
@@ -68,7 +68,7 @@ def _read(role):
 
 
 def weight_bytes(tensors, file_name="", draft_blocks=()):
-    """Bytes of the tensors one forward pass reads (crit_eval.tensors: layers, experts and the output head, not
+    """Bytes of the tensors one forward pass reads (crit_eval.limits.tensors: layers, experts and the output head, not
     embeddings, other modalities or draft layers). tensors: {name: crit_core.model.TensorInfo} of one file."""
     return sum(t.nbytes for name, t in tensors.items() if _read(tensor_role(name, file_name, draft_blocks)))
 
@@ -87,7 +87,7 @@ def matmul_flops(tensors, file_name="", draft_blocks=(), quantization=None):
     {name: TensorInfo}. The output head is left out (one row of logits per prompt). A 3-D expert tensor counts as
     one matrix per expert, as the per-expert matrices of a checkpoint that stores them apart do. quantization: the
     config's quantization_config (or MLX's quantization), which names the scheme of packed integer weights
-    (crit_eval.schemes)."""
+    (crit_eval.limits.schemes)."""
     flops, matrices, seen = {}, {}, set()
     for name, tensor in tensors.items():
         role = tensor_role(name, file_name, draft_blocks)
@@ -166,7 +166,7 @@ def best_rates(device):
     return rates, sources
 
 
-# The activation formats a quantized matrix's prompt GEMM can take, and the rates (crit_eval.probe keys) each runs at
+# The activation formats a quantized matrix's prompt GEMM can take, and the rates (crit_eval.limits.probe keys) each runs at
 # for each stored weight format, the best available one counting: BF16 activations on BF16 tensor cores with FP32
 # accumulation, FP16 activations accumulating in FP16, FP8 activations (FP4 weights times FP8 through kind::f8f6f4, or
 # widened to FP8), and the stored format itself (W8A8, W4A4). Weights stored in BF16 stay at the BF16 rate.

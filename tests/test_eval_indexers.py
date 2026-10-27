@@ -1,4 +1,4 @@
-"""crit_eval.indexers: the reference's faster forms of modeling code select what transformers' own loops select, and
+"""crit_eval.architectures.indexers: the reference's faster forms of modeling code select what transformers' own loops select, and
 its blocked DeepSeek V4 indexer scorer scores what transformers' scorer does."""
 from pathlib import Path
 import sys
@@ -7,7 +7,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import indexers  # noqa: E402
+from crit_eval.architectures import indexers  # noqa: E402
 
 try:
     import torch

@@ -9,7 +9,7 @@ may only make the engine faster.
 ## The max context
 
 `crit eval context --model MODEL_DIR --device device.json` prints it with its basis
-([crit_eval/context.py](../crit_eval/context.py)):
+([crit_eval/limits/context.py](../crit_eval/limits/context.py)):
 `max context = min(requested, model limit, device limit)`.
 
 - **Requested:** the longest request the user wants served, `context_tokens` in `settings.toml`

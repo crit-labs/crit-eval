@@ -11,10 +11,12 @@ import datetime
 import time
 from pathlib import Path
 
-from . import EVAL_DIR, load_json, metrics, write_json
+from .. import EVAL_DIR, load_json, write_json
+from ..reports import metrics
 from .pin import load_continuations
-from .prepare import PREPARED, check_prepared
-from .runner import load_adapter, open_engine, run_speed
+from ..quality.prepare import PREPARED, check_prepared
+from .adapters import load_adapter, open_engine
+from .speed import run_speed
 
 KPIS = ("decode_score", "prefill_score", "ttft_score_ms")
 

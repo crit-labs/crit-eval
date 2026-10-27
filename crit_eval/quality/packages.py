@@ -3,8 +3,9 @@ every crit-eval of that checkpoint, so a run needs only the engine (`crit eval p
 
 A package source is a folder or an HTTPS base URL (a Hugging Face dataset's `resolve/main/`, say) holding
 packages.json and one folder per package, named by the first 16 hex digits of the model's and the suite's sha256:
-prepared.json (crit_eval.prepare) and reference/ (crit_eval.fixed), with reference-as-quantized/ when the data holds
-the as_quantized quality mode's scores too. packages.json lists each package with the
+prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with reference-as-quantized/ when the data holds
+the as_quantized quality mode's scores too, each store with the reference's own spread (spread.json) when the data
+holds it. packages.json lists each package with the
 identities it was made under (model_sha256, suite_sha256, protocol, reference version) and the sha256 of every file,
 which fetch checks before it writes anything into the data. The scores do not depend on the device that computed
 them beyond rounding far below the drift budget, and a run reads them under the model, the suite and the reference
@@ -18,12 +19,14 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from . import load_json, write_json
+from .. import load_json, write_json
 
 INDEX = "packages.json"
 PACKAGE = "reference/package.json"   # in a data folder: the package its reference scores were fetched from
 SOURCE_SETTING = "eval_packages"
-LOCAL = "reference-packages"   # beside crit_eval in a checkout: the default source, not in git
+LOCAL = "reference-packages"   # beside crit_eval in a checkout: the packages made there, not in git
+# The published packages (a Hugging Face dataset of crit-labs), the source when nothing else names one.
+PUBLISHED = "https://huggingface.co/datasets/crit-labs/crit-eval-references/resolve/main"
 
 
 def name(model_sha, suite_sha):
@@ -49,6 +52,7 @@ def pack(data, packages):
             prepared["model"]["sha256"]:
         raise SystemExit(f"{data}: its reference scores are not this crit's reference of the prepared model")
     files = ["prepared.json", f"{fixed.STORE}/index.json"] + [f"{fixed.STORE}/{f}" for f, _ in stored["files"].values()]
+    scores = {fixed.STORE: stored["identity"]}
     for mode, store in fixed.STORES.items():
         other = data / store / "index.json"
         if store == fixed.STORE or not other.is_file():
@@ -57,6 +61,13 @@ def pack(data, packages):
         if scored["identity"].get("reference") == REFERENCE_VERSION and scored["identity"].get("quality_mode") == mode \
                 and scored["identity"].get("model_sha256") == prepared["model"]["sha256"]:
             files += [f"{store}/index.json"] + [f"{store}/{f}" for f, _ in scored["files"].values()]
+            scores[store] = scored["identity"]
+    # Each store's own spread (reference.store_spread), when it was scored for that store's scores.
+    for store, identity in scores.items():
+        spread = data / store / fixed.SPREAD
+        if spread.is_file() and all((load_json(spread).get("identity") or {}).get(key) == value
+                                    for key, value in identity.items()):
+            files.append(f"{store}/{fixed.SPREAD}")
     key = name(prepared["model"]["sha256"], prepared["suite_sha256"])
     target = packages / key
     shutil.rmtree(target, ignore_errors=True)
@@ -95,7 +106,7 @@ def find(model, source, chat_template=None):
     from .prepare import model_identity, suite_identity
     from .reference import REFERENCE_VERSION
     model_sha, suite_sha = model_identity(model, chat_template)["sha256"], suite_identity()
-    from urllib.error import HTTPError
+    from urllib.error import HTTPError, URLError
     try:
         listing = json.loads(_reader(source)(INDEX))
     except FileNotFoundError:
@@ -104,6 +115,8 @@ def find(model, source, chat_template=None):
         if error.code == 404:
             return None
         raise
+    except (URLError, TimeoutError):   # offline: the reference is scored here instead
+        return None
     key = name(model_sha, suite_sha)
     entry = listing.get("packages", {}).get(key)
     if entry is None or entry["model_sha256"] != model_sha or entry["suite_sha256"] != suite_sha \
@@ -144,8 +157,8 @@ def fetch(model, data, source, log=print, chat_template=None):
         for relative in entry["files"]:
             (data / relative).parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(staging / relative), data / relative)
-    # Which package the scores came from, for results (runner.reference_origin): kept while index.json is its own.
-    from . import portable_path
+    # Which package the scores came from, for results (crit_eval.run.quality_checks.reference_origin): kept while index.json is its own.
+    from .. import portable_path
     index = (data / "reference" / "index.json").read_bytes()
     write_json(data / PACKAGE, {"name": key, "source": source if str(source).startswith(("https://", "http://"))
                                 else portable_path(source), "index_sha256": _sha(index)})
@@ -155,7 +168,8 @@ def fetch(model, data, source, log=print, chat_template=None):
 
 def source(given=None):
     """The package source: `given`, else settings.toml's eval_packages, else the checkout's reference-packages
-    folder (LOCAL, kept out of git) when it holds a packages.json, else None."""
-    from . import EVAL_DIR, machine_settings
+    folder (LOCAL, kept out of git) when it holds a packages.json, else the published packages (PUBLISHED)."""
+    from .. import EVAL_DIR, machine_settings
     local = EVAL_DIR.parent / LOCAL
-    return given or machine_settings().get(SOURCE_SETTING) or (str(local) if (local / INDEX).is_file() else None)
+    return (given or machine_settings().get(SOURCE_SETTING) or (str(local) if (local / INDEX).is_file() else None)
+            or PUBLISHED)

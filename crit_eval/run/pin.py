@@ -13,8 +13,8 @@ import hashlib
 import json
 from pathlib import Path
 
-from . import CONTRACT, load_json, write_json
-from .prepare import PREPARED
+from .. import CONTRACT, load_json, write_json
+from ..quality.prepare import PREPARED
 
 CONTINUATIONS = "continuations.json"
 
@@ -43,7 +43,8 @@ def pin(adapter, model, data, config=None, log=print, context_tokens=None):
     """Record the adapter's plain greedy output of every speed case as the data directory's continuation.
     Refuses to replace an existing one: a data directory has one pinned text. context_tokens: the context
     the engine is built for (the run's required context)."""
-    from .runner import load_adapter, open_engine, timed_generate
+    from .adapters import load_adapter, open_engine
+    from .timing import timed_generate
     data = Path(data)
     prepared = load_json(data / PREPARED)
     out = data / CONTINUATIONS

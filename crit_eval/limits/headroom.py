@@ -64,7 +64,7 @@ crit-eval does not judge or classify speed. Noise is the spread of each score ac
 repetitions.
 """
 from . import ceiling as model_ceiling
-from . import metrics
+from ..reports import metrics
 
 
 def decode_suite(result):
@@ -586,7 +586,7 @@ def trace_decode_parts(result, trace):
 
 
 def price_prompts(result, rates, sources, prefill_cases, evidence=()):
-    """A result's headroom with prefill and time to first token priced at `rates` (crit_eval.ceiling.best_rates of a
+    """A result's headroom with prefill and time to first token priced at `rates` (crit_eval.limits.ceiling.best_rates of a
     device) on the model arithmetic it records (result ceiling): the stored-format prefill and TTFT summaries, the
     ceilings by prompt activation format (activation_ceilings, judged with this result's and `evidence`'s quality),
     and their gaps in place of the old ones. The run prices them so; `crit eval status --device/--data` prices a

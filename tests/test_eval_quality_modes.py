@@ -1,5 +1,5 @@
-"""Quality modes: the checkpoint's own activation quantization (crit_eval.schemes.activations, quantize_activations)
-and the as_quantized reference that applies it (crit_eval.reference), on hand-built values and a tiny NVFP4 model
+"""Quality modes: the checkpoint's own activation quantization (crit_eval.limits.schemes.activations, quantize_activations)
+and the as_quantized reference that applies it (crit_eval.quality.reference), on hand-built values and a tiny NVFP4 model
 written here (needs torch, transformers, safetensors and tokenizers)."""
 import importlib.util
 import json
@@ -10,7 +10,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from crit_eval import fixed  # noqa: E402
+from crit_eval.quality import fixed  # noqa: E402
 
 HAS_REFERENCE = all(importlib.util.find_spec(name) for name in ("torch", "transformers", "safetensors", "tokenizers"))
 NVFP4_INPUTS = {"num_bits": 4, "type": "float", "strategy": "tensor_group", "group_size": 16, "dynamic": "local",
@@ -19,7 +19,7 @@ FP8_TOKEN_INPUTS = {"num_bits": 8, "type": "float", "strategy": "token", "dynami
 
 
 class Stored:
-    """A reference checkpoint seen as crit_eval.schemes reads one: tensors by key, headers, a quantization config."""
+    """A reference checkpoint seen as crit_eval.limits.schemes reads one: tensors by key, headers, a quantization config."""
 
     def __init__(self, tensors, quantization):
         self.tensors, self.quantization = tensors, quantization
@@ -31,7 +31,7 @@ class Stored:
         return self.tensors[key]
 
     def header(self, key):
-        from crit_eval.reference import TORCH_DTYPES
+        from crit_eval.quality.checkpoints import TORCH_DTYPES
         tensor = self.tensors[key]
         return type("Header", (), {"dtype": TORCH_DTYPES[str(tensor.dtype).split(".")[-1]], "shape": list(tensor.shape)})
 
@@ -40,7 +40,7 @@ def nvfp4_matrix(weight, global_scale):
     """compressed-tensors' NVFP4 tensors of an FP32 [out, in] weight: E2M1 codes (low nibble first), E4M3 scales per 16
     and the global scale, a divisor."""
     import torch
-    from crit_eval.schemes import E2M1, _round_e2m1
+    from crit_eval.limits.schemes import E2M1, _round_e2m1
     blocks = weight.reshape(weight.shape[0], -1, 16)
     stored = (blocks.abs().amax(-1) / 6 * global_scale).to(torch.float8_e4m3fn)
     step = stored.float()[..., None] / global_scale
@@ -56,7 +56,7 @@ def nvfp4_matrix(weight, global_scale):
 class ActivationTests(unittest.TestCase):
     def test_nvfp4_activations_round_to_the_even_code_with_the_stored_scales(self):
         import torch
-        from crit_eval.schemes import quantize_activations
+        from crit_eval.limits.schemes import quantize_activations
         # Global scale 1, group amax 6: the E4M3 scale is 1 and every value rounds to the E2M1 grid, ties to the even
         # code (0.25 -> 0, 0.75 -> 1, 1.25 -> 1, 1.75 -> 2, 2.5 -> 2, 3.5 -> 4, 5 -> 4).
         x = torch.tensor([[0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0, -0.75, -2.9, 0.1, 0.0, 1.0, 4.4, -6.0, 0.6]])
@@ -72,7 +72,7 @@ class ActivationTests(unittest.TestCase):
 
     def test_fp8_activations_take_one_scale_per_token_or_the_stored_one(self):
         import torch
-        from crit_eval.schemes import quantize_activations
+        from crit_eval.limits.schemes import quantize_activations
         x = torch.tensor([[448.0, 1.0, -3.3], [0.5, 0.0, 0.25]])
         got = quantize_activations(x, "fp8_token", None)
         self.assertEqual(got[0].tolist(), [448.0, 1.0, -3.25])   # step 1: E4M3 has 3 mantissa bits
@@ -81,7 +81,7 @@ class ActivationTests(unittest.TestCase):
 
     def test_the_checkpoint_declares_its_input_activations(self):
         import torch
-        from crit_eval.schemes import SchemeError, activations
+        from crit_eval.limits.schemes import SchemeError, activations
         nvfp4 = {"model.layers.0.mlp.up_proj." + k: v for k, v in nvfp4_matrix(torch.randn(32, 32), 448.0).items()}
         nvfp4["model.layers.0.mlp.up_proj.input_global_scale"] = torch.tensor([224.0])
         fp8 = {"model.layers.0.self_attn.q_proj.weight": torch.zeros(16, 32, dtype=torch.float8_e4m3fn),
@@ -110,6 +110,42 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(activations(Stored(modelopt, {"quant_method": "modelopt"}), "model.layers.0.mlp.up_proj"),
                          ("nvfp4", 4.0))
 
+    def test_as_quantized_judges_by_twice_the_preserve_budget(self):
+        # protocol quality.mode_thresholds: 4-bit activation math swings KL far more than exact activations, so
+        # as_quantized's budget is twice preserve's; a run's own limits lay over either mode's.
+        from crit_eval import load_json, EVAL_DIR
+        from crit_eval.run import quality_checks
+        protocol = load_json(EVAL_DIR / "protocol.json")
+        preserve = quality_checks.quality_thresholds(protocol)
+        self.assertEqual(preserve, {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5})
+        self.assertEqual(quality_checks.quality_thresholds(protocol, mode="preserve"), preserve)
+        quantized = quality_checks.quality_thresholds(protocol, mode="as_quantized")
+        self.assertEqual(quantized, {"ppl_ratio_max": 1.1, "kld_mean_max": 0.1, "kld_p99_max": 1.0})
+        self.assertAlmostEqual(quantized["ppl_ratio_max"] - 1, 2 * (preserve["ppl_ratio_max"] - 1))
+        self.assertEqual(quality_checks.quality_thresholds(protocol, {"kld_p99_max": 0.8}, "as_quantized"),
+                         {**quantized, "kld_p99_max": 0.8})
+
+    def test_a_run_judges_by_the_spread_of_every_text_the_rule_names(self):
+        # protocol quality.spread covers every length (from_tokens 0): a spread stored under an earlier rule, for the
+        # long texts alone, is not judged by until the reference scores it again.
+        from crit_eval import load_json, EVAL_DIR
+        from crit_eval.run import quality_checks
+        protocol = load_json(EVAL_DIR / "protocol.json")
+        self.assertEqual(protocol["quality"]["spread"]["from_tokens"], 0)
+        prepared = {"quality": [{"id": "c", "set": "conversations", "prompt_ids": [1, 2], "continuation_ids": [3]},
+                                {"id": "l", "set": "long-1024", "prompt_ids": [1] * 9000, "continuation_ids": [3]}]}
+        identity = {"reference": 3, "quality_mode": "as_quantized"}
+        store = fixed.STORES["as_quantized"]
+        spread = {"conversations/prompt": {"kld_mean": 0.04, "kld_p99": 0.6, "ppl_ratio": 1.02}}
+        with tempfile.TemporaryDirectory() as data:
+            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity, store))
+            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["l"]}, spread, store)
+            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity, store))   # the long text alone
+            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["c", "l"]}, spread,
+                               store)
+            self.assertEqual(quality_checks.stored_spread(data, prepared, protocol, identity, store), spread)
+            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity))   # preserve's store has none
+
     def test_each_quality_mode_has_its_own_store(self):
         with tempfile.TemporaryDirectory() as data:
             scores = {"t": ([-0.5], [[1]], [[-0.5]])}
@@ -128,7 +164,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
         import torch
         from safetensors.torch import save_file
         from transformers import AutoConfig, AutoModelForCausalLM
-        from crit_eval.schemes import activations, quantize_activations
+        from crit_eval.limits.schemes import activations, quantize_activations
         from test_eval_formats import scored, sequences, tiny
         with tempfile.TemporaryDirectory() as temp:
             original = tiny(Path(temp) / "original")
@@ -158,7 +194,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
             with patch_mode("as_quantized"):
                 quantized = scored(folder, sequences())
             # The twin: transformers' model with the decoded weights and every declared input quantized alike.
-            from crit_eval.reference import _text_config, open_checkpoint
+            from crit_eval.quality.checkpoints import _text_config, open_checkpoint
             checkpoint = open_checkpoint(folder, _text_config(folder))
             twin = AutoModelForCausalLM.from_config(AutoConfig.for_model(**{k: v for k, v in config.items()
                                                                           if k != "quantization_config"}),
@@ -187,7 +223,7 @@ class patch_mode:
         self.mode = mode
 
     def __enter__(self):
-        from crit_eval import reference
+        from crit_eval.quality import reference
         self.original = reference.StreamingReference.__init__
         mode, original = self.mode, self.original
 
@@ -196,7 +232,7 @@ class patch_mode:
         reference.StreamingReference.__init__ = opened
 
     def __exit__(self, *exc):
-        from crit_eval import reference
+        from crit_eval.quality import reference
         reference.StreamingReference.__init__ = self.original
 
 

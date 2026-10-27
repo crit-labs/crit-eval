@@ -9,7 +9,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from crit_eval import logprob, metrics, probe  # noqa: E402
+from crit_eval.quality import logprob
+from crit_eval.reports import metrics
+from crit_eval.limits import probe  # noqa: E402
 
 
 class HostComparisonTests(unittest.TestCase):

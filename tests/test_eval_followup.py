@@ -6,7 +6,8 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import chat, runner, status  # noqa: E402
+from crit_eval.run import chat, history, runner, timing
+from crit_eval.reports import status  # noqa: E402
 
 TURNS = [{"turn": 1, "prompt_ids": list(range(1, 101))},
          {"turn": 2, "prompt_ids": list(range(1, 121))},
@@ -35,10 +36,10 @@ class FollowupTests(unittest.TestCase):
 
     def measure(self, engine, max_context=1000):
         prepared = {"followup": TURNS}
-        first = runner.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None)
+        first = history.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None)
         if first["status"] == "measured":
-            first["again"] = runner.compare_followup(
-                first, runner.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None))
+            first["again"] = history.compare_followup(
+                first, history.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None))
         gate = next(g for g in status._gates({"requirements": {"exactness": "reported"}, "context": {"tokens": None,
                     "reason": "-", "missing": []}, "followup": first}) if g["name"] == "prompt_cache")
         return first, gate
@@ -71,8 +72,8 @@ class FollowupTests(unittest.TestCase):
 
     def test_timed_requests_still_refuse_a_prompt_cache(self):
         engine = Engine(cache=True)
-        runner.timed_generate(engine, [1, 2, 3], 4)
-        runner.timed_generate(engine, [1, 2, 3], 4, prompt_cache=True)
+        timing.timed_generate(engine, [1, 2, 3], 4)
+        timing.timed_generate(engine, [1, 2, 3], 4, prompt_cache=True)
         self.assertEqual(engine.asked, [False, True])
 
 

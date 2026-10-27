@@ -1,5 +1,5 @@
 """Eval over a GGUF, alone or in a folder: ceiling, max context and model identity from the GGUF's tensors and
-derived files, and the reference's GGUF layout (crit_eval.gguf_layout).
+derived files, and the reference's GGUF layout (crit_eval.architectures.gguf_layout).
 
 The conformance tests convert tiny Hugging Face models with GGUF's reference converter and need a checkout of it
 (CRIT_LLAMA_CPP=/path/to/the/checkout) plus torch, transformers, safetensors, tokenizers and gguf; without them they
@@ -17,7 +17,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import GgufError  # noqa: E402
-from crit_eval import ceiling, context, prepare  # noqa: E402
+from crit_eval.limits import ceiling, context
+from crit_eval.quality import prepare  # noqa: E402
 from gguf_writer import gguf_bytes  # noqa: E402
 
 HAS_TEXT = all(importlib.util.find_spec(name) for name in ("tokenizers", "jinja2"))
@@ -143,7 +144,7 @@ class GgufLayoutTests(unittest.TestCase):
 
     def test_value_heads_return_to_grouped_order(self):
         import torch
-        from crit_eval.gguf_layout import _swap_heads
+        from crit_eval.architectures.gguf_layout import _swap_heads
 
         def reorder_v_heads(tensor, dim, num_k_heads, num_v_per_k, head_dim):   # _LinearAttentionVReorderBase
             shape = list(tensor.shape)
@@ -163,7 +164,7 @@ class GgufLayoutTests(unittest.TestCase):
 
     def test_llama_rotary_rows_are_unpermuted(self):
         import torch
-        from crit_eval.gguf_layout import LlamaLayout
+        from crit_eval.architectures.gguf_layout import LlamaLayout
 
         def permute(weights, n_head, n_head_kv):   # LlamaModel.permute
             if n_head_kv is not None and n_head != n_head_kv:
@@ -176,7 +177,7 @@ class GgufLayoutTests(unittest.TestCase):
             self.assertTrue(torch.equal(LlamaLayout._unpermute(permute(weight, heads, kv), heads, kv), weight))
 
     def test_an_architecture_without_rules_is_refused(self):
-        from crit_eval.gguf_layout import GgufCheckpoint, GgufLayoutError
+        from crit_eval.architectures.gguf_layout import GgufCheckpoint, GgufLayoutError
         with tempfile.TemporaryDirectory() as directory:
             model = gguf_folder(directory, config=None, metadata=[("general.architecture", "gemma3")],
                                 tensors=[("token_embd.weight", "F32", (4, 8))])
@@ -318,8 +319,8 @@ class GgufConformanceTests(unittest.TestCase):
         from safetensors.torch import load_file
         from transformers import AutoModel, AutoModelForCausalLM
         from crit_core.model import open_model
-        from crit_eval.gguf_layout import GgufCheckpoint
-        from crit_eval.reference import _text_config
+        from crit_eval.architectures.gguf_layout import GgufCheckpoint
+        from crit_eval.quality.checkpoints import _text_config
         from test_eval_formats import scored
         torch.manual_seed(1)
         sequences = [(torch.randint(0, 300, (40,)).tolist(), 5), (torch.randint(0, 300, (23,)).tolist(), 3)]

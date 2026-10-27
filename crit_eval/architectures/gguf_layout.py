@@ -16,8 +16,8 @@ whole blocks of its format, so the rows a lookup needs are read and decoded on t
 
 An architecture is read only when LAYOUTS has its rules; each rule set is the inverse of the converter class for
 that architecture and is proven by a round trip (tests/test_eval_gguf.py: a model converted by the reference
-converter comes back tensor for tensor; DeepSeek V4, whose rules are crit_eval.gguf_deepseek4, in
-tests/test_eval_gguf_deepseek4.py; Qwen3.8-Flash-Next, whose rules are crit_eval.gguf_qwen4exp, in
+converter comes back tensor for tensor; DeepSeek V4, whose rules are crit_eval.architectures.gguf_deepseek4, in
+tests/test_eval_gguf_deepseek4.py; Qwen3.8-Flash-Next, whose rules are crit_eval.architectures.gguf_qwen4exp, in
 tests/test_eval_gguf_qwen4exp.py). A Llama-architecture GGUF is assumed converted from the Hugging Face
 layout (Q and K permuted); one converted from Mistral's native format is not. Requires numpy, torch and gguf.
 """
@@ -190,7 +190,7 @@ class GgufCheckpoint:
         architecture = gguf.architecture
         rules = LAYOUTS.get(architecture)
         if rules is None:
-            raise GgufLayoutError(f"GGUF architecture {architecture!r} has no layout rules in crit_eval.gguf_layout "
+            raise GgufLayoutError(f"GGUF architecture {architecture!r} has no layout rules in crit_eval.architectures.gguf_layout "
                                   f"(supported: {', '.join(sorted(LAYOUTS))})")
         enums = {name: arch for arch, name in gguf_py.MODEL_ARCH_NAMES.items()}
         if architecture not in enums:
@@ -257,10 +257,10 @@ class GgufCheckpoint:
 
     def rows(self, gguf_name, index):
         """Rows `index` of 2-D GGUF tensor `gguf_name` in FP32: each distinct row read once, with a read of exactly
-        its bytes (consecutive rows in one read) by reference._read_spans' parallel readers, and decoded alone."""
+        its bytes (consecutive rows in one read) by checkpoints._read_spans' parallel readers, and decoded alone."""
         import numpy as np
         import torch
-        from .reference import _read_spans
+        from ..quality.checkpoints import _read_spans
         tensor = self.gguf.tensors[gguf_name]
         count, columns = tensor.shape
         index = index.reshape(-1)

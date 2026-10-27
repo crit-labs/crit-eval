@@ -9,12 +9,16 @@ from pathlib import Path
 import sys
 import tempfile
 import threading
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import chat, fixed, headroom, prepare, reference, runner, status  # noqa: E402
+from crit_eval.run import adapters, chat, runner
+from crit_eval.quality import fixed, prepare, reference
+from crit_eval.limits import headroom
+from crit_eval.reports import status  # noqa: E402
 from test_eval import CharacterText  # noqa: E402
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
@@ -239,7 +243,7 @@ class ChatServerTests(unittest.TestCase):
 
     def engine(self, served_model=None, context_tokens=4096):
         prepared = json.loads((self.data / "prepared.json").read_text())
-        return runner.open_engine(chat.Server(self.url, prepared, served_model), "unused-model", {}, True, context_tokens)
+        return adapters.open_engine(chat.Server(self.url, prepared, served_model), "unused-model", {}, True, context_tokens)
 
     def test_speed_held_out_and_history_prompts_go_as_their_frozen_messages(self):
         result = self.run_eval(("speed", "heldout", "history"))
@@ -614,6 +618,9 @@ class ChatServerTests(unittest.TestCase):
         class Reference:
             def __init__(self, model, quality_mode="preserve"):
                 self.model = model
+                # The spread pass (every text, protocol quality.spread) switches TF32 on and back.
+                flags = SimpleNamespace(allow_tf32=False)
+                self.torch = SimpleNamespace(backends=SimpleNamespace(cuda=SimpleNamespace(matmul=flags), cudnn=flags))
 
             def identity(self, model_sha):
                 return {"model_sha256": model_sha, "reference": reference.REFERENCE_VERSION}
@@ -633,7 +640,9 @@ class ChatServerTests(unittest.TestCase):
                 reference.score_data("other", self.data, log=lambda m: None)
             how = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((how["method"], how["positions"]), ("scored", sum(len(i) - 1 for i, _ in texts.values())))
-            self.assertEqual(reference.score_data("source", self.data, log=lambda m: None)["method"], "stored")
+            self.assertEqual(how["spread"], "scored")
+            again = reference.score_data("source", self.data, log=lambda m: None)
+            self.assertEqual((again["method"], again["spread"]), ("stored", "stored"))
         prepared = json.loads((self.data / "prepared.json").read_text())
         stored = fixed.load(self.data, {"model_sha256": "model", **fixed.identity(texts, 16, prepared["valid_vocab"])})
         self.assertEqual(set(stored), {"tides", "tides@3000", "tides@5000"})

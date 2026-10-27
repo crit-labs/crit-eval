@@ -20,7 +20,7 @@ Requests judged on their text alone (retrieval) may be served from a prompt cach
 cached tokens are recorded. A key for
 the server goes in the CRIT_SERVER_KEY environment variable.
 
-Each request may take as long as the engine's own earlier requests say it should (crit_eval.deadline, protocol
+Each request may take as long as the engine's own earlier requests say it should (crit_eval.run.deadline, protocol
 requests.timeout); one that takes longer raises Hung.
 """
 import array
@@ -35,9 +35,9 @@ import time
 import urllib.error
 import urllib.request
 
-from . import EVAL_DIR, load_json
+from .. import EVAL_DIR, load_json
 from .deadline import Hung, RequestDeadline
-from .prepare import GREEDY_REQUEST, prepared_template, token_ids, with_document
+from ..quality.prepare import GREEDY_REQUEST, prepared_template, token_ids, with_document
 
 # The engine facts crit serve publishes for crit-eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
 # request decode plainly.
@@ -232,7 +232,7 @@ class ChatEngine:
         self.text = load_text(context["model"], server.chat_template)
         self.by_bytes = None  # ids_by_bytes, built for the first quality reply
         self.packed = None   # whether the score call answers in the packed format (None: not asked yet)
-        # With quality measured (crit_eval.runner), every prompt sent as its frozen messages must render to the ids
+        # With quality measured (crit_eval.run.runner), every prompt sent as its frozen messages must render to the ids
         # prepare froze, as the honesty check requires: a server on another template fails at its first request.
         self.exact_prompts = False
 

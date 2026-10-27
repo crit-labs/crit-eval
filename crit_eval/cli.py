@@ -7,7 +7,21 @@ import sys
 # runner.PARTS, kept here so parsing imports nothing else.
 PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup")
 CHAT_TEMPLATE_HELP = ("Chat template (jinja) to render the prompts with, for a model that carries none (default: the "
-                      "one crit ships for its family, as for DeepSeek V4); it becomes part of the model's identity")
+                      "one crit ships for the model's family); it becomes part of the model's identity")
+
+
+def json_option(text, option):
+    """An option's JSON text, else the file holding it."""
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as error:
+        path = Path(text)
+        if not path.is_file():
+            raise SystemExit(f"{option} is neither JSON ({error}) nor a file: {text}")
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as error:
+            raise SystemExit(f"{option} file {path} is not JSON: {error}")
 
 
 def main(argv=None):
@@ -25,7 +39,7 @@ def main(argv=None):
     run.add_argument("--model", required=True, help="Model directory passed to the adapter")
     run.add_argument("--data", required=True, help="Prepared suite directory for this model")
     run.add_argument("--out", required=True, help="Result JSON path")
-    run.add_argument("--config", default="{}", help="JSON configuration overrides passed to the adapter")
+    run.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
     run.add_argument("--only", choices=list(PARTS), action="append",
                      help="Run only these parts (repeatable); default is all. context: the long-context curve and "
                           "retrieval up to the required context and the speed cases again at a lower context; "
@@ -143,14 +157,14 @@ def main(argv=None):
     pin.add_argument("--adapter", required=True, help="Python file exporting create_eval_engine(context)")
     pin.add_argument("--model", required=True, help="Model directory passed to the adapter")
     pin.add_argument("--data", required=True, help="Prepared data directory to pin the continuation in")
-    pin.add_argument("--config", default="{}", help="JSON configuration overrides passed to the adapter")
+    pin.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
     pin.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     ab = subs.add_parser("ab", help="Alternate two engines' speed runs in one session and report paired ratios")
     ab.add_argument("--adapter", required=True, help="Adapter of engine A")
-    ab.add_argument("--config", default="{}", help="JSON configuration of engine A")
+    ab.add_argument("--config", default="{}", help="JSON configuration of engine A (text or a file)")
     ab.add_argument("--adapter-b", help="Adapter of engine B (default: engine A's adapter)")
-    ab.add_argument("--config-b", default="{}", help="JSON configuration of engine B")
+    ab.add_argument("--config-b", default="{}", help="JSON configuration of engine B (text or a file)")
     ab.add_argument("--model", required=True)
     ab.add_argument("--data", required=True)
     ab.add_argument("--out", required=True, help="Result JSON path")
@@ -165,7 +179,7 @@ def main(argv=None):
     kernels.add_argument("--model", required=True, help="Model directory passed to the adapter")
     kernels.add_argument("--data", required=True, help="Prepared suite directory for this model")
     kernels.add_argument("--out", required=True, help="Kernel report JSON path")
-    kernels.add_argument("--config", default="{}", help="JSON configuration overrides passed to the adapter")
+    kernels.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
     kernels.add_argument("--case", action="append", help="Trace only these speed cases (repeatable); default all")
     kernels.add_argument("--device", metavar="JSON", help="Device ceilings from `crit eval probe` for share of peak")
     kernels.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
@@ -192,24 +206,20 @@ ENGINE_COMMANDS = {"run", "pin", "ab", "kernels", "reference"}
 def _command(args):
     if args.command == "kernels":
         from . import load_json as load
-        from .kernels import render as render_kernels, trace
-        from .prepare import PREPARED
+        from .limits.kernels import render as render_kernels, trace
+        from .quality.prepare import PREPARED
         if not (Path(args.data) / PREPARED).is_file():
-            from .prepare import prepare as do_prepare
+            from .quality.prepare import prepare as do_prepare
             do_prepare(args.model, args.data)
-        work = None
-        if args.work:   # JSON text, else a file holding it
-            try:
-                work = json.loads(args.work)
-            except json.JSONDecodeError:
-                work = json.loads(Path(args.work).read_text(encoding="utf-8"))
-        result = trace(args.adapter, args.model, args.data, args.out, json.loads(args.config), args.case, args.nvcc,
+        work = json_option(args.work, "--work") if args.work else None
+        result = trace(args.adapter, args.model, args.data, args.out, json_option(args.config, "--config"), args.case,
+                       args.nvcc,
                        load(args.device) if args.device else None, context_tokens=args.context, work=work)
         print(f"wrote {args.out}")
         print(render_kernels(result, args.top))
         return 0
     if args.command == "prepare":
-        from .prepare import prepare as do_prepare
+        from .quality.prepare import prepare as do_prepare
         try:
             prepared = do_prepare(args.model, args.data, sampling=args.sampling, chat_template=args.chat_template)
         except ValueError as error:
@@ -223,8 +233,8 @@ def _command(args):
         print(f"quality: score them once on the checkpoint: crit eval reference --model {args.model} --data {args.data}")
         return 0
     if args.command == "reference":
-        from .reference import score_data
-        from .fixed import STORES
+        from .quality.reference import score_data
+        from .quality.fixed import STORES
         how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), quality_mode=args.quality_mode)
         print(f"reference scores of {how['positions']:,} positions {how['method']} in "
               f"{Path(args.data) / STORES[args.quality_mode]}"
@@ -232,8 +242,8 @@ def _command(args):
               + (f"; the reference's own spread on the long texts {how['spread']}" if how.get("spread") else ""))
         return 0
     if args.command == "fetch":
-        from .packages import fetch as do_fetch, source
-        from .prepare import read_template
+        from .quality.packages import fetch as do_fetch, source
+        from .quality.prepare import read_template
         where = source(args.packages)
         if where is None:
             raise SystemExit("crit eval fetch: name a package source (--packages, or eval_packages in settings.toml)")
@@ -247,41 +257,43 @@ def _command(args):
             return 1
         return 0
     if args.command == "pack":
-        from .packages import pack as do_pack
+        from .quality.packages import pack as do_pack
         entry = do_pack(args.data, args.packages)
         print(f"packed {entry['name']} ({entry['bytes'] / 2**20:.1f} MiB) into {args.packages}")
         return 0
     if args.command == "context":
         from . import load_json as load
-        from .context import GIB, max_context, render as render_context
+        from .limits.context import GIB, max_context, render as render_context
         from . import EVAL_DIR
         settings = context_settings(load(EVAL_DIR / "protocol.json")["context"], args)
         value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings, requested(args))
         print(json.dumps(value, indent=1) if args.json else render_context(value))
         return 0 if value["tokens"] else 1
     if args.command == "compare":
-        from .report import compare as do_compare
+        from .reports.compare import compare as do_compare
         print(do_compare(args.results))
         return 0
     if args.command == "pin":
-        from .pin import CONTINUATIONS, pin as do_pin
-        from .prepare import PREPARED
+        from .run.pin import CONTINUATIONS, pin as do_pin
+        from .quality.prepare import PREPARED
         if not (Path(args.data) / PREPARED).is_file():
-            from .prepare import prepare as do_prepare
+            from .quality.prepare import prepare as do_prepare
             do_prepare(args.model, args.data)
-        pinned = do_pin(args.adapter, args.model, args.data, json.loads(args.config), context_tokens=args.context)
+        pinned = do_pin(args.adapter, args.model, args.data, json_option(args.config, "--config"),
+                        context_tokens=args.context)
         print(f"pinned {len(pinned['cases'])} speed cases in {Path(args.data) / CONTINUATIONS} (sha256 {pinned['sha256'][:12]})")
         return 0
     if args.command == "ab":
-        from .ab import render as render_ab, run_ab
-        result = run_ab(args.adapter, json.loads(args.config), args.adapter_b or args.adapter, json.loads(args.config_b),
+        from .run.ab import render as render_ab, run_ab
+        result = run_ab(args.adapter, json_option(args.config, "--config"), args.adapter_b or args.adapter,
+                        json_option(args.config_b, "--config-b"),
                         args.model, args.data, args.out, args.rounds, args.warmups, args.repetitions,
                         context_tokens=args.context)
         print(f"wrote {args.out}")
         print(render_ab(result))
         return 0
     if args.command == "probe":
-        from .probe import probe as do_probe
+        from .limits.probe import probe as do_probe
         device = do_probe(args.out, args.nvcc, args.repeats)
         print(f"wrote {args.out}: {device['bandwidth_gbs']:.0f} GB/s, "
               + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in device["tflops"].items())
@@ -291,20 +303,20 @@ def _command(args):
         return 0
     if args.command == "status":
         from . import load_json as load
-        from .status import render, status_of
+        from .reports.status import render, status_of
         from . import EVAL_DIR
         protocol = load(EVAL_DIR / "protocol.json")
         current = status_of(args.result, protocol, args.baseline, args.device, args.data, args.kernels)
         print(json.dumps(current, indent=1) if args.json else render(current))
         return 0
-    from .prepare import PREPARED, read_template
-    from .runner import run as do_run
+    from .quality.prepare import PREPARED, read_template
+    from .run.runner import run as do_run
     parts = tuple(args.only or PARTS)
     data = Path(args.data)
     template = read_template(args.chat_template)
     if not (data / PREPARED).is_file():
-        from .packages import fetch as do_fetch, source
-        from .prepare import prepare as do_prepare
+        from .quality.packages import fetch as do_fetch, source
+        from .quality.prepare import prepare as do_prepare
         try:
             # A published package brings the reference scores too; otherwise prepare here.
             if source() is None or do_fetch(args.model, data, source(), chat_template=template) is None:
@@ -312,12 +324,13 @@ def _command(args):
         except ValueError as error:   # no chat template to render with, or one for a model that carries its own
             raise SystemExit(f"crit eval run: {error}")
     from . import load_json as load
-    from .status import render
+    from .reports.status import render
     device = load(args.device) if args.device else None
     baseline = load(args.baseline) if args.baseline else None
-    result = do_run(args.adapter, args.model, data, args.out, json.loads(args.config), parts,
+    result = do_run(args.adapter, args.model, data, args.out, json_option(args.config, "--config"), parts,
                     args.warmups, args.repetitions, args.label, bandwidth_gbs=args.bandwidth, device=device,
-                    baseline=baseline, quality_budget=json.loads(args.quality_budget) if args.quality_budget else None,
+                    baseline=baseline, quality_budget=(json_option(args.quality_budget, "--quality-budget")
+                                                     if args.quality_budget else None),
                     exactness=args.exactness, context_tokens=args.context, requested_context=requested(args),
                     vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,

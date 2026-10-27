@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v0.1.2",
+  "protocol": "crit-eval-v0.2.0",
   "requests": {
     "timeout": {
       "rule": "an engine behind a server gets no fixed time budget: each request may take floor_seconds plus slack times its expected time from the requests the engine served in this Eval (a prompt of n tokens at most t * max(1, n/m)^2 for a prompt of m tokens that prefilled in t; an output token at context c at most d * max(1, c/k) for one that decoded in d at context k; the tightest bound counts), floor_seconds alone before any; a request past it stops the Eval as hung",
@@ -60,7 +60,7 @@
     "logprobs": "the log-probabilities must be the model's own (before temperature and filters), the values the quality honesty check verifies for greedy replies"
   },
   "quality": {
-    "modes": "a run judges quality in one quality mode, recorded in requirements.quality_mode: preserve (the default) against the reference with exact activations; as_quantized against the same reference with the activations quantized as the checkpoint's own inference declares (every matrix and output head whose stored scheme declares input activations: NVFP4 in groups of 16 with the stored global scale, FP8 per token or per tensor), its scores stored apart (crit eval reference --quality-mode as_quantized). The drift budget and every other rule are the same in both. The mode also prices the limits prefill and the first tokens are measured against: preserve at the fastest 16-bit prompt activations (bf16, fp16_acc) or a faster arithmetic quality shows passing, as_quantized at the stored format",
+    "modes": "a run judges quality in one quality mode, recorded in requirements.quality_mode: preserve (the default) against the reference with exact activations; as_quantized against the same reference with the activations quantized as the checkpoint's own inference declares (every matrix and output head whose stored scheme declares input activations: NVFP4 in groups of 16 with the stored global scale, FP8 per token or per tensor), its scores stored apart (crit eval reference --quality-mode as_quantized). as_quantized judges by its own drift budget, twice preserve's (mode_thresholds): 4-bit activation math turns rounding-level differences into large KL swings (on Qwen3.8-27B NVFP4, two valid references of the checkpoint run as quantized differ by a prompt mean KLD of 0.045-0.08, p99 0.5-1.4), so the preserve budget leaves an engine nothing to spend; every other rule is the same in both. The mode also prices the limits prefill and the first tokens are measured against: preserve at the fastest 16-bit prompt activations (bf16, fp16_acc) or a faster arithmetic quality shows passing, as_quantized at the stored format",
     "top_k": 16,
     "continuation_tokens": 256,
     "rule": "every quality text is a conversation rendered by the model's chat template with its generation prompt (prompt_ids), followed by the conversation's written answer cut to continuation_tokens (continuation_ids); prepare freezes both. crit eval reference scores every position of every text once per model, suite and reference version, teacher-forced on the prepared checkpoint (FP32), and stores each position's target log-probability and top_k. The engine scores the same ids through its serving paths (crit serve's chat-score-v1): every prompt position and the first continuation token from one prefill of the prompt, every later continuation token from its decode, each step forced to the continuation (drafts accepted only while they equal it, every correction and bonus token taken from it)",
@@ -92,12 +92,20 @@
       "kld_mean_max": 0.05,
       "kld_p99_max": 0.5
     },
+    "mode_thresholds": {
+      "as_quantized": {
+        "ppl_ratio_max": 1.1,
+        "kld_mean_max": 0.1,
+        "kld_p99_max": 1.0
+      },
+      "rule": "a quality mode named here judges by its thresholds instead of thresholds (preserve's); a run's --quality-budget is laid over the mode's"
+    },
     "judged": "every set's prompt positions and served positions by the drift budget, each on their own; quality passes when every set passes and the honesty check holds",
     "spread": {
-      "from_tokens": 8192,
+      "from_tokens": 0,
       "perturbation": "tf32",
       "factor": 2,
-      "rule": "the reference scores every text of at least from_tokens tokens once more with its FP32 matmuls taking TF32 inputs (10-bit mantissas, about 1e-3 relative: the size of perturbation a BF16 or FP8 engine's arithmetic introduces, where FP32 rounding alone, 1e-6, under-estimated the effect a hundredfold on Qwen3.8-Flash-Next) and stores how far that run lands from its stored scores, per set and path, by the same metrics (reference/spread.json). A model whose routing or recurrent state amplifies such a perturbation (a mixture of experts with near-tied routing, hard top-k selection) disagrees with itself there by more than the drift budget, so a run judges such a set against the larger of the budget and factor times the reference's own spread (kld_mean and kld_p99; the perplexity ratio's distance from 1), and the result records both. A dense model's two runs stay within the budget, so nothing changes for it",
+      "rule": "the reference scores every text of at least from_tokens tokens (0: every quality text, of every length) once more with its FP32 matmuls taking TF32 inputs (10-bit mantissas, about 1e-3 relative: the size of perturbation a BF16 or FP8 engine's arithmetic introduces, where FP32 rounding alone, 1e-6, under-estimated the effect a hundredfold on Qwen3.8-Flash-Next) and stores how far that run lands from its stored scores, per set and path, by the same metrics (spread.json in the mode's store: reference/, reference-as-quantized/). A model whose routing or recurrent state amplifies such a perturbation (a mixture of experts with near-tied routing, hard top-k selection, 4-bit activations whose rounding flips under the perturbation) disagrees with itself there by more than the drift budget, so a run judges such a set against the larger of the budget and factor times the reference's own spread (kld_mean and kld_p99; the perplexity ratio's distance from 1), and the result records both. A dense model's two exact runs stay within the budget, so nothing changes for it",
       "purpose": "a perfect engine can match the reference no closer than the reference matches itself under an engine-sized perturbation"
     },
     "fail_fast": {

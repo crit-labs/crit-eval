@@ -1,11 +1,11 @@
-"""crit_eval.tensors: one classification of stored tensors for the ceiling and the context limit."""
+"""crit_eval.limits.tensors: one classification of stored tensors for the ceiling and the context limit."""
 from pathlib import Path
 import sys
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from crit_eval.tensors import tensor_role  # noqa: E402
+from crit_eval.limits.tensors import tensor_role  # noqa: E402
 
 
 class TensorRoleTests(unittest.TestCase):

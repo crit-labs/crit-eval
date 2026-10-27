@@ -27,9 +27,9 @@ import sys
 import tempfile
 import time
 
-from . import CONTRACT, EVAL_DIR, load_json, portable_path, write_json
+from .. import CONTRACT, EVAL_DIR, load_json, portable_path, write_json
 from .ceiling import best_rates
-from .prepare import PREPARED
+from ..quality.prepare import PREPARED
 
 SOURCE = EVAL_DIR / "probe" / "kernel_trace.cpp"
 TOP = 12
@@ -115,7 +115,7 @@ def _timed(engine, ids, n, now=time.time_ns):
 
 
 def _child(spec):
-    from .runner import load_adapter, open_engine
+    from ..run.adapters import load_adapter, open_engine
     prepared = load_json(Path(spec["data"]) / PREPARED)
     module = load_adapter(spec["adapter"])
     engine, info = open_engine(module, spec["model"], spec["config"], speculative=True,
@@ -223,7 +223,7 @@ def _work_rule(rules, name):
     return None
 
 
-# The terms of the prefill floor a kernel's time joins (crit_eval.ceiling), and draft work kept apart from them.
+# The terms of the prefill floor a kernel's time joins (crit_eval.limits.ceiling), and draft work kept apart from them.
 TERMS = ("matmul", "attention", "recurrent", "other", "draft")
 # Name heuristics for kernels no kernel_work rule classes, checked in order on the lower-cased demangled name.
 # Weight-only GEMMs go by their scheme (w4a16, marlin) and crit's stored-tile projections by their namespace.
@@ -305,7 +305,7 @@ def analyze(kernels, device, marks, device_ceilings=None):
                                                       sorted(unclassed.items(), key=lambda x: -x[1])[:UNCLASSED]]}
             if phase == "prefill" and "prefill_first" in case:
                 # The fresh request's time to its first token, and the GPU's busy time inside it: the rest is the
-                # engine's host work, launches and synchronization (crit_eval.status: the TTFT breakdown).
+                # engine's host work, launches and synchronization (crit_eval.reports.status: the TTFT breakdown).
                 first_ms = (case["prefill_first"] - lo) / 1e6
                 gpu = sum(ns for k, ns in inside if k[0] < case["prefill_first"]) / 1e6
                 cases[case["id"]][phase].update(first_token_ms=first_ms, gpu_before_first_ms=min(gpu, first_ms))
@@ -422,7 +422,7 @@ def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=
         env = dict(os.environ, CUDA_INJECTION64_PATH=str(library), CRIT_KTRACE_DIR=directory,
                    PYTHONPATH=os.pathsep.join(filter(None, paths)))
         log(f"tracing kernels with {library.name} ({toolkit['nvcc']})")
-        done = subprocess.run([sys.executable, "-B", "-m", "crit_eval.kernels", "--child", json.dumps(spec)], env=env)
+        done = subprocess.run([sys.executable, "-B", "-m", "crit_eval.limits.kernels", "--child", json.dumps(spec)], env=env)
         if done.returncode != 0:
             raise SystemExit(f"traced engine process failed ({done.returncode})")
         marks = load_json(Path(directory) / "marks.json")

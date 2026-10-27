@@ -1,4 +1,4 @@
-"""Eval's run-time estimate (crit_eval.estimate): every request is known from the prepared data and the protocol, and
+"""Eval's run-time estimate (crit_eval.run.estimate): every request is known from the prepared data and the protocol, and
 the engine's first requests give its prefill and decode costs."""
 from pathlib import Path
 import sys
@@ -7,8 +7,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_eval import EVAL_DIR, load_json  # noqa: E402
-from crit_eval.deadline import RequestDeadline  # noqa: E402
-from crit_eval.estimate import estimate, fit, PREFILL_TERMS, rates, requests, summary  # noqa: E402
+from crit_eval.run.deadline import RequestDeadline  # noqa: E402
+from crit_eval.run.estimate import estimate, fit, PREFILL_TERMS, rates, requests, summary  # noqa: E402
 
 PROTOCOL = {
     "speed": {"warmup_runs": 1, "repetitions": 2},

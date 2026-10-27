@@ -7,7 +7,7 @@ from pathlib import Path
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.1.2"
+__version__ = "0.2.0"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.
@@ -49,7 +49,7 @@ def checkouts():
 
 def machine_settings():
     """Memory thresholds from settings.toml (vram_headroom_gib, context_reserve_gib), the wanted context
-    (context_tokens) and the reference package source (eval_packages, crit_eval.packages): crit-eval's checkout's,
+    (context_tokens) and the reference package source (eval_packages, crit_eval.quality.packages): crit-eval's checkout's,
     else the crit checkout's (checkouts); without one crit-eval uses the protocol's defaults and
     DEFAULT_CONTEXT_TOKENS."""
     path = next((root / "settings.toml" for root in checkouts() if (root / "settings.toml").is_file()), None)

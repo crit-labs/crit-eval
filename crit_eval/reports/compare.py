@@ -1,8 +1,8 @@
 """Side-by-side comparison of result files: `crit eval compare A.json B.json ...`."""
 from pathlib import Path
 
-from . import load_json, protocol_series
-from .host import summary
+from .. import load_json, protocol_series
+from ..run.host import summary
 from .status import decode_text_identity
 
 
