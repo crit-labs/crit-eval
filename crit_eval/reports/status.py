@@ -31,8 +31,10 @@ show the change from an earlier result of the same model and suite.
 """
 from pathlib import Path
 
-from . import headroom, load_json, metrics, protocol_series
-from .ceiling import best_rates
+from ..limits import headroom
+from .. import load_json, protocol_series
+from . import metrics
+from ..limits.ceiling import best_rates
 
 
 def _gates(result):
@@ -463,7 +465,7 @@ def _render_ttft_parts(t):
 
 def _render_terms(terms):
     """Each traced case's prefill GPU time per floor term against the term's floor."""
-    from .kernels import unclassed_note
+    from ..limits.kernels import unclassed_note
     lines =[f"  prefill by term (kernel trace of {terms.get('engine')}, prefill as "
              f"{terms.get('prefill_request') or 'the request up to its first token'}; measured vs floor ms):"]
     for case_id, row in terms["cases"].items():
@@ -493,7 +495,7 @@ def _term_rate(t):
 
 def _case_errors(sampled, protocol):
     """Each sampled case's relative standard error, repetitions and the repetitions the protocol's target_se would take
-    (runner.run_sampled_speed records them; a result that does not record them has them derived from its samples)."""
+    (speed.run_sampled_speed records them; a result that does not record them has them derived from its samples)."""
     target = (protocol["sampled_speed"].get("adaptive") or {}).get("target_se")
     found = {}
     for case_id, case in sampled.get("cases", {}).items():
@@ -573,7 +575,7 @@ def build(result, protocol, baseline=None):
                    # The rate each format's floor takes and what achieved it (cuBLASLt GEMM or raw MMA).
                    "rates": room.get("rates"),
                    # Ceilings with the quantized matrices' prompt activations at each format, the engine's own, what
-                   # quality shows passing or rules out, and the reachable one (crit_eval.headroom.activation_ceilings).
+                   # quality shows passing or rules out, and the reachable one (crit_eval.limits.headroom.activation_ceilings).
                    "activations": _activations_kpi(room.get("activations")),
                    # A kernel trace joined to the floor's terms per case (crit eval status --kernels).
                    "terms": room.get("prefill_terms"),
@@ -622,7 +624,7 @@ def build(result, protocol, baseline=None):
         if limits["ttft"]:
             ttft_kpi["floor_ms"] = limits["ttft"]
             ttft_kpi["fraction_of_floor"] = limits["ttft"] / ttft_kpi["score_ms"] if ttft_kpi["score_ms"] else None
-    perplexity, kl_divergence = _quality_kpis(result.get("quality"), protocol["quality"]["thresholds"])
+    perplexity, kl_divergence = _quality_kpis(result.get("quality"), metrics.mode_thresholds(protocol["quality"], mode))
     attribution = (result.get("quality") or {}).get("attribution")
     if kl_divergence is not None and attribution:
         kl_divergence["attribution"] = attribution
@@ -672,7 +674,7 @@ def build(result, protocol, baseline=None):
     return status
 
 
-# The formats a checkpoint stores its matrices in (crit_eval.ceiling), whose rates the stored-format ceiling takes.
+# The formats a checkpoint stores its matrices in (crit_eval.limits.ceiling), whose rates the stored-format ceiling takes.
 STORED_FORMATS = ("bf16", "fp8", "nvfp4")
 GOAL_UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_decode": "tok/s", "context_ttft": "ms"}
 
@@ -1050,7 +1052,7 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
     stored in it when it was measured. device_path: a `crit eval probe` result whose rates price prefill and time to
     first token instead of the result's own device; data: the data directory the result was measured on, whose model
     arithmetic prices them for a result that does not record it (results before crit-eval-v0.1.0). Either prices
-    prefill and time to first token again (crit_eval.headroom.price_prompts), with the ceilings by prompt activation
+    prefill and time to first token again (crit_eval.limits.headroom.price_prompts), with the ceilings by prompt activation
     format; a result that records its arithmetic but not those ceilings gets them from its own device. kernels_path: a
     kernel trace (crit eval kernels) of the engine, joined to the prefill floor's terms (headroom.prefill_terms)."""
     result = load_json(path)
@@ -1060,7 +1062,7 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
         raise SystemExit(f"{path} was measured with {result.get('protocol')}; its status is the one stored in it")
     baseline = load_json(baseline_path) if baseline_path else None
     if data is not None:
-        from .prepare import PREPARED
+        from ..quality.prepare import PREPARED
         prepared = load_json(Path(data) / PREPARED)
         if prepared.get("model", {}).get("sha256") != result.get("model_sha256"):
             raise SystemExit(f"{data} was prepared from another model than {path} measured")

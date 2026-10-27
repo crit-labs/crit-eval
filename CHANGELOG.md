@@ -7,6 +7,61 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ---
 
+## [Unreleased]
+
+## [0.2.0] - 2026-10-27
+
+### Overview
+
+crit-eval 0.2.0 starts protocol series crit-eval-v0.2: the `as_quantized` quality mode judges by a drift budget twice
+`preserve`'s, measured from what 4-bit activation rounding alone moves, and every quality text is judged against the
+reference's own spread. Reference packages are published on Hugging Face and fetched by default, and carry the spread
+they were judged with. The package is grouped into `run`, `quality`, `limits`, `reports` and `architectures`, with
+architecture-specific code in `architectures` alone. How a checkpoint stores its matrices is recognised by crit-core,
+so crit-eval 0.2.0 needs crit-core 0.12.
+
+### Added
+
+- Adapters load as a module of a package of their own folder: code beside an adapter is imported relatively
+  (`from .engine import Engine`), so `crit eval ab` loads two packages whose modules share a name; a second adapter
+  whose absolute import names a module the first adapter's folder provided is refused instead of running the first
+  one's code.
+- docs/ADAPTER.md: a Python engine with the engine library's interface (`info`, `generate`, `score`, `close`) passes
+  the function opening it to crit_core's stock adapter (`eval_engine(context, open_engine, defaults)`) and writes no
+  adapter of its own.
+
+### Changed
+
+- JSON options take text or a file: `--config`, `--config-b`, `--quality-budget` and `--work`.
+- The `crit_eval` package is grouped by what each module does: `crit_eval.run` (runner, adapters and servers,
+  outcomes, deadlines, estimates, `ab`, `pin`, host), `crit_eval.quality` (prepare, reference, fixed texts,
+  packages), `crit_eval.limits` (probe, ceiling, context, headroom, kernels, schemes, tensors), `crit_eval.reports`
+  (metrics, status, and `compare`, formerly `report`) and `crit_eval.architectures` (the GGUF layouts per architecture
+  and the indexer forms, the only architecture-specific code). Code importing `crit_eval.<module>` imports it from
+  its subpackage; the `crit eval` commands are unchanged. The two largest modules are split by part: `run.runner`
+  keeps `run` with the adapters, timing, speed, quality, context and history parts in `run.adapters`, `run.timing`,
+  `run.speed`, `run.quality_checks`, `run.long_context` and `run.history`, and `quality.reference` keeps
+  `StreamingReference` with its attention, checkpoint readers and prompt state in `quality.attention`,
+  `quality.checkpoints` and `quality.prompt_state`.
+- Protocol crit-eval-v0.2.0 (a new series: data prepared under 0.1.x is prepared again; reference scores carry over).
+  The `as_quantized` quality mode judges by a drift budget twice `preserve`'s (`quality.mode_thresholds`: PPL ratio
+  ≤ 1.10, mean KLD ≤ 0.10, p99 KLD ≤ 1.0): on Qwen3.8-27B NVFP4, 4-bit activation math swings prompt rows by a
+  mean KLD of 0.045-0.08 (p99 0.5-1.4) under rounding alone, the preserve budget's size. `preserve` is unchanged.
+- The reference's own spread (`quality.spread`) covers every quality text, not only those of at least 8,192
+  tokens (`from_tokens` 0), so short sets are judged against it too; a spread stored under the old rule is not used
+  until `crit eval reference` scores it again.
+- Reference packages carry each store's `spread.json` (`crit eval pack`), so a fetched package judges by the same
+  spread as data scored on the machine.
+- Reference packages are published on Hugging Face
+  ([crit-labs/crit-eval-references](https://huggingface.co/datasets/crit-labs/crit-eval-references)): when neither
+  `--packages`, `eval_packages` nor a checkout's `reference-packages/` names a source, `crit eval fetch`, `crit eval
+  run` and `crit run eval` fetch from there, and score the reference on the machine when it has no package for the
+  checkout or cannot be reached.
+- How a checkpoint stores each weight matrix is recognised by `crit_core.model.schemes` (from the crit-core release
+  that ships it), the copy engines read too; `crit_eval.limits.schemes` keeps the decoders. No result changes: the
+  recognition moved unchanged.
+- crit-eval needs crit-core 0.12 (`crit-core>=0.12.0,<0.13`), the release that ships `crit_core.model.schemes`.
+
 ## [0.1.2] - 2026-10-26
 
 ### Added
@@ -128,3 +183,9 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 - `crit eval kernels` takes its phase marks on CUPTI's clock (the tracer exports `crit_ktrace_timestamp`): the host
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
+
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/crit-labs/crit-eval/compare/v0.1.2...v0.2.0
+[0.1.2]: https://github.com/crit-labs/crit-eval/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/crit-labs/crit-eval/compare/46c7757...v0.1.1
+[0.1.0]: https://github.com/crit-labs/crit-eval/releases/tag/v0.1.0

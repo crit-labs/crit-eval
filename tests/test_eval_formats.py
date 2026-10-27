@@ -1,5 +1,5 @@
 """Eval over weight formats and quantization schemes beyond plain safetensors: PyTorch state dicts, and the schemes of
-crit_eval.schemes. For each, the reference decodes the stored weights to exactly the FP32 values the format's own
+crit_eval.limits.schemes. For each, the reference decodes the stored weights to exactly the FP32 values the format's own
 library produces, the model scores exactly as transformers scores its dequantized twin, and the ceiling counts the
 same matrices as the unquantized model at the scheme's rate.
 
@@ -17,7 +17,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from crit_eval import ceiling  # noqa: E402
+from crit_eval.limits import ceiling  # noqa: E402
 
 
 def _has(*names):
@@ -70,7 +70,7 @@ def scored(folder, sequences, top_k=5):
     """Per (ids, first target): the reference's (log-probabilities, top_k ids, their log-probabilities) of the targets
     from the first on, as lists (score_texts scores every position)."""
     import tempfile
-    from crit_eval.reference import StreamingReference
+    from crit_eval.quality.reference import StreamingReference
     with tempfile.TemporaryDirectory() as scratch:
         rows = StreamingReference(folder, device="cpu").score_texts([ids for ids, _ in sequences], top_k, None, scratch,
                                                                     log=lambda *_: None)
@@ -92,7 +92,7 @@ class FormatTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def checkpoint(self, folder):
-        from crit_eval.reference import _text_config, open_checkpoint
+        from crit_eval.quality.checkpoints import _text_config, open_checkpoint
         return open_checkpoint(folder, _text_config(folder))
 
     def assert_scores_like_dequantized(self, folder):
@@ -100,7 +100,7 @@ class FormatTests(unittest.TestCase):
         reference decodes, so the stored scheme reaches the modeling code intact."""
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
-        from crit_eval.schemes import scheme
+        from crit_eval.limits.schemes import scheme
         checkpoint = self.checkpoint(folder)
         scores = scored(folder, sequences())
         config = json.loads((folder / "config.json").read_text())
@@ -129,7 +129,7 @@ class FormatTests(unittest.TestCase):
     def assert_decodes_like(self, folder, library):
         """Every quantized matrix decodes to the library's own FP32 dequantization: library(checkpoint, base)."""
         import torch
-        from crit_eval.schemes import scheme
+        from crit_eval.limits.schemes import scheme
         checkpoint = self.checkpoint(folder)
         bases = sorted({key.rsplit(".", 1)[0] for key in checkpoint.where if scheme(checkpoint, key.rsplit(".", 1)[0])})
         self.assertGreaterEqual(len(bases), 14, folder.name)
@@ -164,7 +164,7 @@ class FormatTests(unittest.TestCase):
         # DeepSeek and Qwen FP8 checkpoints: one weight_scale_inv per 128 x 128 block, FP32 or E8M0.
         import torch
         from transformers.integrations.finegrained_fp8 import Fp8Dequantize
-        from crit_eval.reference import StateDictCheckpoint
+        from crit_eval.quality.checkpoints import StateDictCheckpoint
         torch.manual_seed(0)
         weight = (torch.randn(256, 384) * 100).to(torch.float8_e4m3fn)
         for scale in (torch.rand(2, 3) * 0.01,
@@ -223,7 +223,7 @@ class FormatTests(unittest.TestCase):
         import mlx.core as mx
         import numpy as np
         import torch
-        from crit_eval.schemes import _mlx
+        from crit_eval.limits.schemes import _mlx
         cases = {"affine-4": (["--q-bits", "4", "--q-group-size", "32"], "bf16"),
                  "affine-3": (["--q-bits", "3", "--q-group-size", "64"], "bf16"),
                  "affine-6-bf16": (["--q-bits", "6", "--q-group-size", "32", "--dtype", "bfloat16"], "bf16"),

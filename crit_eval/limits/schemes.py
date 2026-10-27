@@ -1,12 +1,13 @@
 """How a checkpoint keyed by Hugging Face names stores its weight matrices, decided in one place for the ceiling and
-the reference.
+the reference: the recognition is crit_core.model.schemes (header-only, shared with engines that load matrices as
+stored), the decoders are here.
 
 A matrix `base` (a module path such as model.layers.0.mlp.down_proj) is stored as one scheme, recognised from the
 tensors under `base.` and the model's quantization config (quantization_config, or MLX's quantization):
 
     plain         base.weight in BF16, F16 or F32
     fp8           base.weight F8_E4M3 with base.weight_scale per tensor, per row or per block (compressed-tensors
-                  block_structure), or base.weight_scale_inv per block (weight_block_size: DeepSeek and Qwen FP8)
+                  block_structure), or base.weight_scale_inv per block (weight_block_size)
     nvfp4         E2M1 pairs (low nibble first) with E4M3 group-16 scales and an FP32 global factor:
                   compressed-tensors (U8 base.weight_packed, base.weight_global_scale as a divisor) or ModelOpt
                   (U8 base.weight, base.weight_scale_2 as a multiplier)
@@ -33,97 +34,25 @@ stored(tensors, base, quantization) gives the scheme's name, its GEMM rate key f
 matrix's element count from headers alone (no torch). dense(checkpoint, base, device) decodes it to FP32 [out, in]
 with the same arithmetic the format's own library performs in FP32 (torch). Weight-only integer schemes count at
 the bf16 rate (engines widen their codes to 16 bits for the GEMM); 8-bit integer weights with per-row scales at
-the fp8 rate (int8 tensor cores run at the FP8 rate). A new scheme is one entry in SCHEMES.
+the fp8 rate (int8 tensor cores run at the FP8 rate). A new scheme is one entry in crit_core's RECOGNISERS and one
+in DECODERS.
 
 activations(checkpoint, base) says how the checkpoint's own inference quantizes the activations a quantized matrix
 multiplies (its declared input activations: compressed-tensors input_activations with base.input_global_scale or
 base.input_scale, ModelOpt base.input_scale), and quantize_activations applies it in FP32, the reference's
-quality_mode as_quantized (crit_eval.reference).
+quality_mode as_quantized (crit_eval.quality.reference).
 """
 import json
 import math
-import re
+
+from crit_core.model.schemes import (PRIMARY, RECOGNISERS, UNREAD, SchemeError, quantization_of,  # noqa: F401
+                                     refuse_unread, stored)
+from crit_core.model.schemes import ct_group as _ct_group, ct_weight_args as _ct_args, mlx_settings as _mlx
+from crit_core.model.schemes import gptq_bits as _gptq_bits, quant_method as _method
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
 AWQ_REVERSE_ORDER = [0, 4, 1, 5, 2, 6, 3, 7]
 FP8_BLOCK = 128
-
-
-class SchemeError(ValueError):
-    """A matrix stored in a way crit does not decode, or whose tensors disagree with its scheme."""
-
-
-def quantization_of(config):
-    """The quantization config of a crit_core.model.ModelConfig as plain data: quantization_config, else MLX's
-    quantization (mlx-lm writes both, alike), else {}."""
-    root = config.to_dict()
-    return root.get("quantization_config") or root.get("quantization") or {}
-
-
-# Schemes whose only decoders are exllama's CUDA kernels, so the reference has no CPU dequantization to match, and
-# the tensor each stores per matrix in place of .weight.
-UNREAD = {"exl2": ".q_weight", "exl3": ".trellis"}
-
-
-def refuse_unread(quantization, names=()):
-    """Raise SchemeError for a checkpoint in a scheme of UNREAD, named by its quantization config or by its tensor
-    names, so that it is refused rather than read without its matrices."""
-    method = _method(quantization)
-    if method not in UNREAD:
-        method = next((m for m, suffix in UNREAD.items() for name in names if name.endswith(suffix)), None)
-    if method:
-        raise SchemeError(f"{method.upper()} weights are not read: exllama decodes them only in CUDA kernels, so "
-                          "there is no CPU dequantization to check crit's reference against; use the base model or "
-                          "another quantization of it")
-
-
-def _method(quantization):
-    return str((quantization or {}).get("quant_method") or "").lower()
-
-
-def _shape(tensors, name):
-    tensor = tensors.get(name)
-    return None if tensor is None else tuple(tensor.shape)
-
-
-def _dtype(tensors, name):
-    tensor = tensors.get(name)
-    return None if tensor is None else tensor.dtype
-
-
-def _mlx(quantization, base):
-    """MLX's (bits, group_size, mode) for module `base`, None when it is not quantized."""
-    override = (quantization or {}).get(base)
-    if override is False:
-        return None
-    source = override if isinstance(override, dict) else quantization or {}
-    return int(source.get("bits", 4)), int(source.get("group_size", 64)), str(source.get("mode", "affine"))
-
-
-def _ct_group(quantization, base, linear=False):
-    """The compressed-tensors config group with weights whose targets name matrix `base` (its module name, or `re:`
-    a pattern matched from its start, as compressed-tensors matches them), or None; with `linear`, else the first that
-    targets the class Linear (every linear matrix the config does not ignore)."""
-    groups = [group for group in ((quantization or {}).get("config_groups") or {}).values()
-              if base is not None and isinstance(group, dict) and group.get("weights")]
-    for group in groups:
-        if any(target == base or target.startswith("re:") and re.match(target[3:], base)
-               for target in group.get("targets") or ()):
-            return group
-    return next((group for group in groups if "Linear" in (group.get("targets") or ())), None) if linear else None
-
-
-def _ct_args(quantization, base=None):
-    """compressed-tensors' weight quantization args (num_bits, strategy, group_size, symmetric) for matrix `base`:
-    of the config groups with weights, the one whose targets name it (_ct_group), else the first. A mixed-precision
-    checkpoint has a group per scheme (DeepSeek V4 W4A16-FP8: FP8 blocks for attention, packed int4 for the
-    experts)."""
-    group = _ct_group(quantization, base)
-    if group is not None:
-        return group["weights"]
-    groups = [group["weights"] for group in ((quantization or {}).get("config_groups") or {}).values()
-              if isinstance(group, dict) and group.get("weights")]
-    return groups[0] if groups else {}
 
 
 FP8_MAX = 448.0
@@ -199,19 +128,9 @@ def quantize_activations(x, kind, scale):
 # Each scheme: stored(tensors, base, quantization) -> (rate, elements) or None, and decode(checkpoint, base,
 # device) -> FP32 [out, in]. Checked in order; the first whose tensors are present names the matrix.
 
-def _plain_stored(tensors, base, quantization):
-    rate = {"BF16": "bf16", "F16": "bf16", "F32": "bf16"}.get(_dtype(tensors, base + ".weight"))
-    return (rate, math.prod(_shape(tensors, base + ".weight"))) if rate else None
-
 
 def _plain_decode(checkpoint, base, device):
     return checkpoint.raw(base + ".weight").to(device).float()
-
-
-def _fp8_stored(tensors, base, quantization):
-    if _dtype(tensors, base + ".weight") not in ("F8_E4M3", "F8_E5M2"):
-        return None
-    return "fp8", math.prod(_shape(tensors, base + ".weight"))
 
 
 def _fp8_decode(checkpoint, base, device):
@@ -219,7 +138,7 @@ def _fp8_decode(checkpoint, base, device):
     import torch
     inverse = checkpoint.has(base + ".weight_scale_inv")   # despite the name, a multiplier too
     scale = checkpoint.raw(base + (".weight_scale_inv" if inverse else ".weight_scale")).to(device)
-    # E8M0 scales (DeepSeek's ue8m0) come as float8_e8m0fnu or as their bytes: 2 ** (s - 127).
+    # E8M0 scales (ue8m0) come as float8_e8m0fnu or as their bytes: 2 ** (s - 127).
     scale = (torch.ldexp(torch.ones_like(scale, dtype=torch.float32), scale.to(torch.int32) - 127)
              if scale.dtype == torch.uint8 else scale.float())
     rows, cols = weight.shape[-2:]
@@ -233,15 +152,6 @@ def _fp8_decode(checkpoint, base, device):
     block = quantization.get("weight_block_size") or _ct_args(quantization, base).get("block_structure") or (FP8_BLOCK,) * 2
     expanded = scale.repeat_interleave(int(block[0]), -2).repeat_interleave(int(block[1]), -1)
     return weight * expanded[..., :rows, :cols]
-
-
-def _nvfp4_stored(tensors, base, quantization):
-    for packed in (".weight_packed", ".weight"):
-        shape, scale = _shape(tensors, base + packed), _shape(tensors, base + ".weight_scale")
-        if (_dtype(tensors, base + packed) == "U8" and _dtype(tensors, base + ".weight_scale") == "F8_E4M3"
-                and scale[-1] * 16 == shape[-1] * 2):
-            return "nvfp4", math.prod(shape) * 2
-    return None
 
 
 def _nvfp4_decode(checkpoint, base, device):
@@ -278,19 +188,6 @@ def unpack_bits(words, bits, count):
     return (low | high) & ((1 << bits) - 1)
 
 
-def _ct_int_stored(tensors, base, quantization):
-    if _method(quantization) != "compressed-tensors":
-        return None
-    if _dtype(tensors, base + ".weight_packed") == "I32":
-        bits = int(_ct_args(quantization, base).get("num_bits", 4))
-        rows, words = _shape(tensors, base + ".weight_packed")[-2:]
-        experts = math.prod(_shape(tensors, base + ".weight_packed")[:-2])
-        return "bf16", experts * rows * (words * 32 // bits)
-    if _dtype(tensors, base + ".weight") == "I8" and base + ".weight_scale" in tensors:
-        return "fp8", math.prod(_shape(tensors, base + ".weight"))
-    return None
-
-
 def _ct_int_decode(checkpoint, base, device):
     import torch
     args = _ct_args(checkpoint.quantization, base)
@@ -318,13 +215,6 @@ def _ct_int_decode(checkpoint, base, device):
     return codes.float() * scale[:, group]
 
 
-def _awq_stored(tensors, base, quantization):
-    if _method(quantization) != "awq" or base + ".qweight" not in tensors:
-        return None
-    cols, packed = _shape(tensors, base + ".qweight")
-    return "bf16", cols * packed * 8
-
-
 def _awq_decode(checkpoint, base, device):
     import torch
     quantization = checkpoint.quantization
@@ -345,18 +235,6 @@ def _awq_decode(checkpoint, base, device):
     group = weight.shape[0] // scales.shape[0]
     zeros = zeros.repeat_interleave(group, dim=0)
     return ((weight - zeros).float() * scales.repeat_interleave(group, dim=0)).T.contiguous()
-
-
-def _gptq_bits(quantization):
-    return int(quantization.get("bits", 4))
-
-
-def _gptq_stored(tensors, base, quantization):
-    if _method(quantization) != "gptq" or base + ".qweight" not in tensors:
-        return None
-    packed, rows = _shape(tensors, base + ".qweight")
-    cols = (_shape(tensors, base + ".g_idx") or (packed * 32 // _gptq_bits(quantization),))[0]
-    return "bf16", rows * cols
 
 
 def _gptq_decode(checkpoint, base, device):
@@ -390,18 +268,6 @@ def _gptq_decode(checkpoint, base, device):
         group = torch.arange(cols, device=device) // (size if size > 0 else cols)
     codes = unpack_bits(qweight.transpose(0, 1).contiguous(), bits, cols).transpose(0, 1)
     return (scales[group] * (codes - zeros[group]).float()).T.contiguous()
-
-
-def _mlx_stored(tensors, base, quantization):
-    if _dtype(tensors, base + ".weight") != "U32" or base + ".scales" not in tensors:
-        return None
-    found = _mlx(quantization, base)
-    if found is None:
-        return None
-    bits, _, mode = found
-    rows, words = _shape(tensors, base + ".weight")[-2:]
-    elements = math.prod(_shape(tensors, base + ".weight")[:-2]) * rows * words * 32 // bits
-    return {"affine": "bf16", "mxfp4": "nvfp4", "nvfp4": "nvfp4", "mxfp8": "fp8"}.get(mode, "bf16"), elements
 
 
 def _mlx_decode(checkpoint, base, device):
@@ -439,12 +305,6 @@ def _bnb4_state(checkpoint, base):
     return None
 
 
-def _bnb4_stored(tensors, base, quantization):
-    if _dtype(tensors, base + ".weight") != "U8" or base + ".weight.absmax" not in tensors:
-        return None
-    return "bf16", math.prod(_shape(tensors, base + ".weight")) * 2
-
-
 def _bnb4_decode(checkpoint, base, device):
     import torch
     state = _bnb4_state(checkpoint, base)
@@ -477,24 +337,10 @@ def _blockwise(values, absmax, size):
     return out
 
 
-def _bnb8_stored(tensors, base, quantization):
-    if _dtype(tensors, base + ".weight") != "I8" or base + ".SCB" not in tensors:
-        return None
-    return "fp8", math.prod(_shape(tensors, base + ".weight"))
-
-
 def _bnb8_decode(checkpoint, base, device):
     weight = checkpoint.raw(base + ".weight").to(device)
     scale = checkpoint.raw(base + ".SCB").to(device).float()
     return weight * scale.view(-1, 1) * 7.874015718698502e-3   # bitsandbytes' 1/127
-
-
-def _nbits_stored(tensors, base, quantization):
-    tensor = tensors.get(base + ".nbits_weight")
-    if tensor is None:
-        return None
-    attributes = getattr(tensor, "attributes", {})
-    return "bf16", int(attributes.get("N", 0)) * int(attributes.get("K", 0))
 
 
 def _nbits_decode(checkpoint, base, device):
@@ -538,33 +384,25 @@ def _byte_codes(data, bits):
     return value & ((1 << bits) - 1)
 
 
-SCHEMES = {
-    "nvfp4": (_nvfp4_stored, _nvfp4_decode),
-    "fp8": (_fp8_stored, _fp8_decode),
-    "int": (_ct_int_stored, _ct_int_decode),
-    "awq": (_awq_stored, _awq_decode),
-    "gptq": (_gptq_stored, _gptq_decode),
-    "mlx": (_mlx_stored, _mlx_decode),
-    "bnb4": (_bnb4_stored, _bnb4_decode),
-    "bnb8": (_bnb8_stored, _bnb8_decode),
-    "nbits": (_nbits_stored, _nbits_decode),
-    "plain": (_plain_stored, _plain_decode),
+# Each scheme crit_core recognises, decoded to FP32 [out, in] with the format library's own arithmetic.
+DECODERS = {
+    "nvfp4": _nvfp4_decode,
+    "fp8": _fp8_decode,
+    "int": _ct_int_decode,
+    "awq": _awq_decode,
+    "gptq": _gptq_decode,
+    "mlx": _mlx_decode,
+    "bnb4": _bnb4_decode,
+    "bnb8": _bnb8_decode,
+    "nbits": _nbits_decode,
+    "plain": _plain_decode,
 }
-# The tensor that names each scheme's matrix, for the ceiling's walk over a file's tensors.
-PRIMARY = (".weight_packed", ".qweight", ".nbits_weight", ".weight")
-
-
-def stored(tensors, base, quantization=None):
-    """(scheme, rate, elements) of matrix `base` from the tensors' headers ({name: TensorInfo}), or None."""
-    for name, (recognise, _) in SCHEMES.items():
-        found = recognise(tensors, base, quantization or {})
-        if found:
-            return (name,) + tuple(found)
-    return None
+if set(DECODERS) != set(RECOGNISERS):
+    raise ImportError(f"crit_core recognises {sorted(RECOGNISERS)} but crit-eval decodes {sorted(DECODERS)}")
 
 
 def scheme(checkpoint, base):
-    """The scheme name of matrix `base` in a reference checkpoint (crit_eval.reference.TensorCheckpoint), or None
+    """The scheme name of matrix `base` in a reference checkpoint (crit_eval.quality.checkpoints.TensorCheckpoint), or None
     when it holds no matrix there."""
     found = stored(_Headers(checkpoint), base, checkpoint.quantization)
     return None if found is None or found[0] == "plain" else found[0]
@@ -575,7 +413,7 @@ def dense(checkpoint, base, device):
     found = stored(_Headers(checkpoint), base, checkpoint.quantization)
     if found is None:
         raise KeyError(f"the checkpoint holds no weight for {base!r}")
-    return SCHEMES[found[0]][1](checkpoint, base, device)
+    return DECODERS[found[0]](checkpoint, base, device)
 
 
 class _Headers:

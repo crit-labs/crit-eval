@@ -2,9 +2,9 @@
 
 Every engine evaluated against the same data directory gets exactly the same prompts, rendered once with the
 model's own chat template: an adapter's engine their token ids, an engine behind a server the chat messages
-frozen next to them (crit_eval.chat). Tokenizer, chat template, stop ids and vocabulary come from Core's text
+frozen next to them (crit_eval.run.chat). Tokenizer, chat template, stop ids and vocabulary come from Core's text
 layer (crit_core.text), which needs the `tokenizers` and `jinja2` packages (preparation only). A model that carries
-no chat template renders with the one crit ships for its family (DeepSeek V4's), or with the one given with
+no chat template renders with the one crit ships for its family, or with the one given with
 --chat-template FILE; prepared.json records which (template_record), and that template is part of the model's
 identity (model_identity), so packages and runs of the checkpoint find the same data.
 
@@ -24,8 +24,8 @@ import re
 from crit_core.model import open_model
 from crit_core.model.gguf import PROJECTOR
 
-from . import SUITE_DIR, protocol_series, write_json
-from .ceiling import model_ceiling
+from .. import SUITE_DIR, protocol_series, write_json
+from ..limits.ceiling import model_ceiling
 
 PREPARED = "prepared.json"
 LONG = "long.json"
@@ -133,7 +133,7 @@ def model_description(model):
     """What a result names its model by, beside model_sha256: its name, the Hugging Face repository and revision
     when the path shows them (a hub cache, or a folder named by its commit), its format, architecture and
     quantization. No path is stored. None where the model cannot be read."""
-    from .schemes import quantization_of
+    from ..limits.schemes import quantization_of
     try:
         path = Path(model).resolve()
         found = HUB_CACHE.search(path.as_posix())
@@ -250,7 +250,7 @@ def heldout_messages(prompt):
 
 
 def api_messages(messages):
-    """Suite messages in the chat API's form, as an engine behind a server is sent them (crit_eval.chat): tool-call
+    """Suite messages in the chat API's form, as an engine behind a server is sent them (crit_eval.run.chat): tool-call
     arguments as JSON text, each tool result paired with its call by id."""
     out, ids, pending = [], count(), []
     for message in messages:

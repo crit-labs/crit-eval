@@ -16,7 +16,7 @@ import shutil
 import subprocess
 import sys
 
-from .probe import host_memory
+from ..limits.probe import host_memory
 
 GPU_FIELDS = ("index", "name", "memory.total", "driver_version", "pcie.link.gen.current", "pcie.link.gen.max",
               "pcie.link.width.current", "pcie.link.width.max")

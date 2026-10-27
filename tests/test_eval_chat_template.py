@@ -16,8 +16,11 @@ for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 
 import core_text_fixtures as fx  # noqa: E402
 from crit_core.text import ModelTextError, load_model_text, shipped_template  # noqa: E402
-from crit_eval import chat, cli, fixed, packages, prepare  # noqa: E402
-from crit_eval.reference import REFERENCE_VERSION  # noqa: E402
+from crit_eval.run import chat
+from crit_eval import cli  # noqa: E402
+from crit_eval.quality import prepare  # noqa: E402
+from crit_eval.quality import fixed, packages
+from crit_eval.quality.reference import REFERENCE_VERSION  # noqa: E402
 
 TEMPLATE = ("{{ bos_token }}{% for m in messages %}<{{ m.role }}>{{ m.content }}{% endfor %}"
             "{% if add_generation_prompt %}<reply>{% endif %}")

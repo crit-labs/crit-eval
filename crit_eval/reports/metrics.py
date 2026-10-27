@@ -252,6 +252,12 @@ def bucketed(reference_rows, engine_rows, labels):
     return {label: text_quality(*rows) for label, rows in groups.items()}
 
 
+def mode_thresholds(rule, mode="preserve"):
+    """The drift budget of quality mode `mode` under protocol quality rule `rule`: its mode_thresholds entry, else
+    thresholds (preserve's)."""
+    return dict((rule.get("mode_thresholds") or {}).get(mode) or rule["thresholds"])
+
+
 def budget_used(quality, thresholds):
     """Largest fraction of the drift budget a set uses (1.0 at a limit); None when nothing is limited."""
     used = []

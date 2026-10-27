@@ -11,7 +11,7 @@ kind is one of
 - layer: everything else, read on every pass.
 draft is true for draft (MTP) layers, in the checkpoint or in their own file beside it, whatever their kind.
 GGUF files name tensors their own way (token_embd, blk.N.ffn_up_exps, output) and mark draft layers only by
-their block number, so tensor_role takes the draft blocks the file's metadata declares (crit_eval.ceiling).
+their block number, so tensor_role takes the draft blocks the file's metadata declares (crit_eval.limits.ceiling).
 
 The rules are data (the tables below), checked in this order. A checkpoint that names its parts differently gets a
 row here, never a branch in the callers.

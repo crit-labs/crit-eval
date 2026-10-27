@@ -1,5 +1,5 @@
 """DeepSeek V4 GGUFs (architecture "deepseek4"): the config.json their metadata derives (crit_core.model.gguf_deepseek4)
-and the reference's layout (crit_eval.gguf_deepseek4).
+and the reference's layout (crit_eval.architectures.gguf_deepseek4).
 
 The conformance test writes a tiny checkpoint in DeepSeek's own format (FP8 matrices with E8M0 block scales, FP4
 routed experts with E8M0 scales per 32 values, BF16 and F32 tensors, hash-routing tables), converts it with GGUF's
@@ -339,7 +339,7 @@ class DeepseekV4NamesTests(unittest.TestCase):
         # The reference spread scores the long texts again on the same reference: every layer it released to meta
         # after the first pass, the compressors' own rotary frequencies too, loads again.
         import torch
-        from crit_eval.reference import StreamingReference
+        from crit_eval.quality.reference import StreamingReference
         torch.manual_seed(1)
         ids = torch.randint(0, 300, (150,)).tolist()
         with tempfile.TemporaryDirectory() as directory:
@@ -402,8 +402,8 @@ class DeepseekV4ConformanceTests(unittest.TestCase):
         import torch
         from transformers import AutoModelForCausalLM
         from crit_core.model import open_model
-        from crit_eval.gguf_layout import GgufCheckpoint
-        from crit_eval.reference import _text_config
+        from crit_eval.architectures.gguf_layout import GgufCheckpoint
+        from crit_eval.quality.checkpoints import _text_config
         from test_eval_formats import scored
         torch.manual_seed(1)
         # 150 tokens cross the heavily compressed layer's 128-token window; the indexer keeps 4 of up to 37 entries.
@@ -458,10 +458,10 @@ class DeepseekV4ConformanceTests(unittest.TestCase):
         import torch
         from transformers import AutoModelForCausalLM, DynamicCache
         from crit_core.model import open_model
-        from crit_eval import reference
-        from crit_eval.gguf_layout import GgufCheckpoint
+        from crit_eval.quality import attention, checkpoints, reference
+        from crit_eval.architectures.gguf_layout import GgufCheckpoint
         folder = self.convert("long", deepseek_checkpoint(self.root / "original-long", True))
-        config = reference._text_config(folder)
+        config = checkpoints._text_config(folder)
         checkpoint = GgufCheckpoint(open_model(folder).weights, config)
         model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
         model.load_state_dict({k: checkpoint.fit(k, checkpoint.raw(k), v.shape) for k, v in model.state_dict().items()})
@@ -479,14 +479,14 @@ class DeepseekV4ConformanceTests(unittest.TestCase):
             return [logprobs[i - 1, ids[i]].item() for i in range(1, len(ids))]
 
         def long(block, chunk):
-            with mock.patch.multiple(reference, QUERY_BLOCK=block, PROMPT_CHUNK=chunk), \
+            with mock.patch.multiple(attention, QUERY_BLOCK=block), mock.patch.multiple(reference, PROMPT_CHUNK=chunk), \
                     tempfile.TemporaryDirectory() as scratch:
                 scorer = reference.StreamingReference(folder, device="cpu")
-                self.assertEqual(scorer.chunked, reference.CHUNKED_SINKS)
+                self.assertEqual(scorer.chunked, attention.CHUNKED_SINKS)
                 return scorer.score_texts([ids], 5, None, scratch, log=lambda *_: None, long=[0])[0][0].tolist()
 
         whole = eager(len(ids))
-        for block in (reference.QUERY_BLOCK, 32, 7):
+        for block in (attention.QUERY_BLOCK, 32, 7):
             with self.subTest(block=block):
                 self.assertEqual(long(block, reference.PROMPT_CHUNK), whole)
         self.assertEqual(long(16, 64), eager(64))

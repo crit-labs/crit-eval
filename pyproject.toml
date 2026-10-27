@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.1.2"
+version = "0.2.0"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-dependencies = ["crit-core>=0.10.0,<0.12"]
+dependencies = ["crit-core>=0.12.0,<0.13"]
 
 [project.optional-dependencies]
 # The reference scores the quality texts on the checkpoint itself (crit-eval reference).

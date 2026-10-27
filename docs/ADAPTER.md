@@ -5,7 +5,12 @@
 An engine joins with a Python file exporting `create_eval_engine(context)`;
 [examples/mock_adapter.py](../crit_eval/examples/mock_adapter.py) is a complete example.
 
-`context` holds `model` (the `--model` directory), `config` (the `--config` JSON),
+The adapter is loaded as a module of a package of its own folder: import the code beside it
+relatively (`from .engine import Engine`), so `crit eval ab` can load two packages whose modules
+share a name. The folder is also on `sys.path`, but Python keeps one module per top-level name, so
+a second adapter whose absolute import names a module the first one's folder provided is refused.
+
+`context` holds `model` (the `--model` directory), `config` (the `--config` JSON, given as text or a file),
 `speculative` (false when the harness wants plain one-token decoding for the exactness check
 from a second engine) and, with a [required context](CONTEXT.md), `context_tokens`. Size the KV
 cache and every length-dependent table for it at load and report `max_context` of at least it. The returned
@@ -64,6 +69,10 @@ from crit_core.native import eval_engine
 def create_eval_engine(context):
     return eval_engine(context, Path(__file__).with_name("libengine.so"), defaults={"mode": "fast"})
 ```
+
+A Python engine that implements the library's interface (`info`, `generate`, `score`, `close`) passes the
+function opening it in place of the path, `eval_engine(context, open_engine, defaults)`, and gets the same adapter
+([Python engines](https://github.com/crit-labs/crit/blob/main/core/src/runtime/README.md#python-engines)).
 
 It generates greedily with stops disabled, offers `replay` and `generate_plain` when the engine
 declares `replay` or `plain`, `generate_sampled` when it samples (with log-probabilities when it

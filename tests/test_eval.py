@@ -16,13 +16,17 @@ from unittest.mock import Mock, mock_open, patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from crit_core.model import inspect_safetensors  # noqa: E402
-from crit_eval import ab, ceiling, context, headroom, host, hostload, metrics, pin, prepare, probe, report, runner, status  # noqa: E402
+from crit_eval.run import ab, adapters, host, hostload, long_context, pin, quality_checks, runner, speed, timing
+from crit_eval.limits import ceiling, context, headroom, probe
+from crit_eval.reports import metrics, compare as report
+from crit_eval.quality import prepare
+from crit_eval.reports import status  # noqa: E402
 import crit_eval  # noqa: E402
 from crit_eval import protocol_series, protocol_version  # noqa: E402
 
 MOCK = ROOT / "crit_eval/examples/mock_adapter.py"
 SUITE = prepare.suite_identity()  # prepared data must come from the suite Eval runs
-# What every result holds before its parts run (crit_eval.runner): the run's requirements and the required context.
+# What every result holds before its parts run (crit_eval.run.runner): the run's requirements and the required context.
 MEASURED = {"requirements": {"exactness": "reported"}, "context": {"tokens": None, "reason": "not given", "missing": []}}
 
 
@@ -37,7 +41,7 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v0.1.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v0.2.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
@@ -212,12 +216,46 @@ class RunnerTests(unittest.TestCase):
             previous = sys.dont_write_bytecode
             sys.dont_write_bytecode = False
             try:
-                module = runner.load_adapter(package / "adapter.py")
+                module = adapters.load_adapter(package / "adapter.py")
             finally:
                 sys.dont_write_bytecode = previous
                 sys.modules.pop("helper_for_adapter", None)
             self.assertEqual(module.create_eval_engine({}), 3)
             self.assertFalse(any(package.rglob("__pycache__")))
+
+    def test_two_adapters_with_same_named_helpers_each_run_their_own(self):
+        with tempfile.TemporaryDirectory() as directory:
+            def package(name, value, statement):
+                folder = Path(directory) / name
+                (folder / "engine_for_adapter").mkdir(parents=True)
+                (folder / "engine_for_adapter/__init__.py").write_text(f"VALUE = {value}\n")
+                (folder / "adapter.py").write_text(statement + "\ndef create_eval_engine(context):\n"
+                                                   "    return engine_for_adapter.VALUE\n")
+                return folder / "adapter.py"
+            relative = "from . import engine_for_adapter"
+            first, second = package("a", 1, relative), package("b", 2, relative)
+            self.assertEqual([adapters.load_adapter(p).create_eval_engine({}) for p in (first, second, first)], [1, 2, 1])
+            absolute = "import engine_for_adapter"
+            first, second = package("c", 3, absolute), package("d", 4, absolute)
+            try:
+                self.assertEqual(adapters.load_adapter(first).create_eval_engine({}), 3)
+                with self.assertRaisesRegex(SystemExit, "both import a top-level 'engine_for_adapter'.*relatively"):
+                    adapters.load_adapter(second)
+            finally:
+                sys.modules.pop("engine_for_adapter", None)
+
+    def test_json_options_take_text_or_a_file(self):
+        from crit_eval.cli import json_option
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "B.json"
+            path.write_text('{"draft_width": 4}')
+            self.assertEqual(json_option('{"draft_width": 2}', "--config"), {"draft_width": 2})
+            self.assertEqual(json_option(str(path), "--config-b"), {"draft_width": 4})
+            with self.assertRaisesRegex(SystemExit, "--config is neither JSON .* nor a file: missing.json"):
+                json_option("missing.json", "--config")
+            path.write_text("draft_width=4")
+            with self.assertRaisesRegex(SystemExit, "--config-b file .*B.json is not JSON"):
+                json_option(str(path), "--config-b")
 
     def test_wrong_token_count_is_rejected(self):
         class Short:
@@ -225,7 +263,7 @@ class RunnerTests(unittest.TestCase):
                 on_tokens([1])
                 return {"tokens": [1]}
         with self.assertRaises(RuntimeError):
-            runner.timed_generate(Short(), [1, 2], 4)
+            timing.timed_generate(Short(), [1, 2], 4)
 
 
 class CharacterText:
@@ -316,6 +354,7 @@ PROTOCOLS = {
     "crit-eval-v8": "f15b05a73387399d950ab3f31fe27dc4eec1b16662a65b91d0f9a583f44ac8ad",  # one long text per length, ...
     "crit-eval-v0.1.0": "a39facfb4d13d4054ab3da3445564606d4a0696f93e5583b8e0a076467858412",  # crit-eval's first release
     "crit-eval-v0.1.2": "a373c9c54f5b00d8d986da7dac0a2480049b0bbef1999d4c9fdd8ac72bc3edad",  # quality modes
+    "crit-eval-v0.2.0": "8baf8ea4edbad3ad1a0ac06dd7775df74a3e216a32696d1c3b5533cf19a9dd1a",  # as_quantized budget x2, spread on every text
 }
 
 
@@ -549,7 +588,7 @@ class CeilingTests(unittest.TestCase):
             self.assertEqual(probe.architecture(), ["-arch=native"])
 
     def test_probe_keeps_the_median_host_rates(self):
-        from crit_eval import probe
+        from crit_eval.limits import probe
         samples = [{"device": "gpu", "bandwidth_gbs": 1, "host_threads": 12, "cpu_isa": "avx512",
                     "device_to_host_gbs": {"pinned": {"65536": d}},
                     "host_memory_gbs": {"read": r, "write": 20.0, "copy": 0.0},
@@ -716,7 +755,7 @@ class ActivationCeilingTests(unittest.TestCase):
         scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
         quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
             "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
-        return {"protocol": "crit-eval-v0.1.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
+        return {"protocol": "crit-eval-v0.2.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
                 "engine": {"prompt_activations": declared}, "quality": quality,
                 "headroom": {"gaps": [], "missing": []}}
 
@@ -1022,12 +1061,12 @@ class RepetitionTests(unittest.TestCase):
 
     def test_repetitions_disagree_by_their_decode_ttft_or_outputs(self):
         agree = [self.sample(100.0, 50.0), self.sample(103.0, 51.0)]
-        self.assertFalse(runner.disagree(agree, [[1, 2], [1, 2]], 0.05))
-        self.assertTrue(runner.disagree([self.sample(100.0, 50.0), self.sample(110.0, 50.0)], [[1], [1]], 0.05))
-        self.assertTrue(runner.disagree([self.sample(100.0, 50.0), self.sample(100.0, 60.0)], [[1], [1]], 0.05))
-        self.assertTrue(runner.disagree(agree, [[1, 2], [1, 3]], 0.05))
+        self.assertFalse(timing.disagree(agree, [[1, 2], [1, 2]], 0.05))
+        self.assertTrue(timing.disagree([self.sample(100.0, 50.0), self.sample(110.0, 50.0)], [[1], [1]], 0.05))
+        self.assertTrue(timing.disagree([self.sample(100.0, 50.0), self.sample(100.0, 60.0)], [[1], [1]], 0.05))
+        self.assertTrue(timing.disagree(agree, [[1, 2], [1, 3]], 0.05))
         # A warmup is no measured repetition.
-        self.assertFalse(runner.disagree(agree + [{"decode_tps": 10.0, "ttft_ms": 900.0, "warmup": True}],
+        self.assertFalse(timing.disagree(agree + [{"decode_tps": 10.0, "ttft_ms": 900.0, "warmup": True}],
                                          [[1], [1]], 0.05))
 
     def test_a_third_repetition_runs_only_after_two_that_disagree(self):
@@ -1042,10 +1081,10 @@ class RepetitionTests(unittest.TestCase):
                     calls.append(n)
                     return [7] * n, dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
                                          round_ms=None)
-                with patch.object(runner, "timed_generate", timed):
-                    speed = runner.run_speed(None, {"max_context": 64}, prepared, protocol, 1, 2, lambda m: None)
+                with patch.object(speed, "timed_generate", timed):
+                    measured = speed.run_speed(None, {"max_context": 64}, prepared, protocol, 1, 2, lambda m: None)
                 self.assertEqual(len(calls), runs)   # the warmup, two repetitions and a third only on disagreement
-                self.assertEqual(len([s for s in speed["cases"]["a"]["samples"] if not s["warmup"]]), runs - 1)
+                self.assertEqual(len([s for s in measured["cases"]["a"]["samples"] if not s["warmup"]]), runs - 1)
 
 
 class SampledSpeedTests(unittest.TestCase):
@@ -1169,7 +1208,7 @@ class SampledSpeedTests(unittest.TestCase):
                 if name == "generate_sampled":
                     raise AttributeError(name)
                 return getattr(self.inner, name)
-        found = runner.run_sampled_speed(Greedy(object()), {"max_context": 64}, {"speed": [], "sampling": {}},
+        found = speed.run_sampled_speed(Greedy(object()), {"max_context": 64}, {"speed": [], "sampling": {}},
                                          runner.load_json(runner.EVAL_DIR / "protocol.json"), 0, 2, lambda m: None)
         self.assertEqual(found["status"], "unsupported")
         gate = status._sampling_gate({"sampled_speed": found})
@@ -1282,12 +1321,12 @@ class SampledSpeedTests(unittest.TestCase):
                 sent.append(dict(sampling))
                 on_tokens([5] * n)
                 return {"tokens": [5] * n, "rounds": n - 1}
-        found = runner.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
+        found = speed.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
         self.assertEqual(found["status"], "measured")
         self.assertEqual(sent[0], {"temperature": 1.0, "top_p": 0.95, "top_k": 0, "min_p": 0.0, "presence_penalty": 0.0,
                                    "frequency_penalty": 0.0, "repetition_penalty": 1.0, "seed": 1})
         Engine.sampling_fields = {"temperature", "seed"}
-        found = runner.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
+        found = speed.run_sampled_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 2, lambda m: None)
         self.assertEqual(found, {"status": "unsupported", "reason": "the engine does not apply the sampling's top_p"})
 
     def test_sampled_repetitions_run_every_seed_and_a_disturbance_shows_in_the_time_per_pass(self):
@@ -1310,13 +1349,13 @@ class SampledSpeedTests(unittest.TestCase):
                     on_tokens([5] * min(per_round, n - i))
                 return {"tokens": [5] * n, "rounds": -(-(n - 1) // per_round)}
         quiet = Engine()
-        found = runner.run_sampled_speed(quiet, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+        found = speed.run_sampled_speed(quiet, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
                                          disturbed_spread=0.25)
         self.assertEqual(quiet.seeds, [0, 1, 2, 3])   # the warmup, then every seed, and no extra repetition
         decode = [s["decode_tps"] for s in found["cases"]["a"]["samples"] if not s["warmup"]]
         self.assertGreater(max(decode) / min(decode), 1.5)   # far past the disturbed spread, from the text alone
-        with self.assertRaisesRegex(runner.Disturbed, "time per target pass"):
-            runner.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, None,
+        with self.assertRaisesRegex(timing.Disturbed, "time per target pass"):
+            speed.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, None,
                                      lambda m: None, disturbed_spread=0.25)
 
         class Served(Engine):
@@ -1330,7 +1369,7 @@ class SampledSpeedTests(unittest.TestCase):
                     on_tokens([5, 5])
                 return {"tokens": [5] * 6, "rounds": 3,
                         "served": {"prompt_tokens": 2, "output_tokens": 6, "finish_reason": "tool_calls"}}
-        found = runner.run_sampled_speed(Served(), {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+        found = speed.run_sampled_speed(Served(), {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
                                          disturbed_spread=0.25)
         self.assertEqual(found["status"], "measured")   # judged on the two full-length replies alone
 
@@ -1353,7 +1392,7 @@ class SampledSpeedTests(unittest.TestCase):
                 return {"tokens": [5] * n, "rounds": -(-(n - 1) // per_round)}
         rule = protocol["sampled_speed"]["adaptive"]
         fixed = Engine()
-        found = runner.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None)
+        found = speed.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None)
         case = found["cases"]["a"]
         self.assertEqual((fixed.seeds, case["repetitions"], found["adaptive"]), ([0, 1, 2, 3], 3, None))
         self.assertGreater(case["decode_se"], rule["target_se"])
@@ -1361,13 +1400,13 @@ class SampledSpeedTests(unittest.TestCase):
         self.assertEqual(case["repetitions_for_target"], math.ceil((deviation / rule["target_se"]) ** 2))
         # On request: further seeds until the error reaches the target, here the cap, since seed 2 stays an outlier.
         adaptive = Engine()
-        found = runner.run_sampled_speed(adaptive, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+        found = speed.run_sampled_speed(adaptive, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
                                          adaptive=True)
         self.assertEqual(adaptive.seeds, [0, 1, 2, 3] + list(range(4, rule["max_repetitions"] + 1)))
         self.assertEqual(found["cases"]["a"]["repetitions"], rule["max_repetitions"])
         self.assertEqual(found["adaptive"], {"target_se": rule["target_se"], "max_repetitions": rule["max_repetitions"]})
         even = Engine(uneven=False)
-        runner.run_sampled_speed(even, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None, adaptive=True)
+        speed.run_sampled_speed(even, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None, adaptive=True)
         self.assertEqual(even.seeds, [0, 1, 2, 3])   # already within the target
         current = status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0}, "speed": {"cases": {}}},
                                protocol)
@@ -1398,7 +1437,7 @@ class SampledSpeedTests(unittest.TestCase):
             cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--no-adaptive-sampled"])
             self.assertFalse(parsed["adaptive_sampled"])
         # A sampled decode repeated adaptively compares only with one repeated the same way.
-        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.1.0",
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.2.0",
                "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
                                  "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
         before = copy.deepcopy(now)
@@ -1576,12 +1615,12 @@ class StatusTests(unittest.TestCase):
 
     def test_exactness_runs_on_the_loaded_engine_when_it_decodes_plain_greedy(self):
         opened = []
-        original = runner.open_engine
+        original = adapters.open_engine
 
         def counting(module, model, config, speculative, context_tokens=None, **options):
             opened.append(speculative)
             return original(module, model, config, speculative, context_tokens, **options)
-        runner.open_engine = counting
+        runner.open_engine = speed.open_engine = counting
         try:
             with tempfile.TemporaryDirectory() as directory:
                 data = Path(directory)
@@ -1597,7 +1636,7 @@ class StatusTests(unittest.TestCase):
                     # Plain decoding is one target pass per token, whichever engine ran it.
                     self.assertGreater(result["exactness"]["step_ms"], 0)
         finally:
-            runner.open_engine = original
+            runner.open_engine = speed.open_engine = original
 
     def test_a_disturbed_device_stops_the_round(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1781,7 +1820,7 @@ class StatusTests(unittest.TestCase):
                 on_tokens(tokens)
                 return {"tokens": tokens, "rounds": 1}
         with self.assertRaises(RuntimeError):
-            runner.timed_replay(Wrong(), [1, 2], [5, 6, 7, 8, 9])
+            timing.timed_replay(Wrong(), [1, 2], [5, 6, 7, 8, 9])
 
     def test_paired_runs_alternate_the_order_and_report_ratios(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1799,7 +1838,7 @@ class StatusTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             library = Path(directory) / "libengine.so"
             library.write_bytes(b"native bytes")
-            identity = runner.native_identity({"native_libraries": [str(library), str(Path(directory) / "missing.so")]})
+            identity = adapters.native_identity({"native_libraries": [str(library), str(Path(directory) / "missing.so")]})
             self.assertEqual(identity[0]["sha256"], hashlib.sha256(b"native bytes").hexdigest())
             self.assertEqual(identity[0]["bytes"], 12)
             self.assertIn("error", identity[1])
@@ -1901,9 +1940,9 @@ class ContextTests(unittest.TestCase):
             value = context.max_context(model, device, context.GIB, self.settings, requested=262144)
             self.assertEqual((value["tokens"], value["bound"]), (8192, "model"))
             self.assertIn("exceed the model's 8,192 positions", value["note"])
-            requirement = runner.context_requirement(model, device, None, context.GIB, self.settings, 4096)
+            requirement = long_context.context_requirement(model, device, None, context.GIB, self.settings, 4096)
             self.assertEqual((requirement["tokens"], requirement["bound"], requirement["source"]), (4096, "requested", "computed"))
-            given = runner.context_requirement(model, device, 8192, context.GIB, self.settings,
+            given = long_context.context_requirement(model, device, 8192, context.GIB, self.settings,
                                                basis={"requested": 262144, "bound": "model", "note": "clamped"})
             self.assertEqual((given["tokens"], given["source"], given["requested"], given["bound"]),
                              (8192, "given", 262144, "model"))
@@ -1990,13 +2029,13 @@ class ContextTests(unittest.TestCase):
             "b": case(90, 50),  # decode 10% slower
             "c": case(90, 50, decodes=(80, 100)),  # 10% slower, within its 22% run-to-run spread
             "d": case(100, 60)}}  # first token 20% later
-        out = runner.compare_lower(at_max, at_lower, 2048, self.settings)
+        out = long_context.compare_lower(at_max, at_lower, 2048, self.settings)
         self.assertEqual(out["slower"], {"b": ["decode"], "d": ["ttft"]})
         self.assertFalse(out["passed"])
         at_lower["cases"].update(b=case(100, 50), d=case(101, 49))
-        self.assertTrue(runner.compare_lower(at_max, at_lower, 2048, self.settings)["passed"])
+        self.assertTrue(long_context.compare_lower(at_max, at_lower, 2048, self.settings)["passed"])
         del at_lower["cases"]["a"]
-        out = runner.compare_lower(at_max, at_lower, 2048, self.settings)
+        out = long_context.compare_lower(at_max, at_lower, 2048, self.settings)
         self.assertEqual((out["unmeasured"], out["passed"]), (["a"], False))
 
     def run_mock(self, directory, context_tokens, model="unused-model", device=None, **config):
@@ -2129,19 +2168,19 @@ class ContextTextTests(unittest.TestCase):
 
     def test_every_point_times_its_reply_and_judges_retrieval_on_it(self):
         engine = self.Engine([1, 2])   # "ab": the fact's answer
-        points, text, asked, _ = runner.run_context(engine, {"max_context": 64}, self.prepared, self.settings, 32,
+        points, text, asked, _ = long_context.run_context(engine, {"max_context": 64}, self.prepared, self.settings, 32,
                                                  lambda message: None)
         self.assertEqual(engine.calls, [12, 28])   # the curve's 16 and 32, one request each, prompt plus output
         self.assertEqual(text["source"], "generated")
         self.assertTrue(all(p["status"] == "measured" for p in points.values()))
         self.assertEqual({point: verdict["passed"] for point, verdict in asked.items()}, {16: True, 32: True})
         # The point below the curve gets a request of its own; the curve's points take their verdicts.
-        retrieval = runner.run_retrieval(engine, {"max_context": 64}, self.prepared, self.settings, 32,
+        retrieval = long_context.run_retrieval(engine, {"max_context": 64}, self.prepared, self.settings, 32,
                                          lambda message: None, asked)
         self.assertEqual(list(retrieval["points"]), ["12", "16", "32"])
         self.assertEqual(engine.calls[2:], [8])
         self.assertTrue(retrieval["passed"])
-        missing = runner.run_context(self.Engine([2, 1]), {"max_context": 64}, self.prepared, self.settings, 32,
+        missing = long_context.run_context(self.Engine([2, 1]), {"max_context": 64}, self.prepared, self.settings, 32,
                                      lambda message: None)[2]
         self.assertFalse(missing[32]["passed"])
 
@@ -2174,21 +2213,21 @@ class QualityTests(unittest.TestCase):
             def score(self, prompt, continuation, top_k, prompt_rows=True):
                 scored.append((list(prompt), list(continuation), prompt_rows))
                 return {"continuation": [{"logprob": -0.5, "top": [[5, -0.5]]}] * len(continuation)}
-        found = runner.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {})
+        found = quality_checks.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {})
         # The conversations only: a long text's reply would prefill its prompt twice more for the same path.
         self.assertEqual([r["id"] for r in found["replies"]], ["tides", "letter"])
         self.assertEqual(len(replied), 2)
         # The long-context curve's reply, served with its log-probabilities already, is scored once and judged alike.
         curve = {"tokens": [5, 5], "logprobs": [-0.5, -0.5], "top": [[[5, -0.5]], [[5, -0.5]]]}
-        more = runner.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {}, texts=False,
+        more = quality_checks.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {}, texts=False,
                                   extra=[("curve@32768", [9] * 40, curve)])
         self.assertEqual(([r["id"] for r in more["replies"]], len(replied), scored[-1]),
                          (["curve@32768"], 2, ([9] * 40, [5, 5], False)))
-        merged = runner.merge_honesty({"honesty": found, "sets": {}, "timing": {}}, more)
+        merged = quality_checks.merge_honesty({"honesty": found, "sets": {}, "timing": {}}, more)
         self.assertEqual(([r["id"] for r in merged["honesty"]["replies"]], merged["honesty"]["passed"], merged["passed"]),
                          (["tides", "letter", "curve@32768"], True, True))
         more["failures"], more["passed"] = ["curve@32768: differs"], False
-        self.assertFalse(runner.merge_honesty({"honesty": found, "sets": {}}, more)["passed"])
+        self.assertFalse(quality_checks.merge_honesty({"honesty": found, "sets": {}}, more)["passed"])
 
     def lp(self, token):
         return self.LP[self.TOP.index(token)] if token in self.TOP else self.LP[3]
@@ -2237,7 +2276,7 @@ class QualityTests(unittest.TestCase):
         protocol["quality"]["honesty"] = dict(protocol["quality"]["honesty"], sets=list(honesty_sets))
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
-        quality = runner.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
+        quality = quality_checks.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
                                      lambda message: None, self.reference(texts), thresholds, spread)
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
                   "protocol": protocol["protocol"], "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
@@ -2327,12 +2366,13 @@ class QualityTests(unittest.TestCase):
                       "exact_variants": {"all exact": {"score_drift": 0.0},
                                          "half": {"config": {"score_drift": 0.1}, "description": "one group exact"}}}
             opened = []
-            original = runner.open_engine
+            original = adapters.open_engine
 
             def counting(module, model, config, *args, **kwargs):
                 opened.append(config.get("score_drift"))
                 return original(module, model, config, *args, **kwargs)
-            with patch.object(runner.fixed, "load", return_value=reference), patch.object(runner, "open_engine", counting):
+            with patch.object(runner.fixed, "load", return_value=reference), patch.object(runner, "open_engine", counting), \
+                    patch.object(quality_checks, "open_engine", counting):
                 result = runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=("quality",),
                                     log=lambda message: None, quality_budget={"ppl_ratio_max": 2.0, "kld_mean_max": 1.0,
                                                                               "kld_p99_max": 1.0},
@@ -2353,7 +2393,7 @@ class QualityTests(unittest.TestCase):
         self.assertIn("drift attribution (share of the budget each exact variant takes away", text)
         self.assertIn(f"all exact conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact), "
                       f"conversations/served {base:+.0%} (0% with it exact); half", text)
-        missing = runner.run_attribution(None, None, {}, {}, runner.load_json(runner.EVAL_DIR / "protocol.json"),
+        missing = quality_checks.run_attribution(None, None, {}, {}, runner.load_json(runner.EVAL_DIR / "protocol.json"),
                                          lambda m: None, None, {}, None, result["quality"], None)
         self.assertEqual(missing["status"], "unmeasured")
 
@@ -2390,12 +2430,12 @@ class QualityTests(unittest.TestCase):
         # protocol quality.spread: where the reference disagrees with itself by more than the budget (a model that
         # amplifies rounding), the set's limits become twice that spread, and the result and status say so.
         budget = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
-        limits, raised = runner.set_limits(budget, {"kld_mean": 0.2, "kld_p99": 0.1, "ppl_ratio": 0.8}, 2.0)
+        limits, raised = quality_checks.set_limits(budget, {"kld_mean": 0.2, "kld_p99": 0.1, "ppl_ratio": 0.8}, 2.0)
         self.assertEqual((limits, raised), ({"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 0.5},
                                             ["kld_mean_max", "ppl_ratio_max"]))
-        self.assertEqual(runner.set_limits(budget, {"kld_mean": 1e-7, "kld_p99": 1e-6, "ppl_ratio": 1.0}, 2.0),
+        self.assertEqual(quality_checks.set_limits(budget, {"kld_mean": 1e-7, "kld_p99": 1e-6, "ppl_ratio": 1.0}, 2.0),
                          (budget, []))
-        self.assertEqual(runner.set_limits(budget, None, 2.0), (budget, []))
+        self.assertEqual(quality_checks.set_limits(budget, None, 2.0), (budget, []))
         failing = self.measure(self.Engine(self, drift_from=520, shift=2.0))[0]["quality"]
         self.assertFalse(failing["sets"]["long-600/served"]["passed"])
         spread = {"long-600/served": {"kld_mean": 5.0, "kld_p99": 20.0, "ppl_ratio": 4.0},
@@ -2457,10 +2497,10 @@ class QualityTests(unittest.TestCase):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         texts = self.texts()
         quiet = lambda message: None  # noqa: E731
-        missing = runner.run_quality(self.Engine(self), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
+        missing = quality_checks.run_quality(self.Engine(self), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
                                      None, {})
         self.assertIn("crit eval reference --model --data", missing["reason"])
-        adapter = runner.run_quality(object(), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
+        adapter = quality_checks.run_quality(object(), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
                                      self.reference(texts), {})
         self.assertEqual(adapter["status"], "unsupported")
         base = {**MEASURED, "engine": {"speculative": False}}
@@ -2711,7 +2751,7 @@ class ReferenceTests(unittest.TestCase):
     def test_long_prompts_score_like_eager_attention_without_its_mask(self):
         import torch
         from transformers import Qwen3Config, Qwen3ForCausalLM
-        from crit_eval import reference
+        from crit_eval.quality import attention, reference
         torch.manual_seed(0)
         config = Qwen3Config(vocab_size=128, hidden_size=64, intermediate_size=128, num_hidden_layers=2,
                              num_attention_heads=4, num_key_value_heads=2, head_dim=16, max_position_embeddings=4096,
@@ -2719,7 +2759,7 @@ class ReferenceTests(unittest.TestCase):
         device = "cuda" if torch.cuda.is_available() else "cpu"
         with tempfile.TemporaryDirectory() as folder:
             Qwen3ForCausalLM(config).save_pretrained(folder)
-            ids = torch.randint(0, 128, (2 * reference.QUERY_BLOCK + 100,)).tolist()
+            ids = torch.randint(0, 128, (2 * attention.QUERY_BLOCK + 100,)).tolist()
             eager = scored_text(reference.StreamingReference(folder, device), ids, 4, 128)
             chunked = scored_text(reference.StreamingReference(folder, device), ids, 4, 128, long=True)
         self.assertTrue(torch.equal(eager[1], chunked[1]))
@@ -2779,7 +2819,7 @@ class ReferenceTests(unittest.TestCase):
     def score_texts(self, folder, texts, **patches):
         """(rows, log lines, layer loads) of StreamingReference.score_texts on the saved model, with `patches`
         ({attribute: replacement}) set on the reference first."""
-        from crit_eval import reference
+        from crit_eval.quality import reference
         ref = reference.StreamingReference(folder, "cpu")
         for name, value in patches.items():
             setattr(ref, name, value)
@@ -2797,7 +2837,7 @@ class ReferenceTests(unittest.TestCase):
         # All chunks of every text run on a layer while it is loaded, but for the layers up to the one whose cache
         # state the forward reads between chunks; the rows equal the chunk-major order's exactly.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import prompt_state, reference
         torch.manual_seed(2)
         texts = [torch.randint(2, 128, (n,)).tolist() for n in (150, 37, 260)]
         for name, model in self.layer_major_models():
@@ -2806,7 +2846,7 @@ class ReferenceTests(unittest.TestCase):
                 count = reference.StreamingReference(folder, "cpu")._layer_count()
                 rows, _, loads = self.score_texts(folder, texts)
                 chunked, _, rounds = self.score_texts(
-                    folder, texts, _layer_major=unittest.mock.Mock(side_effect=reference._OrderUnsafe("forced")))
+                    folder, texts, _layer_major=unittest.mock.Mock(side_effect=prompt_state._OrderUnsafe("forced")))
                 for a, b in zip(rows, chunked):
                     self.assertTrue(all(torch.equal(x, y) for x, y in zip(a, b)), name)
                 self.assertEqual(len(rounds), 5 * count, name)   # five chunks of the longest text, each a round
@@ -2820,7 +2860,7 @@ class ReferenceTests(unittest.TestCase):
         # Two texts with the same first two chunks (the long quality texts' shared document) run those chunks once:
         # the follower's cache is the leader's after them, its rows the same bytes as scoring it on its own.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import prompt_state, reference
         torch.manual_seed(5)
         prefix = torch.randint(2, 128, (150,)).tolist()
         texts = [prefix + torch.randint(2, 128, (30,)).tolist(), torch.randint(2, 128, (37,)).tolist(),
@@ -2839,15 +2879,15 @@ class ReferenceTests(unittest.TestCase):
                     self.assertTrue(all(torch.equal(x, y) for x, y in zip(a, b)), name)
                 self.assertTrue(any("text 3 shares its first 128 tokens with text 1" in line for line in logged),
                                 (name, logged))
-        self.assertEqual(reference._shared_chunks([[[1], [2], [3]], [[1], [2], [4]], [[1], [2]], [[1]]], set()),
+        self.assertEqual(prompt_state._shared_chunks([[[1], [2], [3]], [[1], [2], [4]], [[1], [2]], [[1]]], set()),
                          [(None, 0), (0, 2), (0, 1), (None, 0)])
-        self.assertEqual(reference._shared_chunks([[[1], [2]], [[1], [2]]], {1}), [(None, 0), (None, 0)])
+        self.assertEqual(prompt_state._shared_chunks([[[1], [2]], [[1], [2]]], {1}), [(None, 0), (None, 0)])
 
     def test_the_reference_stores_its_own_spread_on_the_long_texts(self):
         # protocol quality.spread: texts of at least from_tokens tokens are scored again under TF32 matmuls, and how
         # far that run lands from the stored scores is stored per set and path; on the CPU (no TF32) the runs agree.
         import torch
-        from crit_eval import fixed, reference
+        from crit_eval.quality import fixed, reference
         torch.manual_seed(7)
         texts = {"a@150": (torch.randint(2, 128, (150,)).tolist(), False), "b": (torch.randint(2, 128, (37,)).tolist(), False)}
         layout = {"a@150": ("long-150", 100), "b": ("conversations", 20)}
@@ -2878,7 +2918,7 @@ class ReferenceTests(unittest.TestCase):
         # A fused experts parameter too large for the device is decoded expert by expert as the eager loop reads
         # it: the same FP32 values, so the same rows as the whole parameter on the device.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import reference
         torch.manual_seed(6)
         texts = [torch.randint(2, 128, (n,)).tolist() for n in (90, 37)]
         reads = []
@@ -2908,7 +2948,7 @@ class ReferenceTests(unittest.TestCase):
         # reference notices the read and runs the texts chunk by chunk, with the same rows.
         import torch
         from transformers.models.qwen3 import modeling_qwen3
-        from crit_eval import reference
+        from crit_eval.quality import reference
         torch.manual_seed(3)
         texts = [torch.randint(2, 128, (n,)).tolist() for n in (150, 40)]
         name, model = next(self.tiny_models())
@@ -2930,7 +2970,7 @@ class ReferenceTests(unittest.TestCase):
         # Every position of each text, run in chunks layer-major (or chunk-major, or whole when the cache cannot
         # be resumed), scores as the model's own FP32 forward over the whole text; the scratch states are removed.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import prompt_state, reference
         torch.manual_seed(4)
         texts = [torch.randint(2, 128, (n,)).tolist() for n in (150, 37, 200)]
         for name, model in self.layer_major_models():
@@ -2944,9 +2984,9 @@ class ReferenceTests(unittest.TestCase):
                 for order in ("layer-major", "chunk-major", "whole"):
                     ref = reference.StreamingReference(folder, "cpu")
                     if order == "chunk-major":
-                        ref._layer_major = unittest.mock.Mock(side_effect=reference._OrderUnsafe("forced"))
+                        ref._layer_major = unittest.mock.Mock(side_effect=prompt_state._OrderUnsafe("forced"))
                     if order == "whole":
-                        ref._layer_major = unittest.mock.Mock(side_effect=reference.CacheUnsupported("forced"))
+                        ref._layer_major = unittest.mock.Mock(side_effect=prompt_state.CacheUnsupported("forced"))
                     runs[order] = ref.score_texts(texts, 4, None, Path(scratch) / "states", log=lambda m: None,
                                                   long={2})
                     self.assertFalse((Path(scratch) / "states").exists(), (name, order))
@@ -2963,7 +3003,7 @@ class ReferenceTests(unittest.TestCase):
         # Scored once, stored with each file's sha256 and read in pure Python as scored; read thereafter, another
         # identity scores again, and a file whose bytes changed is refused.
         import torch
-        from crit_eval import fixed, reference
+        from crit_eval.quality import fixed, reference
         torch.manual_seed(5)
         texts = {"a": (torch.randint(2, 128, (90,)).tolist(), False),
                  "b@32768": (torch.randint(2, 128, (40,)).tolist(), True)}
@@ -3003,7 +3043,7 @@ class ReferenceTests(unittest.TestCase):
 
     def test_a_cache_that_cannot_be_stored_runs_each_text_whole(self):
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import prompt_state, reference
         torch.manual_seed(1)
         texts = [torch.randint(2, 128, (n,)).tolist() for n in (90, 40)]
         name, model = next(self.tiny_models())
@@ -3012,8 +3052,8 @@ class ReferenceTests(unittest.TestCase):
             plain, _, _ = self.score_texts(folder, texts)
 
             def unstorable(value, path, tensors):
-                raise reference.CacheUnsupported(f"cache state {path} is a Widget")
-            with patch.object(reference, "_encode", unstorable):
+                raise prompt_state.CacheUnsupported(f"cache state {path} is a Widget")
+            with patch.object(prompt_state, "_encode", unstorable):
                 rows, logged, _ = self.score_texts(folder, texts)
         for a, b in zip(plain, rows):
             self.assertLess(float((a[0] - b[0]).abs().max()), 1e-5)
@@ -3021,7 +3061,7 @@ class ReferenceTests(unittest.TestCase):
         self.assertTrue(any("is a Widget" in line and "each text runs whole" in line for line in logged), logged)
 
     def test_the_store_format_round_trips_in_pure_python(self):
-        from crit_eval import fixed
+        from crit_eval.quality import fixed
         with tempfile.TemporaryDirectory() as data:
             scores = {"a": ([-0.5, -1.25], [[3, 4], [5, 6]], [[-0.5, -2.0], [-1.25, -3.5]]), "b": ([-0.75], [[1, 2]],
                                                                                                     [[-0.75, -4.0]])}
@@ -3041,7 +3081,7 @@ class ReferenceTests(unittest.TestCase):
         # whatever their dtype, file and run of consecutive rows.
         import torch
         from safetensors.torch import save_file
-        from crit_eval import reference
+        from crit_eval.quality import checkpoints
         torch.manual_seed(0)
         tables = {"a.weight": torch.randn(300, 24).to(torch.bfloat16),
                   "b.weight": torch.randn(97, 16).to(torch.float8_e4m3fn),
@@ -3056,13 +3096,13 @@ class ReferenceTests(unittest.TestCase):
                           "d.weight_scale": "model-00002-of-00002.safetensors"}
             (folder / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
             (folder / "config.json").write_text(json.dumps({"model_type": "llama"}))
-            checkpoint = reference.Checkpoint(folder)
+            checkpoint = checkpoints.Checkpoint(folder)
             requests = [(key, torch.cat([torch.randint(0, len(table), (200,)), torch.arange(5, 40),
                                          torch.tensor([len(table) - 1, 0, 0])]))
                         for key, table in tables.items()]
             requests.append(("a.weight", torch.tensor([], dtype=torch.int64)))
             for threads in (1, 3):
-                with patch.object(reference, "GATHER_THREADS", threads):
+                with patch.object(checkpoints, "GATHER_THREADS", threads):
                     found = checkpoint.rows_many(requests)
                 for (key, index), rows in zip(requests, found):
                     expected = tables[key][index]
@@ -3075,7 +3115,7 @@ class ReferenceTests(unittest.TestCase):
         # misaligned ones (after an odd-sized tensor), ones read through a gap, in pieces and over several files.
         import torch
         from safetensors.torch import save_file
-        from crit_eval import reference
+        from crit_eval.quality import checkpoints
         torch.manual_seed(0)
         first = {"l.a": torch.randint(0, 256, (7,), dtype=torch.uint8), "l.b": torch.randn(5, 3),
                  "l.c": torch.randn(4, 6).to(torch.bfloat16), "skip": torch.randn(300), "l.d": torch.tensor(2.5),
@@ -3089,10 +3129,10 @@ class ReferenceTests(unittest.TestCase):
                           **{k: "model-00002-of-00002.safetensors" for k in second}}
             (folder / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
             (folder / "config.json").write_text(json.dumps({"model_type": "llama"}))
-            checkpoint = reference.Checkpoint(folder)
+            checkpoint = checkpoints.Checkpoint(folder)
             keys = [k for k in {**first, **second} if k.startswith("l.")]
             for gap, piece in ((0, 64 << 20), (1 << 20, 16)):
-                with patch.object(reference, "STAGE_GAP", gap), patch.object(reference, "STAGE_READ", piece):
+                with patch.object(checkpoints, "STAGE_GAP", gap), patch.object(checkpoints, "STAGE_READ", piece):
                     buffer, layout = checkpoint.stage(keys, torch.zeros(3, dtype=torch.uint8))
                     checkpoint.place(buffer, layout, "cpu")
                 staged = dict(checkpoint.placed)
@@ -3110,7 +3150,7 @@ class ReferenceTests(unittest.TestCase):
         # Every decoder layer's parameters and buffers are bit-identical whether its stored tensors were read ahead
         # into one buffer or read one by one, and no parameter keeps the staged copy alive.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import reference
         for name, model in self.tiny_models():
             with tempfile.TemporaryDirectory() as folder:
                 model.float().eval().save_pretrained(folder)
@@ -3131,9 +3171,9 @@ class ReferenceTests(unittest.TestCase):
     def test_chunked_attention_honours_a_supplied_mask(self):
         # A boolean or additive mask further restricts each block of query rows, as eager attention applies it.
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import attention
         torch.manual_seed(0)
-        length, heads, kv_heads, dim = reference.QUERY_BLOCK + 70, 4, 2, 8
+        length, heads, kv_heads, dim = attention.QUERY_BLOCK + 70, 4, 2, 8
         query = torch.randn(1, heads, length, dim)
         key, value = torch.randn(1, kv_heads, length, dim), torch.randn(1, kv_heads, length, dim)
         causal = torch.ones(length, length, dtype=torch.bool).tril()
@@ -3143,14 +3183,15 @@ class ReferenceTests(unittest.TestCase):
         expected = expected.transpose(1, 2)
         additive = torch.zeros(mask.shape).masked_fill(~mask, torch.finfo(torch.float32).min)
         for supplied in (mask, additive):
-            got, _ = reference.chunked_attention(None, query, key, value, supplied)
+            got, _ = attention.chunked_attention(None, query, key, value, supplied)
             self.assertLess(float((got - expected).abs().max()), 1e-5)
 
     def test_a_mixed_precision_checkpoint_decodes_each_matrix_with_its_own_config_group(self):
         # compressed-tensors' groups by targets (DeepSeek V4 W4A16-FP8): FP8 blocks for attention, listed first, and
         # packed int4 for the experts; an expert decodes with 4 bits as if its group were the only one.
         import torch
-        from crit_eval import reference, schemes
+        from crit_eval.quality import checkpoints
+        from crit_eval.limits import schemes
         torch.manual_seed(0)
         fp8 = {"format": "float-quantized", "targets": [r"re:.*attn\.(wq_a|wkv)$"],
                "weights": {"num_bits": 8, "type": "float", "strategy": "block", "block_structure": [128, 128]}}
@@ -3162,7 +3203,7 @@ class ReferenceTests(unittest.TestCase):
                    base + ".weight_shape": torch.tensor([4, 256])}
 
         def decoded(*groups):
-            ckpt = object.__new__(reference.StateDictCheckpoint)
+            ckpt = object.__new__(checkpoints.StateDictCheckpoint)
             ckpt.where = tensors
             ckpt.quantization = {"quant_method": "compressed-tensors", "format": "mixed-precision",
                                  "config_groups": {f"group_{i}": g for i, g in enumerate(groups)}}
@@ -3180,13 +3221,14 @@ class ReferenceTests(unittest.TestCase):
     def test_nvfp4_layouts_dequantize_alike(self):
         # compressed-tensors divides the group scales by weight_global_scale; ModelOpt multiplies by weight_scale_2.
         import torch
-        from crit_eval import reference, schemes
+        from crit_eval.limits import schemes
+        from crit_eval.quality import checkpoints
         torch.manual_seed(0)
         packed = torch.randint(0, 256, (4, 16), dtype=torch.uint8)
         scale = (torch.rand(4, 2) * 4 + .5).to(torch.float8_e4m3fn)
 
         def checkpoint(tensors):
-            ckpt = object.__new__(reference.StateDictCheckpoint)
+            ckpt = object.__new__(checkpoints.StateDictCheckpoint)
             ckpt.where, ckpt.quantization = tensors, {}
             return ckpt
         ct = checkpoint({"w.weight_packed": packed, "w.weight_scale": scale, "w.weight_global_scale": torch.tensor(4.0)})
@@ -3201,7 +3243,7 @@ class ReferenceTests(unittest.TestCase):
         """The layer-streamed reference, eager and chunked, scores like the model's own FP32 forward. save(folder)
         writes the checkpoint (default: save_pretrained)."""
         import torch
-        from crit_eval import reference
+        from crit_eval.quality import reference
         (save or model.save_pretrained)(folder)
         with torch.no_grad():
             expected = torch.log_softmax(model.float()(torch.tensor([ids]), use_cache=False).logits[0].double(),
@@ -3230,10 +3272,10 @@ class ReferenceTests(unittest.TestCase):
         with torch.no_grad():
             for i, layer in enumerate(model.model.layers):
                 layer.layer_scalar.fill_(0.5 + 0.25 * i)
-        from crit_eval import reference
-        ids = torch.randint(0, 128, (2 * reference.QUERY_BLOCK + 40,)).tolist()   # chunked blocks past the window
+        from crit_eval.quality import attention
+        ids = torch.randint(0, 128, (2 * attention.QUERY_BLOCK + 40,)).tolist()   # chunked blocks past the window
         with tempfile.TemporaryDirectory() as folder:
-            self.assert_scores_like_the_model(model, folder, ids, reference.QUERY_BLOCK - 20)
+            self.assert_scores_like_the_model(model, folder, ids, attention.QUERY_BLOCK - 20)
 
     @unittest.skipUnless(HAS_REFERENCE and importlib.util.find_spec("transformers.models.qwen4_exp"),
                          "needs transformers with qwen4_exp")
@@ -3246,7 +3288,8 @@ class ReferenceTests(unittest.TestCase):
         import torch
         from safetensors.torch import save_file
         from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
-        from crit_eval import reference, schemes
+        from crit_eval.quality import attention, checkpoints, reference
+        from crit_eval.limits import schemes
         torch.manual_seed(0)
         config = Qwen4ExpTextConfig(
             vocab_size=128, hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
@@ -3275,7 +3318,7 @@ class ReferenceTests(unittest.TestCase):
                     stored = {base + ".weight": torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8),
                               base + ".weight_scale": (torch.rand(rows, cols // 16) + .5).to(torch.float8_e4m3fn),
                               base + ".weight_scale_2": torch.tensor(0.01), base + ".input_scale": torch.tensor(1.0)}
-                    view = object.__new__(reference.StateDictCheckpoint)
+                    view = object.__new__(checkpoints.StateDictCheckpoint)
                     view.where, view.quantization = stored, {}
                     decoded[proj] = schemes.dense(view, base, "cpu")
                     tensors.update(stored)
@@ -3314,10 +3357,10 @@ class ReferenceTests(unittest.TestCase):
             weight_map = {**{k: "model-00001-of-00002.safetensors" for k in tensors},
                           **{k: "model-00002-of-00002.safetensors" for k in shards}}
             (folder / "model.safetensors.index.json").write_text(json.dumps({"metadata": {}, "weight_map": weight_map}))
-        ids = torch.randint(0, 128, (2 * reference.QUERY_BLOCK + 40,)).tolist()
+        ids = torch.randint(0, 128, (2 * attention.QUERY_BLOCK + 40,)).tolist()
         ids[100] = ids[300] = config.eos_token_id   # n-gram segments restart after an end of sequence
         with tempfile.TemporaryDirectory() as folder:
-            self.assert_scores_like_the_model(model, folder, ids, reference.QUERY_BLOCK - 20, save=save)
+            self.assert_scores_like_the_model(model, folder, ids, attention.QUERY_BLOCK - 20, save=save)
             # Only the n-gram rows a pass looks up are read (the table is never built), and nothing outside the
             # text model is.
             ref = reference.StreamingReference(folder, "cpu")
@@ -3343,7 +3386,7 @@ class ReferenceDtLimitTest(unittest.TestCase):
 
     def test_config_limit_replaces_the_mixer_clamp(self):
         from types import SimpleNamespace
-        from crit_eval.reference import StreamingReference
+        from crit_eval.quality.reference import StreamingReference
         mixer = SimpleNamespace(time_step_limit=(0.001, float("inf")))
         attention = SimpleNamespace()
         layer = SimpleNamespace(modules=lambda: [layer, mixer, attention])

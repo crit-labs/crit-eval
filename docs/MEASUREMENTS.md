@@ -142,7 +142,7 @@ crit-eval score reads these yet; a result carries them in `device`. Pass it with
 `--bandwidth GBS` overrides the bandwidth.
 
 **Prefill ceiling.** `prepare` counts arithmetic per token from safetensors or GGUF headers and config
-([crit_eval/ceiling.py](../crit_eval/ceiling.py)): 2 × rows × columns for every
+([crit_eval/limits/ceiling.py](../crit_eval/limits/ceiling.py)): 2 × rows × columns for every
 projection in its stored format (BF16, FP8 or NVFP4; a GGUF's block types at the FP8 rate, the
 rate int8 tensor cores share, and its MXFP4/NVFP4 at the NVFP4 rate), excluding gathered embeddings, the vision
 tower, draft layers and the output head; 4 × heads × head dim per query-key pair in each
@@ -265,11 +265,15 @@ and stores each position's log-probability and the reference's top 16 under the 
 what the engine loses on top of the weights the user chose. `as_quantized` judges against the
 checkpoint run as quantized: the same reference with the activations of every matrix and output head
 whose stored scheme declares input activations quantized as declared (NVFP4 in groups of 16 with the
-stored global scale, FP8 per token or per tensor; `crit_eval.schemes.activations`), the arithmetic
+stored global scale, FP8 per token or per tensor; `crit_eval.limits.schemes.activations`), the arithmetic
 serving stacks run such a checkpoint with (W4A4, W8A8). Its scores are a store of their own
 (`reference-as-quantized/`, `crit eval reference --quality-mode as_quantized`, and reference packages
-carry them), and `crit eval run --quality-mode as_quantized` judges against them with the same drift
-budget and rules. The KV cache stays exact in both, so an engine's KV quantization is drift in either
+carry them), and `crit eval run --quality-mode as_quantized` judges against them with the same rules
+and a drift budget twice preserve's (protocol `quality.mode_thresholds`: PPL ratio ≤ 1.10, mean KLD ≤ 0.10,
+p99 KLD ≤ 1.0). 4-bit activation math turns rounding-level differences into large KL swings: on
+Qwen3.8-27B NVFP4, prompt rows move by a mean KLD of 0.045-0.08 (p99 0.5-1.4) under rounding alone, and two
+valid as-quantized references differ by about as much, which would leave an engine none of the preserve
+budget to spend. The KV cache stays exact in both, so an engine's KV quantization is drift in either
 mode. On Qwen3.8-27B NVFP4, 4-bit prompt activations on the MLP matrices use 244% of the preserve
 budget, and on both matrix groups 396%: an engine that runs the checkpoint as stored fails `preserve`
 and is judged on equal terms in `as_quantized`. A model whose declared matrices the modeling code
@@ -347,12 +351,16 @@ near-ties, or a hard top-k selection, flips a discrete choice under a 1e-6 diffe
 state or attention carries the change through the rest of the text. Two equally valid FP32 reference
 runs of Qwen3.8-Flash-Next's 32K text differ by a mean of 0.06 nats per position at 8K to 16K and
 0.29 at 24K to 32K, so no engine can match such a reference within the budget: it cannot match itself.
-`crit eval reference` therefore scores every text of at least 8,192 tokens once more with its FP32
+`crit eval reference` therefore scores every quality text, of every length, once more with its FP32
 matmuls taking TF32 inputs (10-bit mantissas, about 1e-3 relative: the size of perturbation a BF16 or FP8
 engine's arithmetic introduces; FP32 rounding alone, another chunking at 1e-6, measured a spread a
 hundred times smaller on Flash-Next and so would have under-estimated what any engine faces) and stores
 how far that run lands from the stored scores, per set and path, by the same metrics
-(`reference/spread.json`, protocol `quality.spread`). A run judges such a set against the larger of
+(`spread.json` in each mode's store, protocol `quality.spread`; reference packages carry it). Quantized
+activations amplify it too: a TF32 difference that moves a value across an NVFP4 rounding boundary changes
+its 4-bit code even in a short text, so the spread is measured on every text, in both modes
+(until crit-eval-v0.2.0 only texts of at least 8,192 tokens had one; a spread stored under that rule is
+not used until `crit eval reference` scores it again). A run judges such a set against the larger of
 the budget and twice the reference's own spread (mean and p99 KLD; the PPL ratio's distance from 1), and
 the result records the spread and the limits it raised (`reference_spread`, `limits`, `raised`);
 `status` names the sets so judged. A dense model's two runs stay far inside the budget, so nothing
@@ -374,7 +382,8 @@ consecutive positions drawn with replacement from a seeded generator, as the 5th
 percentiles, and the KLD p99's 5th and 95th. `status` prints the worst set's 5th to 95th percentile
 beside its share. It is reported, not judged: the gate judges the measured set.
 
-The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
+The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5 (`preserve`; twice
+that in `as_quantized`).
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
 `{"ppl_ratio_max": 1.0, "kld_mean_max": 0, "kld_p99_max": 0}` asks for no drift. Each set
 reports `budget_used`, its largest share of any limit. The budget is there to be spent on speed:
@@ -406,8 +415,10 @@ and scores (about 14 MB) are shared: `crit eval pack` adds a scored data folder 
 file. The checkpoint is found by the identity `prepare` records (config, tokenizer, template, weight
 file names and sizes), without hashing its weights. The package source is `eval_packages` in
 `settings.toml` (a folder or an https base URL, such as a Hugging Face dataset's `resolve/main`),
-else the checkout's own `reference-packages/` folder, kept out of git; `crit eval run` and
-`crit run eval` fetch a missing reference from it before they would score one. A package is per file: two
+else the checkout's own `reference-packages/` folder, kept out of git, else the published packages,
+the Hugging Face dataset [crit-labs/crit-eval-references](https://huggingface.co/datasets/crit-labs/crit-eval-references);
+`crit eval run` and `crit run eval` fetch a missing reference from it before they would score one, and score it
+on the machine when the source has none for the checkpoint or cannot be reached. A package is per file: two
 quantizations of a model, or the same format from two publishers, are different checkpoints.
 
 ## Exactness
@@ -483,7 +494,7 @@ run.
 its start to the result; the log's last lines print both. A part that did not run has no entry.
 
 After the first measured speed case the log prints an **estimate** of every part and the total
-(`estimate`, [crit_eval/estimate.py](../crit_eval/estimate.py)): every request's prompt and
+(`estimate`, [crit_eval/run/estimate.py](../crit_eval/run/estimate.py)): every request's prompt and
 output length is fixed by the prepared data and the protocol, so the requests the engine served
 so far fit its prefill (t0 + a·n + c·n²) and decode (p + q·context per token) costs, and the plan
 is priced with them. It leaves out third repetitions, prompt caches and replies that stop early;
@@ -509,7 +520,7 @@ data prepared before the held-out set, the gate is unmeasured.
 When a change trades arithmetic for speed (lower-precision activations, approximate kernels,
 another accumulation order), measure the exact shift on full logit rows over a fixed corpus:
 
-- **Host, FP64** ([metrics.py](../crit_eval/metrics.py)): `log_softmax(logits, valid)`
+- **Host, FP64** ([metrics.py](../crit_eval/reports/metrics.py)): `log_softmax(logits, valid)`
   over the first `valid` outputs, `nll`, `kl_divergence` (KL(reference ‖ candidate) in nats,
   clamped at zero), a streaming `Summary` (perplexity, KL mean, nearest-rank quantiles, maximum)
   and `compare(reference_rows, candidate_rows, targets)`.
@@ -518,7 +529,7 @@ another accumulation order), measure the exact shift on full logit rows over a f
   computes each row's log-softmax over a strided FP32 logits matrix and writes the target NLL,
   stores a reference, or writes the KL from a stored one. Fixed-order reductions make it bitwise
   repeatable; an out-of-range target yields NaN. Compile it beside the forward path or fuse the
-  same arithmetic; [logprob.py](../crit_eval/logprob.py) builds it with nvcc.
+  same arithmetic; [logprob.py](../crit_eval/quality/logprob.py) builds it with nvcc.
 
 Per corpus window, run the reference path once with `store`, then every output-producing path
 with `reference` on the same ids, accumulating on the host. Report the reference perplexity next
@@ -527,7 +538,7 @@ models score assistant-role tokens only.
 
 ## Served benchmark outcomes
 
-[outcomes.py](../crit_eval/outcomes.py) counts only complete, valid responses.
+[outcomes.py](../crit_eval/run/outcomes.py) counts only complete, valid responses.
 `validate_completion` checks an OpenAI-style SSE stream: status, in-band errors, finish policy,
 `[DONE]` framing and reported usage (request `stream_options.include_usage`). `validate_cohort`
 disqualifies an aggregate with a missing, failed or duplicated request or too little

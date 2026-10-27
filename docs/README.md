@@ -49,6 +49,17 @@ Results report facts; crit-eval does not classify or rank. The builder reasons f
   prefill at its stored-format and at its reachable ceiling, TTFT) would give at its floor, with a
   kernel trace (`status --kernels`) each prefill term too, plus missing inputs that hide a limit.
 
+## Package layout
+
+| Folder | What it holds |
+| --- | --- |
+| [crit_eval/](../crit_eval/) | `cli.py` (`crit eval`), the protocol ([protocol.json](../crit_eval/protocol.json)), the suite's texts ([suite/](../crit_eval/suite/)), the CUDA probes ([probe/](../crit_eval/probe/)) and an example adapter ([examples/](../crit_eval/examples/)) |
+| [run/](../crit_eval/run/) | Running an engine through the suite: adapters and servers, request outcomes and deadlines, run estimates, `ab`, `pin`, the measuring host |
+| [quality/](../crit_eval/quality/) | The quality reference: prepared data, reference scores, the fixed texts and reference packages |
+| [limits/](../crit_eval/limits/) | The physical limits: device probe, the model's arithmetic and bytes per token, context, kernel traces, how a checkpoint stores its tensors |
+| [reports/](../crit_eval/reports/) | Metrics, `status` and `compare` |
+| [architectures/](../crit_eval/architectures/) | The only architecture-specific code: GGUF layouts per architecture and faster forms of modeling code |
+
 ## Setup
 
 Install crit-eval as its [README](../README.md#quick-start) says, or run `python -B -m crit_eval ...`
@@ -132,16 +143,16 @@ The context, the ceiling and the model identity count the GGUF's stored bytes pe
 (the identity also hashes the derived files). `reference` decodes every block type gguf-py
 decodes (bit for bit as ggml's own dequantization) and undoes the converter's layout per
 architecture before the official modeling code runs
-([gguf_layout.py](../crit_eval/gguf_layout.py)), for the same architectures; others
+([gguf_layout.py](../crit_eval/architectures/gguf_layout.py)), for the same architectures; others
 are refused by name. DeepSeek V4's converter starts from DeepSeek's own checkpoint and stores its
 FP8 matrices as Q8_0 and its FP4 experts as MXFP4 (bit for bit); the reference reads them as stored,
 renames every tensor to transformers' DeepseekV4 names and returns the hash-routing tables
-([gguf_deepseek4.py](../crit_eval/gguf_deepseek4.py)). Qwen3.8-Flash-Next's converter
+([gguf_deepseek4.py](../crit_eval/architectures/gguf_deepseek4.py)). Qwen3.8-Flash-Next's converter
 writes matrices that read the same input as one (hyper-connection down and inject, the delta net's
 QKV and gate, beta and alpha), splits the indexer's query/key projection, stores its zero-centred
 norms as 1 + w and moves the n-gram hash constants to metadata; the reference takes each half back,
 joins the projection, subtracts the 1 (one rounding) and reads the constants exactly, from GGUFs
-written with or without the merges ([gguf_qwen4exp.py](../crit_eval/gguf_qwen4exp.py)). A GGUF
+written with or without the merges ([gguf_qwen4exp.py](../crit_eval/architectures/gguf_qwen4exp.py)). A GGUF
 whose attention layers have no compress ratio (the converter writes that when transformers renamed
 the layer types it read) runs plain attention in GGUF's runtime and is refused. Embedding tables are
 read by rows: a row of a GGUF tensor is whole blocks of its format, so a lookup reads and decodes only
@@ -164,7 +175,7 @@ ONNX graph's weights as the checkpoint it came from
 beside either, the safetensors are the weights.
 
 Quantized checkpoints are read as stored, whatever writes them
-([schemes.py](../crit_eval/schemes.py)): FP8 (per tensor, per row or per block, compressed-
+([schemes.py](../crit_eval/limits/schemes.py)): FP8 (per tensor, per row or per block, compressed-
 tensors or DeepSeek/Qwen `weight_scale_inv`), NVFP4 (compressed-tensors, ModelOpt), compressed-tensors
 int (pack-quantized W4A16/W8A16, symmetric or with zero points, and int-quantized W8A8), AWQ GEMM,
 GPTQ (2, 3, 4 and 8 bits, `gptq` and `gptq_v2`), MLX (affine of any width, mixed per-module widths,
@@ -180,7 +191,7 @@ onnxruntime-genai's builder, ONNX quantized ops other than MatMulNBits, and EXL2
 which exllama decodes only in CUDA kernels, so there is no CPU dequantization to check against.
 
 `reference` runs the text model's own transformers forward in FP32 and streams its decoder
-layers onto the GPU one at a time ([reference.py](../crit_eval/reference.py)). One pass
+layers onto the GPU one at a time ([reference.py](../crit_eval/quality/reference.py)). One pass
 per prompt records what the forward hands each layer, without running it; each layer is then
 loaded once and run for every prompt, and the forward runs again on the last layer's output so
 its own tail (final norm or mixer) gives the head its input. Whatever a model does around its
@@ -198,7 +209,7 @@ host memory is never built. Experts
 run transformers' eager per-expert loop. The long prompts use chunked attention with boolean
 masks only where the modeling code needs one (for example a sparse-attention indexer). Where
 modeling code loops in Python over every token, the reference binds a form that computes the same
-at once, only to the code it was checked against ([indexers.py](../crit_eval/indexers.py):
+at once, only to the code it was checked against ([indexers.py](../crit_eval/architectures/indexers.py):
 qwen4_exp's sparse-attention indexer, which pools every complete key block once instead of once per
 query; floating-point ties at its top-k edge are left to the device, as in the loop).
 

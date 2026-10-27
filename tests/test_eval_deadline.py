@@ -1,4 +1,4 @@
-"""Eval's request bound (crit_eval.deadline): no fixed time budget, each request bounded by what the engine served."""
+"""Eval's request bound (crit_eval.run.deadline): no fixed time budget, each request bounded by what the engine served."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 import sys
@@ -8,8 +8,9 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import chat, runner  # noqa: E402
-from crit_eval.deadline import Hung, RequestDeadline  # noqa: E402
+from crit_eval.run import chat
+from crit_eval.run import long_context  # noqa: E402
+from crit_eval.run.deadline import Hung, RequestDeadline  # noqa: E402
 
 RULE = {"floor_seconds": 2.0, "slack": 4.0}
 
@@ -107,7 +108,7 @@ class HungServerTests(unittest.TestCase):
                                   "facts": []}}
         settings = {"output_tokens": 4, "curve_from": 64, "repetitions": 1, "retrieval": {"positions": []}}
         with self.assertRaises(Hung):
-            runner.run_context(Engine(), {"max_context": 64}, prepared, settings, 64, lambda m: None)
+            long_context.run_context(Engine(), {"max_context": 64}, prepared, settings, 64, lambda m: None)
 
 
 if __name__ == "__main__":

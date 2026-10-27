@@ -1,4 +1,4 @@
-"""Reference packages (crit_eval.packages): prepared data and reference scores packed once, fetched into a run's data
+"""Reference packages (crit_eval.quality.packages): prepared data and reference scores packed once, fetched into a run's data
 byte for byte, found by the checkpoint's and the suite's identity, and refused when a file differs from its record."""
 from pathlib import Path
 import json
@@ -9,7 +9,8 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval import fixed, packages, prepare  # noqa: E402
+from crit_eval.quality import fixed, packages
+from crit_eval.quality import prepare  # noqa: E402
 
 MODEL, SUITE = "a" * 64, "b" * 64
 REFERENCE = 3
@@ -30,7 +31,7 @@ class PackageTests(unittest.TestCase):
     def identities(self, model=MODEL, suite=SUITE):
         return (patch.object(prepare, "model_identity", lambda path, chat_template=None: {"sha256": model}),
                 patch.object(prepare, "suite_identity", lambda: suite),
-                patch("crit_eval.reference.REFERENCE_VERSION", REFERENCE))
+                patch("crit_eval.quality.reference.REFERENCE_VERSION", REFERENCE))
 
     def test_a_packed_checkpoint_is_fetched_byte_for_byte(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -48,26 +49,26 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual((root / "run" / relative).read_bytes(), (data / relative).read_bytes(), relative)
 
     def test_a_result_names_the_package_its_reference_came_from_until_it_is_scored_again(self):
-        from crit_eval import runner
+        from crit_eval.run import quality_checks
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             first, second, third = self.identities()
             with first, second, third:
                 entry = packages.pack(scored(root / "data"), root / "packages")
                 packages.fetch("checkpoint", root / "run", root / "packages", log=lambda m: None)
-            origin = runner.reference_origin(root / "run")
+            origin = quality_checks.reference_origin(root / "run")
             self.assertEqual(origin["reference"], REFERENCE)
             self.assertEqual(origin["package"]["name"], entry["name"])
-            self.assertIsNone(runner.reference_origin(root / "data")["package"])   # scored here
+            self.assertIsNone(quality_checks.reference_origin(root / "data")["package"])   # scored here
             index = root / "run" / "reference" / "index.json"
             index.write_bytes(index.read_bytes() + b" ")
-            self.assertIsNone(runner.reference_origin(root / "run")["package"])
-            self.assertIsNone(runner.reference_origin(root / "nowhere"))
+            self.assertIsNone(quality_checks.reference_origin(root / "run")["package"])
+            self.assertIsNone(quality_checks.reference_origin(root / "nowhere"))
 
     def test_another_checkpoint_or_suite_has_no_package(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("crit_eval.reference.REFERENCE_VERSION", REFERENCE):
+            with patch("crit_eval.quality.reference.REFERENCE_VERSION", REFERENCE):
                 packages.pack(scored(root / "data"), root / "packages")
             for model, suite in (("c" * 64, SUITE), (MODEL, "d" * 64)):
                 first, second, third = self.identities(model, suite)
@@ -99,10 +100,39 @@ class PackageTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "another model or suite"):
                     packages.fetch("checkpoint", root / "run", root / "packages")
 
+    def test_each_quality_modes_scores_carry_their_spread(self):
+        # The reference's own spread travels with the scores it was measured against, in each mode's store; a
+        # spread of other scores (an earlier reference, say) stays behind.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            data = scored(root / "data")
+            quantized = {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2, "quality_mode": "as_quantized"}
+            store = fixed.STORES["as_quantized"]
+            fixed.write(data, quantized, {"text": ([-0.6, -1.4], [[3, 4], [5, 6]], [[-0.1, -0.2], [-0.3, -0.4]])},
+                        store)
+            spread = {"long-1/prompt": {"kld_mean": 0.03, "kld_p99": 0.7, "ppl_ratio": 1.01}}
+            fixed.write_spread(data, {**quantized, "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread,
+                               store)
+            first, second, third = self.identities()
+            with first, second, third:
+                entry = packages.pack(data, root / "packages")
+                self.assertIn(f"{store}/{fixed.SPREAD}", entry["files"])
+                self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])   # none stored for preserve
+                fixed.write_spread(data, {"reference": REFERENCE - 1, "model_sha256": MODEL, "top_k": 2,
+                                          "spread_perturbation": "tf32"}, spread)
+                self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", packages.pack(data, root / "packages")["files"])
+                fixed.write_spread(data, {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2,
+                                          "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread)
+                entry = packages.pack(data, root / "packages")
+                self.assertIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])
+                packages.fetch("checkpoint", root / "run", root / "packages", log=lambda m: None)
+            self.assertEqual(fixed.load_spread(root / "run", quantized, store), spread)
+            self.assertEqual(fixed.load_spread(root / "run", {"reference": REFERENCE}), spread)
+
     def test_scores_of_another_reference_are_not_packed(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with patch("crit_eval.reference.REFERENCE_VERSION", REFERENCE + 1):
+            with patch("crit_eval.quality.reference.REFERENCE_VERSION", REFERENCE + 1):
                 with self.assertRaisesRegex(SystemExit, "not this crit's reference"):
                     packages.pack(scored(root / "data"), root / "packages")
 

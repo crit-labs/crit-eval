@@ -11,8 +11,8 @@ import os
 from pathlib import Path
 import subprocess
 
-from . import EVAL_DIR
-from .probe import host_compiler
+from .. import EVAL_DIR
+from ..limits.probe import host_compiler
 
 SOURCE = EVAL_DIR / "probe" / "logprob_compare.cu"
 HEADER = SOURCE.with_suffix(".h")

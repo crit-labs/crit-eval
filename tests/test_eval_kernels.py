@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from crit_eval import kernels  # noqa: E402
+from crit_eval.limits import kernels  # noqa: E402
 
 
 def write_trace(directory, pid, offset, rows, sms=170):
@@ -93,8 +93,8 @@ class KernelTraceTest(unittest.TestCase):
                 {"speed": [{"id": "c", "prompt_ids": [1, 2, 3, 4, 5], "output_tokens": 3}]}))
             spec = {"data": directory, "adapter": "unused", "model": "m", "config": {}, "cases": [], "dir": directory}
             with patch.dict(kernels.os.environ, {"CUDA_INJECTION64_PATH": "/no/such/library.so"}), \
-                    patch("crit_eval.runner.load_adapter"), \
-                    patch("crit_eval.runner.open_engine", return_value=(Engine(), {"name": "toy"})), \
+                    patch("crit_eval.run.adapters.load_adapter"), \
+                    patch("crit_eval.run.adapters.open_engine", return_value=(Engine(), {"name": "toy"})), \
                     patch.object(kernels.time, "sleep"):
                 kernels._child(spec)
             marks = json.loads((Path(directory) / "marks.json").read_text())

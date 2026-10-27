@@ -1,5 +1,5 @@
 """Qwen3.8-Flash-Next GGUFs (architecture "qwen4exp"): the config.json their metadata derives
-(crit_core.model.gguf_qwen4exp) and the reference's layout (crit_eval.gguf_qwen4exp), with the n-gram table read by
+(crit_core.model.gguf_qwen4exp) and the reference's layout (crit_eval.architectures.gguf_qwen4exp), with the n-gram table read by
 rows (GgufCheckpoint.row_source).
 
 The conformance test converts a tiny transformers Qwen4Exp with GGUF's reference converter and needs a checkout of it
@@ -260,8 +260,8 @@ class Qwen4ExpConformanceTests(base.GgufConformanceTests):
         from safetensors.torch import load_file
         from transformers import AutoModel, AutoModelForCausalLM
         from crit_core.model import open_model
-        from crit_eval.gguf_layout import GgufCheckpoint
-        from crit_eval.reference import _text_config
+        from crit_eval.architectures.gguf_layout import GgufCheckpoint
+        from crit_eval.quality.checkpoints import _text_config
         from test_eval_formats import scored
         torch.manual_seed(1)
         sequences = [(torch.randint(0, 300, (40,)).tolist(), 5), (torch.randint(0, 300, (23,)).tolist(), 3)]

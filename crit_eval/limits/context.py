@@ -32,7 +32,7 @@ from .ceiling import model_config, weight_files
 from .tensors import tensor_role
 
 GIB = 1 << 30
-DRAFT_HEAD = re.compile(r"(^|\.)head\.weight$")   # a draft layer's own output head (DeepSeek-style shared_head.head)
+DRAFT_HEAD = re.compile(r"(^|\.)head\.weight$")   # a draft layer's own output head (shared_head.head)
 
 
 def weight_split(model, config):
