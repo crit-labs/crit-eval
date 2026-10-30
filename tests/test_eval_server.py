@@ -19,7 +19,7 @@ from crit_eval.run import adapters, chat, runner
 from crit_eval.quality import fixed, prepare, reference
 from crit_eval.limits import headroom
 from crit_eval.reports import status  # noqa: E402
-from test_eval import CharacterText  # noqa: E402
+from test_eval import CharacterText, run_full  # noqa: E402
 
 TOOLS = [{"type": "function", "function": {"name": "read_file", "parameters": {"type": "object"}}}]
 CHAT = [{"role": "user", "content": "Explain tides."}]
@@ -238,7 +238,7 @@ class ChatServerTests(unittest.TestCase):
         self.server.server_close()
 
     def run_eval(self, parts, repetitions=2):
-        return runner.run(None, "unused-model", self.data, self.data / "result.json", parts=parts, warmups=0,
+        return run_full(None, "unused-model", self.data, self.data / "result.json", parts=parts, warmups=0,
                           repetitions=repetitions, log=lambda message: None, context_tokens=4096, url=self.url + "/")
 
     def engine(self, served_model=None, context_tokens=4096):
@@ -274,7 +274,7 @@ class ChatServerTests(unittest.TestCase):
 
     def test_tokens_per_round_come_from_crit_serves_telemetry(self):
         self.server.telemetry = {"tokens_per_round": 3.0}
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed",),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed",),
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
         sample = result["speed"]["cases"]["chat"]["samples"][0]
         self.assertEqual((sample["rounds"], sample["tokens_per_round"]), (4, 3.0))
@@ -282,7 +282,7 @@ class ChatServerTests(unittest.TestCase):
     def test_the_time_to_first_token_splits_into_the_engines_own_and_the_rest(self):
         # crit serve's telemetry names the engine's prefill and its own time to the first token.
         self.server.telemetry = {"tokens_per_round": 3.0, "prefill_ms": 0.5, "ttft_ms": 0.75}
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed",),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed",),
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
         sample = result["speed"]["cases"]["chat"]["samples"][0]
         self.assertEqual((sample["prefill_ms"], sample["first_token_ms"]), (0.5, 0.75))
@@ -340,7 +340,7 @@ class ChatServerTests(unittest.TestCase):
         self.server.card = {"capabilities": ["chat-plain-v1"],
                             "engine_facts": {"speculative": True, "plain": True, "draft_width": 3, "bytes_per_pass": 2e9}}
         self.server.telemetry = {"tokens_per_round": 3.0, "accepted": [2, 2, 2, 2]}
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url,
                             exactness="required", bandwidth_gbs=1000.0)
         self.assertEqual((result["engine"]["speculative"], result["engine"]["draft_width"]), (True, 3))
@@ -367,7 +367,7 @@ class ChatServerTests(unittest.TestCase):
     def test_a_server_that_drafts_without_engine_facts_counts_as_speculative(self):
         self.server.telemetry = {"tokens_per_round": 3.0}   # more than one token per target pass, and no facts
         logged = []
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
                             warmups=0, repetitions=1, log=logged.append, context_tokens=4096, url=self.url,
                             exactness="required")
         self.assertEqual((result["engine"]["speculative"], result["engine"]["speculative_source"]), (True, "telemetry"))
@@ -376,14 +376,14 @@ class ChatServerTests(unittest.TestCase):
         gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
         self.assertEqual(gates["exactness"], "unmeasured")
         self.server.telemetry = {"tokens_per_round": 1.0}   # one token per pass: a plain engine
-        plain = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+        plain = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
                            warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url)
         self.assertFalse(plain["engine"]["speculative"])
         self.assertNotIn("exactness", plain)
         # What crit serve reports for a plain engine: its n output tokens over n - 1 rounds (the first token comes
         # from the prefill), n / (n - 1) tokens per round, above 1 without any draft.
         self.server.telemetry = {"tokens_per_round": 12 / 11}
-        served = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+        served = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url,
                             exactness="required")
         sample = served["speed"]["cases"]["chat"]["samples"][0]
@@ -394,7 +394,7 @@ class ChatServerTests(unittest.TestCase):
 
     def test_a_served_speculative_engine_without_plain_decoding_has_its_exactness_unmeasured(self):
         self.server.card = {"engine_facts": {"speculative": True, "plain": True}}   # the package declares no plain
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "exactness"),
                             warmups=0, repetitions=1, log=lambda line: None, context_tokens=4096, url=self.url,
                             exactness="required")
         self.assertEqual(result["exactness"]["status"], "unmeasured")
@@ -406,7 +406,7 @@ class ChatServerTests(unittest.TestCase):
     def test_a_reply_streamed_in_one_piece_has_no_decode_speed(self):
         self.server.one_piece = True
         logged = []
-        result = runner.run(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "heldout"),
+        result = run_full(None, "unused-model", self.data, self.data / "result.json", parts=("speed", "heldout"),
                             warmups=0, repetitions=2, log=logged.append, context_tokens=4096, url=self.url)
         self.assertIsNone(result["speed"]["cases"]["chat"]["decode_tps"])
         self.assertTrue(any(line.startswith("speed chat: decode unmeasured") for line in logged), logged)

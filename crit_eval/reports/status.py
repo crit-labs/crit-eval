@@ -45,7 +45,9 @@ def _gates(result):
         cases = speed["cases"]
         measured = [cid for cid, c in cases.items() if c["status"] == "measured"]
         skipped = {cid: c.get("reason") for cid, c in cases.items() if c["status"] != "measured"}
-        gates.append({"name": "coverage", "state": "pass" if not skipped else "fail",
+        # A case a staged run's budget left out was not measured; one the engine cannot hold fails.
+        failed = [cid for cid in skipped if not cases[cid].get("over_budget")]
+        gates.append({"name": "coverage", "state": "fail" if failed else "unmeasured" if skipped else "pass",
                       "detail": f"{len(measured)}/{len(cases)} speed cases measured"
                                 + "".join(f"; {cid} skipped: {why}" for cid, why in skipped.items())})
         unrepeatable = [cid for cid in measured if not cases[cid].get("repeatable", True)]
@@ -205,7 +207,17 @@ def _context_gates(result):
         return [{"name": name, "state": "unmeasured", "detail": detail}
                 for name in ("capacity", "retrieval", "lower_context")]
     points, lower = context.get("points"), context.get("lower")
-    if points is None:
+    if context.get("certified") is False and ((points or {}).get(str(required)) or {}).get("status") != "measured":
+        # protocol stages certify: only the candidate that will ship serves the requirement itself.
+        fit = context.get("fit") or {}
+        capacity = {"name": "capacity", "state": "unmeasured",
+                    "detail": f"the required {required:,} tokens are served by the certification only (crit eval run "
+                              "--certify, the candidate that will ship)"
+                              + (f"; {fit['free_after_load_bytes'] / 1e9:.2f} GB free after the load, the KV cache "
+                                 f"at the requirement needs {fit['kv_bytes_at_requirement'] / 1e9:.2f} GB"
+                                 if fit.get("free_after_load_bytes") is not None and fit.get("kv_bytes_at_requirement")
+                                 else "")}
+    elif points is None:
         capacity = {"name": "capacity", "state": "unmeasured", "detail": "context checks not run"}
     else:
         top = points.get(str(required)) or {}

@@ -1,5 +1,5 @@
 {
-  "protocol": "crit-eval-v0.3.0",
+  "protocol": "crit-eval-v0.4.0",
   "requests": {
     "timeout": {
       "rule": "an engine behind a server gets no fixed time budget: each request may take floor_seconds plus slack times its expected time from the requests the engine served in this Eval (a prompt of n tokens at most t * max(1, n/m)^2 for a prompt of m tokens that prefilled in t; an output token at context c at most d * max(1, c/k) for one that decoded in d at context k; the tightest bound counts), floor_seconds alone before any; a request past it stops the Eval as hung",
@@ -204,6 +204,20 @@
     "generality": "against a baseline result that measured the held-out prompts: the held-out decode score may not fall by more than tolerance, and no held-out prompt may decode slower than in the baseline by more than prompt_tolerance; how far the held-out change trails the suite's is reported; without such a baseline the gate is unmeasured and the scores are reported",
     "tolerance": 0.05,
     "prompt_tolerance": 0.1
+  },
+  "stages": {
+    "purpose": "a run without a profile measures in stages, each a prefix of the next, so an engine is measured as far as its own speed allows within budget_seconds: a slow first candidate gets the telemetry that says what to fix next in minutes, a fast one the full telemetry, and only the candidate that will ship pays for its required context",
+    "budget_seconds": 2700,
+    "budget": "wall seconds from the run's start, loads included; after stage 1 the run goes on to the highest stage whose remaining requests, priced at the rates this engine measured (crit_eval.run.estimate), fit what is left; a part that would still pass the budget is skipped and named in stages.skipped. Stage 1 always runs. A certified run has no budget",
+    "1": "every candidate: the engine opened once at the requirement; each speed case once, with no warmup, a case after the first only while its expected time and stage 1's quality still fit the budget (one left out is skipped as over_budget, its coverage unmeasured); quality on every set whose longest text fits short_quality_tokens and still fits the budget, the honesty check included; the request history on the speed case with the shortest prompt; the device memory after the load against the KV cache the requirement needs (context.fit); decode time per output token fitted across the contexts measured and projected to the requirement (context.creep); the time to first token of the shortest prompt (speed.ttft_floor_ms)",
+    "2": "stage 1, then: the speed cases with prompts under long_prompt_tokens repeated (repetitions, no warmup: the engine is warm), longer ones kept at their one request; the follow-up turns once; the quality sets stage 1 left out; the curve's first point (curve_from), whose reply also serves the honesty check's long reply and retrieval there; retrieval at its points below the curve's first",
+    "3": "stage 2, then: the sampled suite at its first sampled_repetitions seeds after a warmup that serves the sampling check, no adaptive repetitions; exactness on exactness_cases speed cases; the held-out prompts when there is a baseline that measured them; the follow-up turns again; and, after the engine closes, the speed cases once on an engine opened at the lower context (the lower-context gate)",
+    "certify": "crit eval run --certify, the candidate that will ship: stage 3 whatever the budget, then one request at the requirement itself (the curve's last point and retrieval on its reply), which the capacity gate needs; without it capacity is unmeasured and the curve stops at its first point",
+    "short_quality_tokens": 2048,
+    "long_prompt_tokens": 8192,
+    "repetitions": 2,
+    "sampled_repetitions": 2,
+    "exactness_cases": 2
   },
   "profiles": {
     "rule": "a profile (crit eval run --profile NAME) fixes what a run measures so results from different machines and engines compare; the result records it as profile, and results of different profiles are not compared",

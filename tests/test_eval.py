@@ -27,6 +27,11 @@ import crit_eval  # noqa: E402
 from crit_eval import protocol_series, protocol_version  # noqa: E402
 
 MOCK = ROOT / "crit_eval/examples/mock_adapter.py"
+def run_full(*args, **options):
+    """crit eval run as before stages (--stage full): these tests measure every part; tests/test_eval_stages.py
+    runs the stages."""
+    return runner.run(*args, **{"stage": "full", **options})
+
 SUITE = prepare.suite_identity()  # prepared data must come from the suite Eval runs
 # What every result holds before its parts run (crit_eval.run.runner): the run's requirements and the required context.
 MEASURED = {"requirements": {"exactness": "reported"}, "context": {"tokens": None, "reason": "not given", "missing": []}}
@@ -43,7 +48,7 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v0.3.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v0.4.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
@@ -197,7 +202,7 @@ class RunnerTests(unittest.TestCase):
             data = Path(directory)
             fixture(data)
             config = {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", config,
+            result = run_full(MOCK, "unused-model", data, data / "result.json", config,
                                 warmups=0, repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
             speed = result["speed"]
             # Every part's wall seconds, in the order the parts ran, and the run's total.
@@ -432,6 +437,7 @@ PROTOCOLS = {
     "crit-eval-v0.2.1": "5ec78e08cafea54a1cf3e73233f8c6be6e5151499cf95e0ba711130f5c984792",  # prompt perplexity reported
     "crit-eval-v0.2.2": "3a637b009a7fc2670db2ce714c2b6c9d0dc9393594260e9c2751e8f02713eb0e",  # spread probe on the short texts
     "crit-eval-v0.3.0": "b6761b006fc61e9a5f9315241bc1fb5437bfb09661665e3628dfb6c63c20dbd7",  # as_quantized by allowance
+    "crit-eval-v0.4.0": "3f6a56953fe781d6f683970ba5c814ef0451246e73259b98e019934a5e5ddc28",  # stages, certification
 }
 
 
@@ -844,7 +850,7 @@ class ActivationCeilingTests(unittest.TestCase):
         scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
         quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
             "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
-        return {"protocol": "crit-eval-v0.3.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
+        return {"protocol": "crit-eval-v0.4.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
                 "engine": {"prompt_activations": declared}, "quality": quality,
                 "headroom": {"gaps": [], "missing": []}}
 
@@ -1112,7 +1118,7 @@ class HeldoutTests(unittest.TestCase):
             prepared["heldout"] = [{"id": "zh", "language": "Chinese", "kind": "prose", "prompt_ids": [7, 8, 9],
                                     "output_tokens": 12}]
             (data / "prepared.json").write_text(json.dumps(prepared))
-            result = runner.run(MOCK, "unused-model", data, data / "result.json",
+            result = run_full(MOCK, "unused-model", data, data / "result.json",
                                 {"max_context": 128},
                                 parts=("speed", "heldout"), warmups=0, repetitions=1, log=lambda message: None)
             held = result["heldout"]
@@ -1193,7 +1199,7 @@ class SampledSpeedTests(unittest.TestCase):
                 value["sampling_check"]["min_tokens"] = min_tokens
             return value
         with patch.object(runner, "load_json", protocol):
-            return runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=warmups,
+            return run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=warmups,
                               repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
 
     def test_the_sampled_warmups_are_the_sampling_checks_replies(self):
@@ -1255,7 +1261,7 @@ class SampledSpeedTests(unittest.TestCase):
             prepared = json.loads((data / "prepared.json").read_text())
             del prepared["sampling"]
             (data / "prepared.json").write_text(json.dumps(prepared))
-            result = runner.run(MOCK, "unused-model", data, data / "result.json",
+            result = run_full(MOCK, "unused-model", data, data / "result.json",
                                 {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}, warmups=0,
                                 repetitions=2, log=lambda message: None, bandwidth_gbs=1.0)
             room, kpis = result["headroom"], result["status"]["kpis"]
@@ -1543,7 +1549,7 @@ class SampledSpeedTests(unittest.TestCase):
                 return {"status": "unsupported", "reason": "fixture"}
             with patch.object(runner, "run_sampled_speed", sampled):
                 for options in ({}, {"adaptive_sampled": False}, {"repetitions": 2}):
-                    runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 128}, parts=("speed",),
+                    run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 128}, parts=("speed",),
                                warmups=0, log=lambda message: None, **options)
         # The default, the opt-out, and a fixed repetition count, which is never extended.
         self.assertEqual(seen["adaptive"], [True, False, False])
@@ -1554,7 +1560,7 @@ class SampledSpeedTests(unittest.TestCase):
             cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--no-adaptive-sampled"])
             self.assertFalse(parsed["adaptive_sampled"])
         # A sampled decode repeated adaptively compares only with one repeated the same way.
-        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.3.0",
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.4.0",
                "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
                                  "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
         before = copy.deepcopy(now)
@@ -1609,7 +1615,7 @@ class SampledSpeedTests(unittest.TestCase):
             prepared.update(sampling={"temperature": 0.6, "top_k": 8}, sampling_source="override")
             (data / "prepared.json").write_text(json.dumps(prepared))
             config = {"max_context": 64, "bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5}
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+            result = run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, bandwidth_gbs=1.0)
             self.assertEqual((result["sampled_speed"]["sampling"], result["sampled_speed"]["sampling_source"]),
                              ({"temperature": 0.6, "top_k": 8}, "override"))
@@ -1630,7 +1636,7 @@ class StatusTests(unittest.TestCase):
         (data / "prepared.json").write_text(json.dumps(prepared))
         config = {"max_context": 128, "bytes_per_pass": 1e6,
                   "draft_bytes_per_step": 1e5, **config}
-        return runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+        return run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                           log=lambda message: None, device=device)
 
     def test_status_reports_gates_kpis_and_missing_inputs_without_a_verdict(self):
@@ -1719,7 +1725,7 @@ class StatusTests(unittest.TestCase):
             fixture(data)
             config = {"max_context": 128}
             budget = {"ppl_ratio_max": 1.5, "kld_mean_max": 1.0, "kld_p99_max": 10.0}
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+            result = run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, quality_budget=budget, exactness="required")
             # crit eval reference judges the quality sets by the run's budget (QualityTests).
             self.assertEqual(result["requirements"], {"quality_budget": budget, "exactness": "required",
@@ -1727,7 +1733,7 @@ class StatusTests(unittest.TestCase):
             gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
             self.assertEqual(gates["exactness"], "pass")
             with self.assertRaises(SystemExit):
-                runner.run(MOCK, "unused-model", data, data / "bad.json", config, warmups=0, repetitions=1,
+                run_full(MOCK, "unused-model", data, data / "bad.json", config, warmups=0, repetitions=1,
                            log=lambda message: None, quality_budget={"kld_max": 1.0})
 
     def test_exactness_runs_on_the_loaded_engine_when_it_decodes_plain_greedy(self):
@@ -1744,7 +1750,7 @@ class StatusTests(unittest.TestCase):
                 fixture(data)
                 for plain, engine, opens in ((True, "shared", [True]), (False, "separate", [True, False])):
                     opened.clear()
-                    result = runner.run(MOCK, "unused-model", data, data / "result.json",
+                    result = run_full(MOCK, "unused-model", data, data / "result.json",
                                         {"max_context": 128, "plain": plain}, parts=("speed", "exactness"),
                                         warmups=0, repetitions=2, log=lambda message: None, exactness="required")
                     self.assertEqual(opened, opens)
@@ -1760,7 +1766,7 @@ class StatusTests(unittest.TestCase):
             data = Path(directory)
             fixture(data)
             config = {"max_context": 128, "disturbed": True}
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+            result = run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None)
             self.assertEqual(result["aborted"]["reason"], "disturbed")
             self.assertIn("speed short: decode varied", result["aborted"]["detail"])
@@ -1770,7 +1776,7 @@ class StatusTests(unittest.TestCase):
             protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
             with self.assertRaises(SystemExit):
                 status.status_of(data / "result.json", protocol)
-            kept = runner.run(MOCK, "unused-model", data, data / "kept.json", config, warmups=0, repetitions=2,
+            kept = run_full(MOCK, "unused-model", data, data / "kept.json", config, warmups=0, repetitions=2,
                               log=lambda message: None, abort_disturbed=False)
             self.assertNotIn("aborted", kept)
             self.assertIn("status", kept)
@@ -1905,7 +1911,7 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(pinned["sha256"], pin.continuation_sha256(pinned["cases"]))
             with self.assertRaises(SystemExit):  # one pinned text per data directory
                 pin.pin(MOCK, "unused-model", data, config, log=lambda message: None)
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
+            result = run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, parts=("speed", "exactness"))
             speed = result["speed"]
             self.assertEqual(speed["decode_text"], {"source": "pinned", "sha256": pinned["sha256"],
@@ -1914,7 +1920,7 @@ class StatusTests(unittest.TestCase):
             self.assertIn(len(speed["cases"]["short"]["samples"]), (2, 3))
             self.assertTrue(speed["cases"]["short"]["repeatable"])
             self.assertIn(f"decode measured on the pinned continuation {pinned['sha256'][:12]}", result["status"]["notes"])
-            free = runner.run(MOCK, "unused-model", data, data / "free.json", {**config, "replay": False}, warmups=0,
+            free = run_full(MOCK, "unused-model", data, data / "free.json", {**config, "replay": False}, warmups=0,
                               repetitions=1, log=lambda message: None, parts=("speed",))
             self.assertEqual(free["speed"]["decode_text"]["source"], "generated")
             compared = status.changes(free, result)
@@ -2061,7 +2067,7 @@ class ContextTests(unittest.TestCase):
 
     def test_the_requested_context_caps_the_max_context_and_says_when_it_cannot_be_served(self):
         import crit_eval
-        self.assertEqual(crit_eval.DEFAULT_CONTEXT_TOKENS, 262144)
+        self.assertEqual(crit_eval.DEFAULT_CONTEXT_TOKENS, 200000)
         with tempfile.TemporaryDirectory() as directory:
             model = safetensors_model(directory, SHAPES, DENSE)
             device = {"device": "fixture gpu", "memory_free_bytes": self.overhead + RESIDENT + 32 * 20000}
@@ -2242,7 +2248,7 @@ class ContextTests(unittest.TestCase):
         fixture(data)
         config = {"bytes_per_pass": 1e6, "draft_bytes_per_step": 1e5, **config}
         device = {"bandwidth_gbs": 1.0, "tflops": {"fp8": 1.0, "bf16": 1.0}, **(device or {})}
-        return runner.run(MOCK, model, data, data / "result.json", config, warmups=0, repetitions=2,
+        return run_full(MOCK, model, data, data / "result.json", config, warmups=0, repetitions=2,
                           log=lambda message: None, device=device, context_tokens=context_tokens)
 
     def test_engines_are_built_for_the_required_context_and_checked_below_it(self):
@@ -2276,7 +2282,7 @@ class ContextTests(unittest.TestCase):
                                                                      side_effect=lambda: next(readings)):
             data = Path(directory)
             fixture(data)
-            result = runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 1 << 20},
+            result = run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 1 << 20},
                                 parts=("context",), log=lambda message: None, context_tokens=4096)
         memory = result["context"]["device_memory"]
         self.assertEqual((memory["free_bytes"], memory["least_at"]), (1_000_000_000, "after_curve"))
@@ -2541,7 +2547,7 @@ class QualityTests(unittest.TestCase):
                     {"logprob": math.log(0.5), "top_ids": [token] + [(token + j) % 1000 for j in range(1, 16)],
                      "top_logprobs": [math.log(0.5)] + [math.log(0.5 / 15)] * 15}
                     for token in (t["prompt_ids"] + t["continuation_ids"])[1:]] for t in texts}):
-                result = runner.run(MOCK, "unused-model", data, data / "result.json", {"max_context": 128},
+                result = run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 128},
                                     parts=("quality",), log=lambda message: None)
         quality = result["quality"]
         self.assertEqual((quality["status"], quality["evidence"], quality["passed"]), ("scored", "development", True))
@@ -2572,11 +2578,11 @@ class QualityTests(unittest.TestCase):
                 return original(module, model, config, *args, **kwargs)
             with patch.object(runner.fixed, "load", return_value=reference), patch.object(runner, "open_engine", counting), \
                     patch.object(quality_checks, "open_engine", counting):
-                result = runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=("quality",),
+                result = run_full(MOCK, "unused-model", data, data / "result.json", config, parts=("quality",),
                                     log=lambda message: None, quality_budget={"ppl_ratio_max": 2.0, "kld_mean_max": 1.0,
                                                                               "kld_p99_max": 1.0},
                                     attribute_drift=True)
-                plain = runner.run(MOCK, "unused-model", data, data / "plain.json", config, parts=("quality",),
+                plain = run_full(MOCK, "unused-model", data, data / "plain.json", config, parts=("quality",),
                                    log=lambda message: None)
         self.assertEqual(opened, [0.2, 0.0, 0.1, 0.2])   # the engine, each variant after it, then the plain run's
         found = result["quality"]["attribution"]
@@ -2805,7 +2811,7 @@ class LongPromptTests(unittest.TestCase):
         data = Path(directory)
         fixture(data)
         config = {"facts_from": FACTS, **config}
-        return runner.run(MOCK, "unused-model", data, data / "result.json", config, parts=parts, warmups=0,
+        return run_full(MOCK, "unused-model", data, data / "result.json", config, parts=parts, warmups=0,
                           repetitions=2, log=lambda message: None, context_tokens=context_tokens)
 
     def gates(self, result):
@@ -2835,7 +2841,7 @@ class LongPromptTests(unittest.TestCase):
             fixture(data)
 
             def run(**options):
-                return runner.run(MOCK, "unused-model", data, data / "result.json", {"facts_from": FACTS},
+                return run_full(MOCK, "unused-model", data, data / "result.json", {"facts_from": FACTS},
                                   warmups=0, log=lambda message: None, profile="hub", **options)
             result = run()
             with self.assertRaisesRegex(SystemExit, "200,000 tokens"):

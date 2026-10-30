@@ -9,6 +9,38 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-30
+
+### Overview
+
+crit-eval 0.4.0 starts protocol series crit-eval-v0.4: a run measures in stages within a 45-minute budget, as far as
+the engine's own speed allows, and only the candidate that will ship serves its required context (`--certify`). The
+default requested context is 200,000 tokens. Data prepared under 0.3.x is prepared again; the reference scores carry
+over.
+
+### Added
+
+- Protocol crit-eval-v0.4.0: a run without a profile measures in stages within a 45-minute wall-clock budget
+  (protocol `stages`, `--budget-minutes`, `--stage`). Stage 1 runs on every engine: each speed case once, quality
+  on the texts up to 2,048 tokens, each priced at the rates measured so far and left out when it would pass the
+  budget (`over_budget`), the request history on the shortest case, the device memory the required context
+  needs against what the load left free (`context.fit`), decode projected to the required context (`context.creep`)
+  and the shortest prompt's time to first token (`speed.ttft_floor_ms`). After it the run goes on to the highest
+  stage whose remaining requests fit the budget at the engine's measured rates: stage 2 adds the repetitions, the
+  follow-up turns, the long quality text and the curve's first point; stage 3 the sampled suite at two seeds,
+  exactness on two cases, the follow-up turns again and the lower context once. The full run of a 55 tok/s prefill
+  candidate projected 6.2 h; its stage 1 takes about 25 minutes. The run prints its first estimate after its first
+  speed case (`stages.first_estimate`).
+- A run whose engine stops answering (a request past its deadline) keeps what it measured until then, marked
+  `aborted` with reason `hung`, as a disturbed round does.
+- `crit eval run --certify`: the candidate that will ship runs stage 3 whatever the budget and one request at the
+  required context, which the capacity gate needs. Without it no request fills the required context: capacity is
+  unmeasured and the curve stops at its first point. The curve's middle points are no longer measured.
+
+### Changed
+
+- The default requested context is 200,000 tokens (was 262,144).
+
 ## [0.3.0] - 2026-10-30
 
 ### Overview
@@ -296,7 +328,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.3.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.4.0...HEAD
+[0.4.0]: https://github.com/crit-labs/crit-eval/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/crit-labs/crit-eval/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/crit-labs/crit-eval/compare/v0.1.1...v0.1.2

@@ -73,12 +73,21 @@ def main(argv=None):
     run.add_argument("--profile", choices=["hub"],
                      help="A protocol profile fixing what the run measures (protocol profiles). hub: crit-hub "
                           "submissions, 200,000 tokens of context, the curve at its two ends, one engine load")
+    run.add_argument("--stage", choices=["1", "2", "3", "full"],
+                     help="How far a run without a profile measures (protocol stages): by default as far as the "
+                          "budget allows at the engine's measured rates; 1, 2 or 3 at most that far; full every part "
+                          "at the protocol's repetitions, as before stages (--warmups and --repetitions apply to it)")
+    run.add_argument("--certify", action="store_true",
+                     help="The candidate that will ship: stage 3 whatever the budget, then one request at the "
+                          "required context itself, which the capacity gate needs")
+    run.add_argument("--budget-minutes", type=float, metavar="MINUTES",
+                     help="The staged run's wall-clock budget, loads included (default: the protocol's 45)")
     run.add_argument("--context", type=int, metavar="TOKENS",
                      help="Context (prompt plus output) every engine is built and measured for: the run's kv_tokens. "
                           "Default: crit-eval's max context for the model on the --device")
     run.add_argument("--requested-context", type=int, metavar="TOKENS", default=None,
                      help="The longest request wanted, which caps the max context crit-eval computes without --context "
-                          "(default: settings.toml context_tokens, else 262,144)")
+                          "(default: settings.toml context_tokens, else 200,000)")
     run.add_argument("--context-reserve-gib", type=float, default=None,
                      help="Device memory kept out of the KV cache when crit-eval computes the max context: "
                           "activations, workspaces, graphs and speed techniques (default: settings.toml "
@@ -112,7 +121,7 @@ def main(argv=None):
                          help="Device memory kept out of the KV cache for workspaces and speed techniques "
                               "(default: settings.toml context_reserve_gib, else the protocol's reserve_gib)")
     context.add_argument("--requested-context", type=int, metavar="TOKENS", default=None,
-                         help="The longest request wanted (default: settings.toml context_tokens, else 262,144)")
+                         help="The longest request wanted (default: settings.toml context_tokens, else 200,000)")
     context.add_argument("--drafter", action="append", default=[], metavar="DIR",
                          help="A companion drafter the engine may load beside the model; its stored weights are kept "
                               "out of the KV cache (repeatable)")
@@ -384,7 +393,9 @@ def _command(args):
                     context_reserve_bytes=round(reserve_gib(args) * (1 << 30)) if reserve_gib(args) is not None else None,
                     abort_disturbed=not args.keep_disturbed, url=args.url, served_model=args.served_model,
                     profile=args.profile, chat_template=template, attribute_drift=args.attribute_drift,
-                    adaptive_sampled=args.adaptive_sampled, quality_mode=args.quality_mode)
+                    adaptive_sampled=args.adaptive_sampled, quality_mode=args.quality_mode,
+                    stage=args.stage if args.stage in (None, "full") else int(args.stage), certify=args.certify,
+                    budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None)
     print(f"wrote {args.out}")
     if result.get("aborted"):
         print(f"aborted: {result['aborted']['detail']}")
@@ -406,7 +417,7 @@ def reserve_gib(args):
 
 
 def requested(args):
-    """--requested-context, else settings.toml's context_tokens, else 262,144."""
+    """--requested-context, else settings.toml's context_tokens, else 200,000."""
     from . import requested_context
     return args.requested_context if args.requested_context is not None else requested_context()
 

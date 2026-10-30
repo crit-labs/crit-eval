@@ -13,8 +13,8 @@ may only make the engine faster.
 `max context = min(requested, model limit, device limit)`.
 
 - **Requested:** the longest request the user wants served, `context_tokens` in `settings.toml`
-  (default 262,144; `--requested-context` overrides it). When the model or the device allows
-  less, they bound it and the result's `note` says so, e.g. "the requested 262,144 tokens exceed
+  (default 200,000; `--requested-context` overrides it). When the model or the device allows
+  less, they bound it and the result's `note` says so, e.g. "the requested 200,000 tokens exceed
   the model's 131,072 positions". It is the user's setting: engine builders do not change it.
 
 - **Model limit:** the positions `config.json` declares (`max_position_embeddings` or another

@@ -8,7 +8,7 @@
 
 ### Speed and quality measurement tool to compare inference engines honestly.
 
-[![Version 0.3.0](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.4.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![Python 3.11+](docs/assets/badge-python.svg)](pyproject.toml)
 
@@ -94,7 +94,7 @@ plugs in through a Python [adapter](docs/ADAPTER.md) instead of `--url`.
 | **decode_sampled** | `status.kpis.decode_sampled` | Decode tokens per second at the model's own sampling, the headline decode, and tokens per round for speculative engines; a case whose three seeds disagree is repeated at further seeds (up to 9) until its standard error is within 3%, and each case's error is reported |
 | **prefill** | `status.kpis.prefill` | Prompt tokens per second on the two long prompts |
 | **ttft** | `status.kpis.ttft` | Milliseconds to the first token over every workload |
-| **long-context decode and ttft** | `status.kpis.context` | The same scores along a curve of prompts up to the required context (262,144 tokens by default) |
+| **long-context decode and ttft** | `status.kpis.context` | The same scores along a curve of prompts up to the required context (200,000 tokens by default; the required context itself on a certified run) |
 | **perplexity** | `status.kpis.perplexity` | The engine's perplexity over the reference's: the worst quality set (prompt and served tokens, each long length) against its limit; per set in `quality.sets` |
 | **kl_divergence** | `status.kpis.kl_divergence` | Mean and p99 KL divergence of the engine's token distributions from the reference's: the worst set against its limits; per set in `quality.sets` |
 | limits and gaps | `headroom` | Each KPI's physical limit on this machine, from the probe's best rate per format (cuBLASLt GEMM or raw tensor cores), and what each term (model pass, draft steps, verify pass, draft width, drafter acceptance, prefill, first token) would give at its floor |
