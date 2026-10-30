@@ -2,7 +2,7 @@
 
     max context = min(requested, model limit, device limit)      tokens of prompt plus output
 
-The requested context is the user's (settings.toml context_tokens, default 262,144; `--requested-context`): the
+The requested context is the user's (settings.toml context_tokens, default 200,000; `--requested-context`): the
 longest request they want served. The model and the device may allow less, and then bound it; the result says
 which bound and why.
 
@@ -316,11 +316,15 @@ def lower_context(required, longest_case_tokens, settings):
 def curve_points(required, settings, every=None):
     """Context lengths the long-context curve measures: powers of two from `curve_from` below the
     requirement, then the requirement itself. With settings' curve_points "ends" (a profile's curve), only the first and the
-    requirement; every=True gives all of them regardless (the points a profile's curve interpolates)."""
+    requirement; every=True gives all of them regardless (the points a profile's curve interpolates). With "first"
+    (a staged run that is not certified, protocol stages), only the first, the requirement itself when no point lies
+    below it: a longer requirement is the certification's."""
     points, point = [], int(settings["curve_from"])
     while point < required:
         points.append(point)
         point *= 2
+    if settings.get("curve_points") == "first" and not every:
+        return points[:1] or [required]
     if settings.get("curve_points") == "ends" and not every:
         points = points[:1]
     return points + [required]

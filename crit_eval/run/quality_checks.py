@@ -321,6 +321,30 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
             "timing": {part: _phase_timing(values) for part, values in timing.items()}}
 
 
+def merge_quality(quality, more):
+    """Fold the quality part `more` (run_quality of sets `quality` left out: a staged run's later sets) into
+    `quality`: its sets, buckets and texts join the first's, the sets it scored or skipped replace the first's skip
+    reasons, and the part's pass is judged again."""
+    if quality.get("status") != "scored":
+        return more
+    skipped = {name: why for name, why in quality.get("skipped", {}).items()
+               if f"{name}/prompt" not in more.get("sets", {}) and f"{name}/served" not in more.get("sets", {})}
+    skipped.update(more.get("skipped") or {})
+    if more.get("status") != "scored":
+        return {**quality, "skipped": skipped}
+    sets = {**quality["sets"], **more["sets"]}
+    texts = quality["timing"]["texts"] + more["timing"]["texts"]
+    timing = {**quality["timing"], "scores": _phase_timing(texts), "texts": texts,
+              "metrics_seconds": quality["timing"]["metrics_seconds"] + more["timing"]["metrics_seconds"]}
+    honesty = quality.get("honesty") or {}
+    merged = {**quality, "sets": sets, "buckets": {**quality["buckets"], **more["buckets"]}, "skipped": skipped,
+              "seconds": quality["seconds"] + more["seconds"], "timing": timing,
+              "passed": all(s["passed"] for s in sets.values()) and honesty.get("passed") is not False}
+    if more.get("stopped_early"):
+        merged["stopped_early"] = more["stopped_early"]
+    return merged
+
+
 def merge_honesty(quality, more):
     """Fold the honesty verdict `more` (run_honesty of extra replies, timing included) into result part `quality`:
     its replies, failures, worst difference and timing join the first check's, and the part's pass is judged again."""

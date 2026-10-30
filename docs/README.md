@@ -289,6 +289,37 @@ call gets no quality figures; an adapter's engine with `score()` gets them as de
 (`crit eval run --adapter A --only quality`, no server needed), which is reported and never a gate
 result ([Adapter](ADAPTER.md)).
 
+## Stages
+
+A run without a profile measures in stages (protocol `stages`), each a prefix of the next, within a wall-clock
+budget of 45 minutes, loads included (`--budget-minutes`). A slow first candidate gets the telemetry that says what
+to fix next in minutes; a fast one gets the full telemetry; only the candidate that will ship pays for its
+required context.
+
+| Stage | Adds | What it gives |
+|---|---|---|
+| 1 | each speed case once; quality on every set up to 2,048 tokens with the honesty check; the request history on the shortest speed case | decode, prefill and time to first token with its floor (`speed.ttft_floor_ms`, the shortest prompt's); the quality gate; the history gate; the memory the required context needs against what the load left free (`context.fit`); decode projected to the required context from every context measured (`context.creep`) |
+| 2 | the speed cases under 8,192 prompt tokens twice more; the follow-up turns; the longer quality sets and any stage 1 had no room for; the long-context curve's first point (32,768 tokens) and retrieval below it | the repetitions' spread; prompt-cache KPIs; long-text quality and the honesty check's long reply; long-context time to first token, decode and retrieval |
+| 3 | the sampled suite at two seeds after a warmup that serves the sampling check; exactness on the two shortest cases; the held-out prompts when a baseline measured them; the follow-up turns again; the speed cases once at the lower context | sampled decode and the sampling gate; exactness; the generality gate; the prompt-cache gate; the lower-context gate |
+
+Stage 1 runs on every engine, but not blindly: after its first speed case it prices each further case and quality set
+at the rates measured so far, and leaves out one that would pass the budget (`over_budget`; a speed case left out
+makes coverage unmeasured, not failed). An engine that stops answering (a request past its deadline) ends the run as
+`aborted` with what it measured until then.
+
+After stage 1 the run prices the next stages' requests at the rates the engine measured
+([estimate](../crit_eval/run/estimate.py)) and goes on to the highest that fits what is left of the budget; a part
+that would still pass it is skipped and named in `stages.skipped`. `--stage 1|2|3` caps how far a run goes.
+
+No stage serves the required context itself. The curve stops at its first point, retrieval at the points below
+it, and the capacity gate is unmeasured. `--certify`, for the candidate that will ship, runs stage 3 whatever the
+budget and one request at the requirement (the curve's last point, retrieval on its reply), which the capacity
+gate needs. An engine that serves the requirement serves every context below it, so the curve's middle points are
+not measured.
+
+`--stage full` runs every part at the protocol's warmups and repetitions, as before stages; `--warmups` and
+`--repetitions` apply to it alone. A profile (`--profile hub`) fixes its own parts and has no stages.
+
 ## Protocol versions
 
 Every prepared data directory and result records the protocol it ran under, `protocol` in

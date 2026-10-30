@@ -46,7 +46,7 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
     n = int(settings["output_tokens"])
     points, asked = {}, {}
     curve = curve_points(required, settings)
-    long_reply = {"point": curve[0], "reason": "the curve's first point was not measured"}
+    long_reply = {"point": curve[0] if curve else None, "reason": "the curve's first point was not measured"}
     for point in curve:
         if point > info["max_context"]:
             points[str(point)] = {"status": "skipped", "context": point,
@@ -129,6 +129,10 @@ def run_retrieval(engine, info, prepared, settings, required, log, from_curve=No
     for point in sorted(set(retrieval_points(required, rule)) | set(from_curve)):   # every curve point too
         if point in from_curve:
             points[str(point)] = from_curve[point]
+            continue
+        if point == required and settings.get("requirement") is False:
+            points[str(point)] = {"status": "skipped", "context": point,
+                                  "reason": "the required context is served by the certification only (protocol stages)"}
             continue
         if point == required:
             points[str(point)] = {"status": "failed", "context": point,

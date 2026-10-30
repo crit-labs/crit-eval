@@ -11,13 +11,14 @@ from .timing import (_summary, check_disturbed, decode_text, disagree, rate, tim
 
 
 def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None, disturbed_spread=None,
-              after_first=None):
+              after_first=None, admit=None):
     """Speed cases. With a pinned continuation and a replaying adapter, every speed KPI comes from replays
     of the pinned text (identical for every engine) and two free generations record the engine's own
     output for repeatability and exactness; otherwise the KPIs come from free generation. After the case's
     repetitions, one more when they disagree (protocol speed.extra_repetition).
     disturbed_spread: stop the round (Disturbed) when a case's decode speeds spread by more than this.
-    after_first: called with the first measured case (the run's time estimate)."""
+    after_first: called with the first measured case (the run's time estimate). admit: called with each case after
+    the first and the cases measured so far; the reason it returns (a staged run's budget) skips the case."""
     tolerance = protocol["speed"]["extra_repetition"]["tolerance"]
     cases = {}
     stop_ids = set(prepared["stop_ids"])
@@ -28,6 +29,11 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
         if len(prompt) + n > info["max_context"]:
             cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
             log(f"speed {case['id']}: skipped (context)")
+            continue
+        refused = admit(case, cases) if admit is not None and cases else None
+        if refused:
+            cases[case["id"]] = {"status": "skipped", "reason": refused, "over_budget": True}
+            log(f"speed {case['id']}: skipped ({refused})")
             continue
         samples, outputs = [], []
         load = HostLoad().start()
@@ -73,11 +79,21 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
         if after_first is not None:
             after_first(cases[case["id"]])
             after_first = None
+    return speed_summary(cases, protocol, warmups, repetitions, text)
+
+
+def speed_summary(cases, protocol, warmups, repetitions, text):
+    """The speed part's scores over its cases (run_speed's result): a staged run's cases measured in different
+    stages are summarized together again."""
     measured = [c for c in cases.values() if c["status"] == "measured"]
     prefill = [cases[i]["prefill_tps"] for i in protocol["speed"].get("prefill_cases", [])
                if cases.get(i, {}).get("status") == "measured" and cases[i].get("prefill_tps")]
+    shortest = min((c for c in measured if c.get("ttft_ms")), key=lambda c: c["prompt_tokens"], default=None)
     return {
         "warmup_runs": warmups, "repetitions": repetitions, "decode_text": text,
+        # The first token of the shortest prompt: what a request costs before its prompt does (protocol stages 1).
+        "ttft_floor_ms": shortest["ttft_ms"] if shortest else None,
+        "ttft_floor_case": next((i for i, c in cases.items() if c is shortest), None),
         "decode_score": metrics.geometric_mean([c["decode_tps"] for c in measured]),
         "decode_se": metrics.score_error([[s["decode_tps"] for s in c["samples"] if not s["warmup"]] for c in measured]),
         "prefill_score": metrics.geometric_mean(prefill)
