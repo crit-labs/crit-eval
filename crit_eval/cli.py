@@ -24,6 +24,17 @@ def json_option(text, option):
             raise SystemExit(f"{option} file {path} is not JSON: {error}")
 
 
+def adapter_config(adapter, text, option):
+    """An adapter's configuration: the configuration.json packaged beside it, the one crit serve opens the candidate
+    with, then the option's overrides. An adapter outside a package gets the overrides alone."""
+    overrides = json_option(text, option)
+    packaged = Path(adapter).parent / "configuration.json" if adapter else None
+    if packaged is None or not packaged.is_file():
+        return overrides
+    print(f"{option}: {packaged} with {len(overrides)} override(s)", file=sys.stderr)
+    return {**json_option(str(packaged), option), **overrides}
+
+
 def main(argv=None):
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -39,7 +50,7 @@ def main(argv=None):
     run.add_argument("--model", required=True, help="Model directory passed to the adapter")
     run.add_argument("--data", required=True, help="Prepared suite directory for this model")
     run.add_argument("--out", required=True, help="Result JSON path")
-    run.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
+    run.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file, over the configuration.json packaged beside it")
     run.add_argument("--only", choices=list(PARTS), action="append",
                      help="Run only these parts (repeatable); default is all. context: the long-context curve and "
                           "retrieval up to the required context and the speed cases again at a lower context; "
@@ -55,7 +66,7 @@ def main(argv=None):
                      help='Drift limits over the protocol defaults, e.g. \'{"ppl_ratio_max": 1.02}\'; '
                           'keys ppl_ratio_max, kld_mean_max, kld_p99_max')
     run.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
-                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized: against the checkpoint run as quantized, its activations quantized as it declares (score that reference first: crit eval reference --quality-mode as_quantized)")
+                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized: against the same scores with each set's budget widened by how far the checkpoint's own activation quantization lands from them (the allowance crit eval reference measures)")
     run.add_argument("--exactness", choices=["reported", "required"],
                      help="reported (default): agreement with plain greedy is shown and the quality budget judges "
                           "the output; required: any difference fails the gate")
@@ -94,11 +105,17 @@ def main(argv=None):
     context.add_argument("--device", required=True, metavar="JSON", help="Device file from `crit eval probe`")
     context.add_argument("--vram-headroom-gib", type=float, default=None,
                          help="Device memory left free (default: settings.toml vram_headroom_gib, else 1)")
+    context.add_argument("--ram-headroom-gib", type=float, default=None,
+                         help="Host memory left free, for the placement scenario (default: settings.toml "
+                              "ram_headroom_gib, else 2)")
     context.add_argument("--context-reserve-gib", type=float, default=None,
                          help="Device memory kept out of the KV cache for workspaces and speed techniques "
                               "(default: settings.toml context_reserve_gib, else the protocol's reserve_gib)")
     context.add_argument("--requested-context", type=int, metavar="TOKENS", default=None,
                          help="The longest request wanted (default: settings.toml context_tokens, else 262,144)")
+    context.add_argument("--drafter", action="append", default=[], metavar="DIR",
+                         help="A companion drafter the engine may load beside the model; its stored weights are kept "
+                              "out of the KV cache (repeatable)")
     context.add_argument("--json", action="store_true", help="Print the computation as JSON")
 
     probe = subs.add_parser("probe", help="Measure device bandwidth and GEMM rates per weight format (needs nvcc)")
@@ -131,10 +148,10 @@ def main(argv=None):
                                                   "transformers, GPU; stop any engine first)")
     reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
     reference.add_argument("--data", required=True, help="Prepared suite directory")
-    reference.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
-                           help="preserve (default): exact activations; as_quantized: the activations quantized as the "
-                                "checkpoint declares, scored into a store of their own for runs with --quality-mode "
-                                "as_quantized")
+    reference.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default=None,
+                           help="Accepted from earlier versions and ignored: one run scores what both quality modes "
+                                "need (the scores, their spread and, for a checkpoint that declares quantized "
+                                "activations, the as_quantized allowance)")
 
     fetch = subs.add_parser("fetch", help="Fetch the checkpoint's reference package (prepared data and reference "
                                           "scores) into the data, so a run needs only the engine")
@@ -157,14 +174,14 @@ def main(argv=None):
     pin.add_argument("--adapter", required=True, help="Python file exporting create_eval_engine(context)")
     pin.add_argument("--model", required=True, help="Model directory passed to the adapter")
     pin.add_argument("--data", required=True, help="Prepared data directory to pin the continuation in")
-    pin.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
+    pin.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file, over the configuration.json packaged beside it")
     pin.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     ab = subs.add_parser("ab", help="Alternate two engines' speed runs in one session and report paired ratios")
     ab.add_argument("--adapter", required=True, help="Adapter of engine A")
-    ab.add_argument("--config", default="{}", help="JSON configuration of engine A (text or a file)")
+    ab.add_argument("--config", default="{}", help="JSON configuration overrides of engine A (text or a file), over its packaged configuration.json")
     ab.add_argument("--adapter-b", help="Adapter of engine B (default: engine A's adapter)")
-    ab.add_argument("--config-b", default="{}", help="JSON configuration of engine B (text or a file)")
+    ab.add_argument("--config-b", default="{}", help="JSON configuration overrides of engine B (text or a file), over its packaged configuration.json")
     ab.add_argument("--model", required=True)
     ab.add_argument("--data", required=True)
     ab.add_argument("--out", required=True, help="Result JSON path")
@@ -179,7 +196,7 @@ def main(argv=None):
     kernels.add_argument("--model", required=True, help="Model directory passed to the adapter")
     kernels.add_argument("--data", required=True, help="Prepared suite directory for this model")
     kernels.add_argument("--out", required=True, help="Kernel report JSON path")
-    kernels.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file")
+    kernels.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file, over the configuration.json packaged beside it")
     kernels.add_argument("--case", action="append", help="Trace only these speed cases (repeatable); default all")
     kernels.add_argument("--device", metavar="JSON", help="Device ceilings from `crit eval probe` for share of peak")
     kernels.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
@@ -188,6 +205,17 @@ def main(argv=None):
                                                        "file: [{\"match\": NAME_PART, \"term\": matmul|attention|recurrent|"
                                                        "other|draft, \"format\": nvfp4|fp8|bf16, ...}]")
     kernels.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
+
+    workbench = subs.add_parser("workbench", help="Check, time or profile a kernel on its workbench folder "
+                                                  "(crit kernels new): reference, floor, yardstick")
+    workbench.add_argument("action", choices=("check", "bench", "profile"))
+    workbench.add_argument("folder", help="The workbench folder")
+    workbench.add_argument("--python", help="The engine's Python (torch and the GPU); default this one")
+    workbench.add_argument("--shape", type=int, help="One shape of kernel.json by index (profile: default the first)")
+    workbench.add_argument("--iters", type=int, help="bench: timed calls per shape and column count")
+    workbench.add_argument("--device", metavar="JSON", help="bench: a `crit eval probe` result, for the floor")
+    workbench.add_argument("--out", help="check and bench: the result JSON (default FOLDER/check.json, bench.json)")
+    workbench.add_argument("--ncu", help="profile: Nsight Compute's ncu, to add its sections")
 
     args = parser.parse_args(argv)
     # An engine behind a server is the server's to load (crit serve holds the lock while it serves).
@@ -204,6 +232,17 @@ ENGINE_COMMANDS = {"run", "pin", "ab", "kernels", "reference"}
 
 
 def _command(args):
+    if args.command == "workbench":
+        from .workbench import profile, run_harness
+        if args.action == "profile":
+            result = profile(args.folder, args.python, args.ncu, args.shape or 0)
+            print(json.dumps(result, indent=2))
+            return 0
+        options = {"iters": args.iters, "device": args.device, "out": args.out, "shape": args.shape}             if args.action == "bench" else {"out": args.out, "shape": args.shape}
+        code, result = run_harness(args.folder, args.action, args.python, **options)
+        if result is None:
+            raise SystemExit(f"the workbench harness exited {code} without a result")
+        return 0 if code == 0 else 1
     if args.command == "kernels":
         from . import load_json as load
         from .limits.kernels import render as render_kernels, trace
@@ -212,7 +251,7 @@ def _command(args):
             from .quality.prepare import prepare as do_prepare
             do_prepare(args.model, args.data)
         work = json_option(args.work, "--work") if args.work else None
-        result = trace(args.adapter, args.model, args.data, args.out, json_option(args.config, "--config"), args.case,
+        result = trace(args.adapter, args.model, args.data, args.out, adapter_config(args.adapter, args.config, "--config"), args.case,
                        args.nvcc,
                        load(args.device) if args.device else None, context_tokens=args.context, work=work)
         print(f"wrote {args.out}")
@@ -234,12 +273,14 @@ def _command(args):
         return 0
     if args.command == "reference":
         from .quality.reference import score_data
-        from .quality.fixed import STORES
-        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), quality_mode=args.quality_mode)
-        print(f"reference scores of {how['positions']:,} positions {how['method']} in "
-              f"{Path(args.data) / STORES[args.quality_mode]}"
+        from .quality.fixed import STORE
+        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True))
+        print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / STORE}"
               + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else "")
-              + (f"; the reference's own spread on the long texts {how['spread']}" if how.get("spread") else ""))
+              + (f"; the reference's own spread {how['spread']}" if how.get("spread") else "")
+              + {"none": "; the checkpoint declares no quantized activations (as_quantized judges as preserve)",
+                 "unsupported": "; the as_quantized allowance not measured (see above)"}.get(
+                  how.get("allowance"), f"; the as_quantized allowance {how['allowance']}" if how.get("allowance") else ""))
         return 0
     if args.command == "fetch":
         from .quality.packages import fetch as do_fetch, source
@@ -266,8 +307,15 @@ def _command(args):
         from .limits.context import GIB, max_context, render as render_context
         from . import EVAL_DIR
         settings = context_settings(load(EVAL_DIR / "protocol.json")["context"], args)
-        value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings, requested(args))
-        print(json.dumps(value, indent=1) if args.json else render_context(value))
+        value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings, requested(args),
+                            drafters=args.drafter)
+        from .limits.context import placement, render_placement
+        from . import machine_settings
+        ram = args.ram_headroom_gib if args.ram_headroom_gib is not None else machine_settings().get("ram_headroom_gib", 2.0)
+        where = placement(args.model, load(args.device), headroom_gib(args) * GIB, ram * GIB, settings, requested(args),
+                          drafters=args.drafter)
+        print(json.dumps({**value, "placement": where}, indent=1) if args.json
+              else render_context(value) + "\n" + render_placement(where))
         return 0 if value["tokens"] else 1
     if args.command == "compare":
         from .reports.compare import compare as do_compare
@@ -279,14 +327,14 @@ def _command(args):
         if not (Path(args.data) / PREPARED).is_file():
             from .quality.prepare import prepare as do_prepare
             do_prepare(args.model, args.data)
-        pinned = do_pin(args.adapter, args.model, args.data, json_option(args.config, "--config"),
+        pinned = do_pin(args.adapter, args.model, args.data, adapter_config(args.adapter, args.config, "--config"),
                         context_tokens=args.context)
         print(f"pinned {len(pinned['cases'])} speed cases in {Path(args.data) / CONTINUATIONS} (sha256 {pinned['sha256'][:12]})")
         return 0
     if args.command == "ab":
         from .run.ab import render as render_ab, run_ab
-        result = run_ab(args.adapter, json_option(args.config, "--config"), args.adapter_b or args.adapter,
-                        json_option(args.config_b, "--config-b"),
+        result = run_ab(args.adapter, adapter_config(args.adapter, args.config, "--config"), args.adapter_b or args.adapter,
+                        adapter_config(args.adapter_b or args.adapter, args.config_b, "--config-b"),
                         args.model, args.data, args.out, args.rounds, args.warmups, args.repetitions,
                         context_tokens=args.context)
         print(f"wrote {args.out}")
@@ -327,7 +375,7 @@ def _command(args):
     from .reports.status import render
     device = load(args.device) if args.device else None
     baseline = load(args.baseline) if args.baseline else None
-    result = do_run(args.adapter, args.model, data, args.out, json_option(args.config, "--config"), parts,
+    result = do_run(args.adapter, args.model, data, args.out, adapter_config(args.adapter, args.config, "--config"), parts,
                     args.warmups, args.repetitions, args.label, bandwidth_gbs=args.bandwidth, device=device,
                     baseline=baseline, quality_budget=(json_option(args.quality_budget, "--quality-budget")
                                                      if args.quality_budget else None),

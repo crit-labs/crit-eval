@@ -1,7 +1,9 @@
 """crit eval harness: metrics, runner and comparison with the mock adapter (no GPU)."""
+import contextlib
 import copy
 import hashlib
 import importlib.util
+import io
 import json
 import math
 import os
@@ -41,7 +43,7 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v0.2.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": "crit-eval-v0.3.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
@@ -114,6 +116,26 @@ class MetricTests(unittest.TestCase):
         self.assertIsNone(unmeasured["pass_efficiency"])
         self.assertTrue(any("bytes_per_pass" in w for w in unmeasured["warnings"]))
 
+    def test_bytes_read_from_host_memory_are_priced_at_the_host_rates(self):
+        speed = {"cases": {"code": {"status": "measured", "tokens_per_round": 1.0, "round_ms": 100.0}}}
+        # 18 GB a pass, 1.3 GB of it copied over a 26 GB/s link: the link, not the device, sets the floor.
+        info = {"bytes_per_pass": 18e9, "host_bytes_per_pass": {"link": 1.3e9}}
+        room = headroom.summarize(info, speed, 100.0, 1800, {}, host_rates={"link": 26, "memory": 45})
+        self.assertAlmostEqual(room["pass_floor_ms"], 50.0)
+        self.assertEqual(room["host_pass"], {"link": 1.3e9, "cpu": 0, "link_gbs": 26, "memory_gbs": 45})
+        self.assertAlmostEqual(room["cases"]["code"]["pass_floor_ms"], 50.0)
+        # The same bytes computed on the CPU are priced at host memory's rate; both at once share it.
+        cpu = headroom.summarize({**info, "host_bytes_per_pass": {"cpu": 1.3e9}}, speed, 100.0, 1800, {},
+                                 host_rates={"link": 26, "memory": 45})
+        self.assertAlmostEqual(cpu["pass_floor_ms"], 1.3e9 / 45e6)
+        both = headroom.pass_floor_ms(18e9, 1800, {"link": 0.9e9, "cpu": 0.9e9, "link_gbs": 26, "memory_gbs": 45})
+        self.assertAlmostEqual(both, 1.8e9 / 45e6)
+        # Without the probe's host rates the device floor stands and the rates are named missing.
+        bare = headroom.summarize(info, speed, 100.0, 1800, {})
+        self.assertAlmostEqual(bare["pass_floor_ms"], 18e9 / 1800e6)
+        self.assertIn("host rates for host_bytes_per_pass (re-run crit eval probe)", bare["missing"])
+        self.assertIsNone(headroom.summarize({"bytes_per_pass": 18e9}, speed, 100.0, 1800, {})["host_pass"])
+
     def test_acceptance_projects_tokens_and_speed_by_width(self):
         # Rounds accepted 0, 1, 2 and 4 drafts at width 4.
         curve = headroom.tokens_by_width([0, 1, 2, 4], 4)
@@ -146,6 +168,16 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(headroom.conditional_acceptance([0, 1, 2, 4], 4), [0.75, 2 / 3, 0.5, 1.0])
         self.assertEqual(headroom.tokens_at_rate(0.5, 3), [1.0, 1.5, 1.75, 1.875])
         self.assertEqual(headroom.conditional_acceptance([0, 0], 2), [0.0, 0.0])
+
+    def test_rounds_of_a_varying_width_count_only_the_depths_they_drafted(self):
+        # Rounds drafting 2, 2, 4 and 4 tokens: the two short rounds kept both drafts, which says nothing about a third.
+        accepted, drafted = [2, 2, 1, 4], [2, 2, 4, 4]
+        self.assertEqual(headroom.conditional_acceptance(accepted, 4, drafted), [1.0, 0.75, 1.0, 1.0])
+        # Read against the widest width, the short rounds look rejected at depth 3.
+        self.assertEqual(headroom.conditional_acceptance(accepted, 4), [1.0, 0.75, 1 / 3, 1.0])
+        curve = headroom.tokens_by_width(accepted, 4, drafted)
+        self.assertEqual(curve, [1.0, 2.0, 2.75, 3.5, 4.25])
+        self.assertEqual(headroom.tokens_by_width(accepted, 4, [4] * 4), headroom.tokens_by_width(accepted, 4))
 
     def test_judge_reports_threshold_failures(self):
         self.assertEqual(metrics.judge({"ppl_ratio": 1.0, "kld_mean": 0.0}, {"ppl_ratio_max": 1.01, "kld_mean_max": 0.01}), [])
@@ -257,6 +289,18 @@ class RunnerTests(unittest.TestCase):
             with self.assertRaisesRegex(SystemExit, "--config-b file .*B.json is not JSON"):
                 json_option(str(path), "--config-b")
 
+    def test_a_packaged_adapter_starts_from_its_configuration(self):
+        from crit_eval.cli import adapter_config
+        with tempfile.TemporaryDirectory() as directory:
+            adapter = Path(directory) / "adapter.py"
+            self.assertEqual(adapter_config(str(adapter), '{"draft_width": 2}', "--config"), {"draft_width": 2})
+            (Path(directory) / "configuration.json").write_text('{"draft_width": 4, "graphs": true}')
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(adapter_config(str(adapter), "{}", "--config"), {"draft_width": 4, "graphs": True})
+                self.assertEqual(adapter_config(str(adapter), '{"draft_width": 2}', "--config"),
+                                 {"draft_width": 2, "graphs": True})
+            self.assertEqual(adapter_config(None, "{}", "--config"), {})
+
     def test_wrong_token_count_is_rejected(self):
         class Short:
             def generate(self, prompt, n, on_tokens):
@@ -310,6 +354,36 @@ class PrepareTests(unittest.TestCase):
         self.assertEqual(len(ids), 400)
         self.assertEqual(prepare.token_ids(Model(), Model().render(messages, tools)), ids)  # the document cut to fit
 
+    def test_a_tokenizer_marking_the_start_of_its_input_marks_only_the_renders_start(self):
+        # Metaspace with prepend_scheme "first" (SentencePiece-style Llama tokenizers) puts a word marker (id 2 here)
+        # before text that starts the input, so the document and the tail encoded on their own got one each that the
+        # served render, encoded whole, does not have.
+        class Model(CharacterText):
+            class tokenizer:
+                special_ids = frozenset({1})
+                added_tokens = {1: SimpleNamespace(content="\x01")}
+
+                @staticmethod
+                def encode(text, *, add_special_tokens, split_special_tokens=None):
+                    ids = []
+                    for index, part in enumerate(text.split("\x01")):
+                        ids += [1] if index else []
+                        ids += ([2] if index == 0 and part else []) + [ord(c) for c in part]
+                    return ids
+
+                @staticmethod
+                def decode(ids):
+                    return "".join(chr(i) for i in ids if i != 2)
+
+            def render(self, messages, tools=None, **variables):
+                return "".join(f"<{m['role']}>{m['content']}" for m in messages) + "<a>"
+        case = {"id": "long", "prompt_tokens": 400, "document": "long_document.txt",
+                "messages": [{"role": "user", "content": "Summarize.\n\n{document}"}]}
+        ids, messages, tools = prepare.speed_prompt(Model(), case)
+        self.assertEqual((len(ids), ids.count(2)), (400, 1))
+        self.assertEqual(prepare.token_ids(Model(), Model().render(messages, tools)), ids)
+        self.assertEqual(prepare.piece_ids(Model(), "ab"), [ord("a"), ord("b")])
+
     def test_agent_case_renders_tools_and_file_contents_and_fills_the_inline_document(self):
         seen = {}
 
@@ -355,6 +429,9 @@ PROTOCOLS = {
     "crit-eval-v0.1.0": "a39facfb4d13d4054ab3da3445564606d4a0696f93e5583b8e0a076467858412",  # crit-eval's first release
     "crit-eval-v0.1.2": "a373c9c54f5b00d8d986da7dac0a2480049b0bbef1999d4c9fdd8ac72bc3edad",  # quality modes
     "crit-eval-v0.2.0": "8baf8ea4edbad3ad1a0ac06dd7775df74a3e216a32696d1c3b5533cf19a9dd1a",  # as_quantized budget x2, spread on every text
+    "crit-eval-v0.2.1": "5ec78e08cafea54a1cf3e73233f8c6be6e5151499cf95e0ba711130f5c984792",  # prompt perplexity reported
+    "crit-eval-v0.2.2": "3a637b009a7fc2670db2ce714c2b6c9d0dc9393594260e9c2751e8f02713eb0e",  # spread probe on the short texts
+    "crit-eval-v0.3.0": "b6761b006fc61e9a5f9315241bc1fb5437bfb09661665e3628dfb6c63c20dbd7",  # as_quantized by allowance
 }
 
 
@@ -587,6 +664,18 @@ class CeilingTests(unittest.TestCase):
         with patch.object(probe.subprocess, "run", side_effect=OSError("no nvidia-smi")):
             self.assertEqual(probe.architecture(), ["-arch=native"])
 
+    def test_an_older_device_file_says_what_it_lacks(self):
+        from crit_eval.limits import probe
+        current = {key: {"x": 1.0} for key in probe.MEASURED} | {
+            "probe_sha256": hashlib.sha256(probe.SOURCE.read_bytes()).hexdigest()}
+        self.assertEqual(probe.outdated(current), [])
+        self.assertEqual(probe.outdated(None), [])
+        # The Nanbeige run's device file: cuBLASLt GEMM rates only, from a probe before the raw MMA rates.
+        older = {"bandwidth_gbs": 1437.7, "tflops": {"bf16": 215.0}, "probe_sha256": "0" * 64}
+        found = probe.outdated(older)
+        self.assertIn("no raw tensor-core rates (fp16_acc, fp4_fp8 prompt activations)", found)
+        self.assertIn("measured by another probe source", found)
+
     def test_probe_keeps_the_median_host_rates(self):
         from crit_eval.limits import probe
         samples = [{"device": "gpu", "bandwidth_gbs": 1, "host_threads": 12, "cpu_isa": "avx512",
@@ -755,7 +844,7 @@ class ActivationCeilingTests(unittest.TestCase):
         scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
         quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
             "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
-        return {"protocol": "crit-eval-v0.2.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
+        return {"protocol": "crit-eval-v0.3.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
                 "engine": {"prompt_activations": declared}, "quality": quality,
                 "headroom": {"gaps": [], "missing": []}}
 
@@ -898,7 +987,8 @@ class ActivationCeilingTests(unittest.TestCase):
         prefill = found["as_quantized"]["kpis"]["prefill"]
         self.assertEqual(prefill["ceiling_activations"], "stored")
         self.assertAlmostEqual(prefill["ceiling"], floor(400e12, 800e12))
-        self.assertIn("quality mode as_quantized: quality judged against the checkpoint run as quantized",
+        self.assertIn("quality mode as_quantized: quality judged against the checkpoint's exact activations with each "
+                      "set's budget widened by its own activation quantization's drift",
                       status.render(found["as_quantized"]))
 
 
@@ -1358,6 +1448,33 @@ class SampledSpeedTests(unittest.TestCase):
             speed.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, None,
                                      lambda m: None, disturbed_spread=0.25)
 
+        # An adaptive engine: 15 ms plain steps and 26 ms rounds of 7 drafts, mixed by each seed's acceptance. Its
+        # time per round follows the mix (16.1 to 24.9 ms, 55% apart); at the median drafts per round it agrees.
+        def mixed(share, slow=1.0):
+            drafted = [7] * int(share * 100) + [0] * (100 - int(share * 100))
+            return {"warmup": False, "request_ms": 2000.0, "drafted": drafted, "round_ms": (15 + 11 * share) * slow}
+        samples = [mixed(0.1), mixed(0.5), mixed(0.9)]
+        self.assertEqual([round(v, 6) for v in timing.width_adjusted_rounds(samples)], [20.5] * 3)
+        timing.check_disturbed("a", samples, 0.25, key="round_ms")
+        with self.assertRaisesRegex(timing.Disturbed, "at the drafts each round made"):
+            timing.check_disturbed("a", [mixed(0.1), mixed(0.5), mixed(0.9), mixed(0.5, slow=1.4)], 0.25, key="round_ms")
+        self.assertIsNone(timing.width_adjusted_rounds(samples[:2]))   # two samples fit any slope exactly
+        self.assertIsNone(timing.width_adjusted_rounds([mixed(0.5)] * 3))
+        # A disturbance on a nearly full device names the engine's own memory as a cause.
+        disturbed = [mixed(0.5), mixed(0.5), mixed(0.5, slow=1.5)]
+        with patch.object(host, "device_memory", return_value={"free_bytes": 90 * 2**20, "total_bytes": 32 * 2**30}):
+            with self.assertRaisesRegex(timing.Disturbed, r"0\.09 of 34\.4 GB free: nearly full.*WDDM"):
+                timing.check_disturbed("a", disturbed, 0.25, key="round_ms")
+        with patch.object(host, "device_memory", return_value={"free_bytes": 8 * 2**30, "total_bytes": 32 * 2**30}):
+            with self.assertRaises(timing.Disturbed) as caught:
+                timing.check_disturbed("a", disturbed, 0.25, key="round_ms")
+            self.assertNotIn("nearly full", str(caught.exception))
+            # A quiet host points at the engine itself; a busy one names both causes.
+            with self.assertRaisesRegex(timing.Disturbed, "1.2 CPU cores busy; the host was quiet.*engine itself"):
+                timing.check_disturbed("a", disturbed, 0.25, other_cores=1.2, key="round_ms")
+            with self.assertRaisesRegex(timing.Disturbed, "the device was disturbed, or the engine varies on its own"):
+                timing.check_disturbed("a", disturbed, 0.25, other_cores=4.0, key="round_ms")
+
         class Served(Engine):
             """Behind a server: seed 3's reply ends early at a tool call, its few passes streamed slowly."""
             def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
@@ -1437,7 +1554,7 @@ class SampledSpeedTests(unittest.TestCase):
             cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--no-adaptive-sampled"])
             self.assertFalse(parsed["adaptive_sampled"])
         # A sampled decode repeated adaptively compares only with one repeated the same way.
-        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.2.0",
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.3.0",
                "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
                                  "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
         before = copy.deepcopy(now)
@@ -1922,6 +2039,26 @@ class ContextTests(unittest.TestCase):
             self.assertIsNone(value["tokens"])
             self.assertIn("free device memory (re-run crit eval probe)", value["missing"])
 
+    def test_a_companion_drafter_is_kept_out_of_the_kv_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for name in ("target", "drafter"):
+                (Path(directory) / name).mkdir()
+            model = safetensors_model(Path(directory) / "target", SHAPES, DENSE)
+            # A DFlash-style drafter: its layers and fc, the target's head for its logits, an embedding left out.
+            drafter = safetensors_model(Path(directory) / "drafter", {"layers.0.fc.weight": (64, 64 * 50),
+                                                                      "embed_tokens.weight": (1000, 64)}, {})
+            found = context.companion_drafter_bytes(drafter, model)
+            self.assertEqual(found, {"weight_bytes": 64 * 64 * 50 * 2, "pass_bytes": 64 * 64 * 50 * 2 + 1000 * 64 * 2})
+            device = {"device": "fixture gpu", "memory_free_bytes": self.overhead + RESIDENT + 32 * 20000}
+            value = context.max_context(model, device, context.GIB, self.settings, drafters=[drafter])
+            # 409,600 drafter bytes leave 32 x 7,200 for the cache: 7,168 tokens at the 1,024 granularity
+            self.assertEqual((value["tokens"], value["bound"]), (7168, "device"))
+            self.assertEqual(value["basis"]["companion_drafter_bytes"], 64 * 64 * 50 * 2)
+            self.assertIn("companion drafters", context.render(value))
+            value = context.max_context(model, device, context.GIB, self.settings, drafters=[Path(directory) / "none"])
+            self.assertIsNone(value["tokens"])
+            self.assertTrue(any("companion drafter" in row for row in value["missing"]))
+
     def test_the_requested_context_caps_the_max_context_and_says_when_it_cannot_be_served(self):
         import crit_eval
         self.assertEqual(crit_eval.DEFAULT_CONTEXT_TOKENS, 262144)
@@ -1946,6 +2083,49 @@ class ContextTests(unittest.TestCase):
                                                basis={"requested": 262144, "bound": "model", "note": "clamped"})
             self.assertEqual((given["tokens"], given["source"], given["requested"], given["bound"]),
                              (8192, "given", 262144, "model"))
+
+    def test_placement_names_the_scenario_the_tiers_and_each_expert_source_bound(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shapes = {**SHAPES, **{f"model.layers.0.mlp.experts.{i}.up_proj.weight": (128, 64) for i in range(1, 4)}}
+            model = safetensors_model(directory, shapes, {**DENSE, "num_experts": 4, "num_experts_per_tok": 1})
+            expert, ram = 128 * 64 * 2, 2 * context.GIB
+            # The KV cache of 8,192 tokens and one of the four experts fit the device; three experts stay off it.
+            rates = {"bandwidth_gbs": 1000, "host_memory_gbs": {"read": 50},
+                     "host_to_device_gbs": {"pinned": {"1048576": 10, "268435456": 25}}}
+            device = {**rates, "memory_free_bytes": self.overhead + RESIDENT + 32 * 8192 + expert,
+                      "host_memory_total_bytes": ram + 10 ** 9}
+            found = context.placement(model, device, context.GIB, ram, self.settings, 8192)
+            self.assertEqual((found["scenario"], found["number"]), ("sparse_device_host", 2))
+            self.assertEqual((found["bytes"]["experts_on_device"], found["bytes"]["experts_off_device"]), (expert, 3 * expert))
+            self.assertEqual(found["lookup_tables"], {"bytes": 1000 * 64 * 2, "tier": "host"})
+            self.assertEqual((found["active_expert_bytes_per_token"], found["missed_expert_bytes_per_token"]),
+                             (expert, 3 * expert // 4))
+            self.assertEqual(found["rates_gbs"]["link"], 25)   # pinned copies at the largest size timed
+            floors = found["plain_pass_floor_ms"]
+            self.assertAlmostEqual(floors["device"], (RESIDENT + expert) / 1e9)
+            self.assertAlmostEqual(floors["link"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 25e6))
+            self.assertAlmostEqual(floors["cpu"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 50e6))
+            self.assertIn("misses computed on the CPU", context.render_placement(found))
+            # Host memory that holds the experts but not the tables puts the tables on disk; less, the experts too.
+            device["host_memory_total_bytes"] = ram + 3 * expert
+            found = context.placement(model, device, context.GIB, ram, self.settings, 8192)
+            self.assertEqual((found["scenario"], found["lookup_tables"]["tier"]), ("sparse_device_host", "disk"))
+            self.assertIn("no read-ahead", context.render_placement(found))
+            device["host_memory_total_bytes"] = ram + expert
+            self.assertEqual(context.placement(model, device, context.GIB, ram, self.settings, 8192)["scenario"],
+                             "sparse_device_host_disk")
+            # Every expert and the tables on the device; then weights read every pass that do not fit it.
+            roomy = {**device, "memory_free_bytes": device["memory_free_bytes"] + 3 * expert + 1000 * 64 * 2}
+            found = context.placement(model, roomy, context.GIB, ram, self.settings, 8192)
+            self.assertEqual((found["scenario"], found["number"], found["lookup_tables"]["tier"]), ("fits_device", 1, "device"))
+            self.assertEqual(found["missed_expert_bytes_per_token"], 0)
+            self.assertNotIn("link", found["plain_pass_floor_ms"])
+            tight = {**device, "memory_free_bytes": self.overhead + RESIDENT - 1, "host_memory_total_bytes": ram + 10 ** 9}
+            found = context.placement(model, tight, context.GIB, ram, self.settings, 8192)
+            self.assertEqual((found["scenario"], found["number"]), ("dense_device_host", 5))
+            tight["host_memory_total_bytes"] = ram + RESIDENT
+            self.assertEqual(context.placement(model, tight, context.GIB, ram, self.settings, 8192)["scenario"], "beyond_host")
+            self.assertIsNone(context.placement(model, {}, context.GIB, ram, self.settings, 8192))
 
     def test_a_pass_reads_the_resident_weights_and_the_routed_experts_share(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2037,6 +2217,25 @@ class ContextTests(unittest.TestCase):
         del at_lower["cases"]["a"]
         out = long_context.compare_lower(at_max, at_lower, 2048, self.settings)
         self.assertEqual((out["unmeasured"], out["passed"]), (["a"], False))
+
+    def test_a_later_first_token_names_where_the_time_went(self):
+        from crit_eval.reports import status
+
+        def case(ttft, engine):
+            return {"status": "measured", "decode_tps": 100.0, "ttft_ms": ttft,
+                    "samples": [{"warmup": False, "decode_tps": 100.0, "ttft_ms": ttft, "prefill_ms": engine}] * 2}
+        at_max = {"cases": {"code": case(70.0, 25.0)}}
+        out = long_context.compare_lower(at_max, {"cases": {"code": case(78.0, 25.5)}}, 65536, self.settings)
+        row = out["cases"]["code"]
+        self.assertEqual((row["engine_ttft_ms"], row["outside_engine_ms_at_required"]), (25.5, 45.0))
+        detail = status._ttft_split(row)
+        self.assertIn("engine 25.0 -> 25.5 ms, outside the engine 45.0 -> 52.5 ms", detail)
+        self.assertIn("mostly outside the engine", detail)
+        row = long_context.compare_lower(at_max, {"cases": {"code": case(78.0, 33.0)}}, 65536, self.settings)["cases"]["code"]
+        self.assertIn("mostly in the engine", status._ttft_split(row))
+        no_timing = {"status": "measured", "decode_tps": 100.0, "ttft_ms": 78.0, "samples": []}
+        row = long_context.compare_lower(at_max, {"cases": {"code": no_timing}}, 65536, self.settings)["cases"]["code"]
+        self.assertEqual(status._ttft_split(row), "")
 
     def run_mock(self, directory, context_tokens, model="unused-model", device=None, **config):
         data = Path(directory)
@@ -2271,13 +2470,13 @@ class QualityTests(unittest.TestCase):
             return {"tokens": tokens, "logprobs": [r["logprob"] for r in rows], "top": [r["top"] for r in rows]}
 
     def measure(self, engine, thresholds=None, max_context=10_000, honesty_sets=("conversations", "long-600"),
-                spread=None):
+                spread=None, allowance=None):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         protocol["quality"]["honesty"] = dict(protocol["quality"]["honesty"], sets=list(honesty_sets))
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
         quality = quality_checks.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
-                                     lambda message: None, self.reference(texts), thresholds, spread)
+                                     lambda message: None, self.reference(texts), thresholds, spread, allowance)
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
                   "protocol": protocol["protocol"], "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
         return result, status.build(result, protocol)
@@ -2391,8 +2590,9 @@ class QualityTests(unittest.TestCase):
         self.assertNotIn("attribution", plain["quality"])   # only on request
         text = status.render(result["status"])
         self.assertIn("drift attribution (share of the budget each exact variant takes away", text)
-        self.assertIn(f"all exact conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact), "
-                      f"conversations/served {base:+.0%} (0% with it exact); half", text)
+        # The prompt positions' share leaves out their perplexity ratio (protocol quality.prompt_perplexity).
+        self.assertIn(f"all exact conversations/served {base:+.0%} (0% with it exact), "
+                      f"conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact); half", text)
         missing = quality_checks.run_attribution(None, None, {}, {}, runner.load_json(runner.EVAL_DIR / "protocol.json"),
                                          lambda m: None, None, {}, None, result["quality"], None)
         self.assertEqual(missing["status"], "unmeasured")
@@ -2450,6 +2650,38 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("judged against the reference's own spread: long-600/prompt", self.gate(current)["detail"])
 
+    def test_as_quantized_widens_a_set_to_margin_times_the_checkpoints_own_quantization_drift(self):
+        # protocol quality.allowance: the exact scores, each set's limits raised to margin times how far the
+        # checkpoint run with its own activation quantization lands from them; a set it does not exceed keeps its
+        # limits, and the prompt positions keep no perplexity limit.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        margin = protocol["quality"]["allowance"]["margin"]
+        engine = self.Engine(self, drift_from=520, shift=0.6)
+        failing = self.measure(engine)[0]["quality"]["sets"]["long-600/served"]
+        self.assertFalse(failing["passed"])
+        self.assertLess(failing["kld_mean"], protocol["quality"]["allowance"]["cap"]["kld_mean_max"])
+        own = {name: {"kld_mean": failing["kld_mean"] / margin * 1.01, "kld_p99": failing["kld_p99"] / margin * 1.01,
+                      "ppl_ratio": 1 + (failing["ppl_ratio"] - 1) / margin * 1.01}
+               for name in ("long-600/served", "long-600/prompt")}
+        own["conversations/served"] = {"kld_mean": 1e-4, "kld_p99": 1e-3, "ppl_ratio": 1.0001}
+        own["conversations/prompt"] = {"kld_mean": 10.0, "kld_p99": 100.0, "ppl_ratio": 9.0}   # a format carried badly
+        result, current = self.measure(self.Engine(self, drift_from=520, shift=0.6), allowance=own)
+        sets = result["quality"]["sets"]
+        self.assertTrue(sets["long-600/served"]["passed"] and sets["long-600/prompt"]["passed"])
+        self.assertIn("kld_mean_max", sets["long-600/served"]["allowance_raised"])
+        self.assertAlmostEqual(sets["long-600/served"]["limits"]["kld_mean_max"], margin * own["long-600/served"]["kld_mean"])
+        self.assertEqual(sets["long-600/served"]["allowance"], own["long-600/served"])
+        self.assertNotIn("ppl_ratio_max", sets["long-600/prompt"]["allowance_raised"])
+        self.assertNotIn("allowance_raised", sets["conversations/served"])   # below the budget: limits as they are
+        # The raise stops at the cap (protocol quality.allowance.cap), however far the checkpoint itself drifts.
+        cap = protocol["quality"]["allowance"]["cap"]
+        self.assertEqual(sets["conversations/prompt"]["limits"],
+                         {"kld_mean_max": cap["kld_mean_max"], "kld_p99_max": cap["kld_p99_max"]})
+        self.assertEqual(self.gate(current)["state"], "pass")
+        self.assertIn("judged with the checkpoint's own quantization drift as allowance: conversations/prompt "
+                      "(kld_mean <= 0.4, kld_p99 <= 4), long-600/prompt",
+                      self.gate(current)["detail"])
+
     def test_drift_in_the_prefill_alone_fails_the_prompt_positions(self):
         # A prefill that drifts while decode does not: every reply's first token comes from that arithmetic.
         result, current = self.measure(self.Engine(self, drift_from=520, shift=2.0, prompt_only=True))
@@ -2460,6 +2692,38 @@ class QualityTests(unittest.TestCase):
         gate = self.gate(current)
         self.assertEqual(gate["state"], "fail")
         self.assertIn("long-600/prompt: ", gate["detail"])
+
+    def test_the_prompt_positions_report_their_perplexity_ratio_without_judging_it(self):
+        # protocol quality.prompt_perplexity: the prompt positions are judged by KLD alone.
+        result, current = self.measure(self.Engine(self, drift_from=520, shift=2.0, prompt_only=True),
+                                       spread={"long-600/prompt": {"kld_mean": 5.0, "kld_p99": 20.0, "ppl_ratio": 1.0}})
+        prompt = result["quality"]["sets"]["long-600/prompt"]
+        self.assertNotIn("ppl_ratio_max", prompt["limits"])
+        self.assertGreater(prompt["ppl_ratio"], 1.05)
+        self.assertTrue(prompt["passed"])
+        self.assertIn("ppl_ratio_max", result["quality"]["sets"]["long-600/served"]["limits"])
+
+    def test_a_stored_result_is_judged_again_by_todays_rules(self):
+        # A result measured when prompt positions were judged on their perplexity ratio: its status today drops it.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        limits = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
+        prompt = {"ppl_ratio": 1.24, "kld_mean": 0.01, "kld_p99": 0.2, "passed": False, "limits": limits,
+                  "failures": ["ppl_ratio 1.24 > 1.05"], "budget_used": 4.8}
+        served = {"ppl_ratio": 0.99, "kld_mean": 0.01, "kld_p99": 0.1, "passed": True, "limits": limits, "failures": [],
+                  "budget_used": 0.2}
+        quality = {"status": "scored", "passed": False, "sets": {"long-600/prompt": prompt, "long-600/served": served},
+                   "honesty": {"passed": True, "max_abs_logprob_diff": 0.0}}
+        again = status._rejudged(quality, protocol)
+        self.assertTrue(again["passed"])
+        self.assertEqual(again["sets"]["long-600/prompt"]["rejudged"], protocol["protocol"])
+        self.assertNotIn("ppl_ratio_max", again["sets"]["long-600/prompt"]["limits"])
+        self.assertNotIn("rejudged", again["sets"]["long-600/served"])
+        gate = status._quality_gate({"quality": again})
+        self.assertEqual(gate["state"], "pass")
+        self.assertIn("judged again by " + protocol["protocol"] + ": long-600/prompt", gate["detail"])
+        # Over the KLD limits it still fails.
+        worse = {**quality, "sets": {**quality["sets"], "long-600/prompt": {**prompt, "kld_mean": 0.2}}}
+        self.assertFalse(status._rejudged(worse, protocol)["passed"])
 
     def test_drift_in_the_decode_path_fails_the_served_positions(self):
         result, _ = self.measure(self.Engine(self, decode_drift=0.4))
@@ -2913,6 +3177,59 @@ class ReferenceTests(unittest.TestCase):
             self.assertEqual((again["method"], again["spread"]), ("stored", "stored"))
             self.assertEqual(reference.store_texts(ref, texts, 4, None, data, "m", log=lambda m: None, layout=layout,
                                                    spread={**rule, "from_tokens": 1000})["spread"], "none")
+
+    def test_a_tiny_spread_on_the_short_texts_skips_the_long_texts_second_run(self):
+        # protocol quality.spread.probe: the texts below below_tokens run first; a spread far below the level that
+        # would raise a limit leaves the longer texts unscored (their sets judged against the budget alone), and
+        # one that is not tiny scores them too.
+        import torch
+        from unittest import mock
+        from crit_eval.quality import fixed, reference
+        torch.manual_seed(7)
+        texts = {"a@150": (torch.randint(2, 128, (150,)).tolist(), False), "b": (torch.randint(2, 128, (37,)).tolist(), False)}
+        layout = {"a@150": ("long-150", 100), "b": ("conversations", 20)}
+        rule = {"from_tokens": 0, "perturbation": "tf32", "factor": 2, "probe": {"below_tokens": 100, "margin": 20}}
+        budget = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
+        name, model = next(self.tiny_models())
+        with tempfile.TemporaryDirectory() as folder:
+            model.float().eval().save_pretrained(folder)
+            ref = reference.StreamingReference(folder, "cpu")
+            identity = {**ref.identity("m"), **fixed.identity(texts, 4, None)}
+            expected = {**identity, "spread_perturbation": "tf32", "spread_texts": ["a@150", "b"]}
+            with tempfile.TemporaryDirectory() as data:
+                scored = []
+                score = ref.score_texts
+                with mock.patch.object(ref, "score_texts", lambda texts, *a, **k: scored.append(len(texts)) or
+                                       score(texts, *a, **k)):
+                    how = reference.store_texts(ref, texts, 4, None, data, "m", log=lambda m: None, spread=rule,
+                                                layout=layout, budget=budget)
+                self.assertEqual((how["spread"], scored), ("probed", [2, 1]))   # the scores, then b's spread alone
+                spread = fixed.load_spread(data, expected)   # what a run asks for (quality_checks.stored_spread)
+                self.assertEqual(sorted(spread), ["conversations/prompt", "conversations/served"])
+                stored = json.loads((Path(data) / fixed.STORE / fixed.SPREAD).read_text())["identity"]
+                self.assertEqual(stored["spread_skipped"], ["a@150"])
+                again = reference.store_texts(ref, texts, 4, None, data, "m", log=lambda m: None, spread=rule,
+                                              layout=layout, budget=budget)
+                self.assertEqual(again["spread"], "stored")
+            with tempfile.TemporaryDirectory() as data, mock.patch.object(reference, "_spread_tiny", return_value=False):
+                how = reference.store_texts(ref, texts, 4, None, data, "m", log=lambda m: None, spread=rule,
+                                            layout=layout, budget=budget)
+                self.assertEqual(how["spread"], "scored")
+                self.assertEqual(sorted(fixed.load_spread(data, expected)),
+                                 ["conversations/prompt", "conversations/served", "long-150/prompt", "long-150/served"])
+            with tempfile.TemporaryDirectory() as data:   # without a budget there is nothing to probe against
+                self.assertEqual(reference.store_texts(ref, texts, 4, None, data, "m", log=lambda m: None, spread=rule,
+                                                       layout=layout)["spread"], "scored")
+
+    def test_a_spread_is_tiny_only_below_the_margin_on_every_set(self):
+        from crit_eval.quality.reference import _spread_tiny
+        budget = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
+        row = {"kld_mean": 1e-4, "kld_p99": 1e-3, "ppl_ratio": 1.0001}
+        self.assertTrue(_spread_tiny({"x/prompt": row, "x/served": row}, budget, 2, 20))
+        self.assertFalse(_spread_tiny({"x/prompt": {**row, "kld_mean": 2e-3}}, budget, 2, 20))   # 0.05 / 40 = 1.25e-3
+        self.assertFalse(_spread_tiny({"x/served": {**row, "kld_p99": 2e-2}}, budget, 2, 20))
+        self.assertFalse(_spread_tiny({"x/served": {**row, "ppl_ratio": 0.997}}, budget, 2, 20))
+        self.assertTrue(_spread_tiny({"x/prompt": {**row, "ppl_ratio": 0.5}}, budget, 2, 20))   # prompt PPL not judged
 
     def test_experts_decoded_one_at_a_time_give_the_same_rows(self):
         # A fused experts parameter too large for the device is decoded expert by expert as the eager loop reads

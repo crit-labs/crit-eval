@@ -3,9 +3,9 @@ every crit-eval of that checkpoint, so a run needs only the engine (`crit eval p
 
 A package source is a folder or an HTTPS base URL (a Hugging Face dataset's `resolve/main/`, say) holding
 packages.json and one folder per package, named by the first 16 hex digits of the model's and the suite's sha256:
-prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with reference-as-quantized/ when the data holds
-the as_quantized quality mode's scores too, each store with the reference's own spread (spread.json) when the data
-holds it. packages.json lists each package with the
+prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with the reference's own spread
+(spread.json) and the as_quantized quality mode's allowance (allowance.json) when the data holds them. packages.json
+lists each package with the
 identities it was made under (model_sha256, suite_sha256, protocol, reference version) and the sha256 of every file,
 which fetch checks before it writes anything into the data. The scores do not depend on the device that computed
 them beyond rounding far below the drift budget, and a run reads them under the model, the suite and the reference
@@ -52,22 +52,13 @@ def pack(data, packages):
             prepared["model"]["sha256"]:
         raise SystemExit(f"{data}: its reference scores are not this crit's reference of the prepared model")
     files = ["prepared.json", f"{fixed.STORE}/index.json"] + [f"{fixed.STORE}/{f}" for f, _ in stored["files"].values()]
-    scores = {fixed.STORE: stored["identity"]}
-    for mode, store in fixed.STORES.items():
-        other = data / store / "index.json"
-        if store == fixed.STORE or not other.is_file():
-            continue
-        scored = load_json(other)
-        if scored["identity"].get("reference") == REFERENCE_VERSION and scored["identity"].get("quality_mode") == mode \
-                and scored["identity"].get("model_sha256") == prepared["model"]["sha256"]:
-            files += [f"{store}/index.json"] + [f"{store}/{f}" for f, _ in scored["files"].values()]
-            scores[store] = scored["identity"]
-    # Each store's own spread (reference.store_spread), when it was scored for that store's scores.
-    for store, identity in scores.items():
-        spread = data / store / fixed.SPREAD
-        if spread.is_file() and all((load_json(spread).get("identity") or {}).get(key) == value
-                                    for key, value in identity.items()):
-            files.append(f"{store}/{fixed.SPREAD}")
+    # The scores' own spread (reference.store_spread) and allowance (reference.store_allowance), when they were
+    # measured against these scores.
+    for extra in (fixed.SPREAD, fixed.ALLOWANCE):
+        path = data / fixed.STORE / extra
+        if path.is_file() and all((load_json(path).get("identity") or {}).get(key) == value
+                                  for key, value in stored["identity"].items()):
+            files.append(f"{fixed.STORE}/{extra}")
     key = name(prepared["model"]["sha256"], prepared["suite_sha256"])
     target = packages / key
     shutil.rmtree(target, ignore_errors=True)
@@ -151,8 +142,8 @@ def fetch(model, data, source, log=print, chat_template=None):
             (staging / relative).parent.mkdir(parents=True, exist_ok=True)
             (staging / relative).write_bytes(raw)
         data.mkdir(parents=True, exist_ok=True)
-        from .fixed import STORES
-        for store in STORES.values():
+        from .fixed import LEGACY_AS_QUANTIZED, STORE
+        for store in (STORE, LEGACY_AS_QUANTIZED):
             shutil.rmtree(data / store, ignore_errors=True)
         for relative in entry["files"]:
             (data / relative).parent.mkdir(parents=True, exist_ok=True)

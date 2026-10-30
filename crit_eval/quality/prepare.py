@@ -196,6 +196,23 @@ def token_ids(model, text):
     return model.tokenizer.encode(text, add_special_tokens=False, split_special_tokens=False)
 
 
+def piece_ids(model, text):
+    """Token ids of text that follows other text in a render (a document, a template's tail, an answer, a fact), as
+    encoding the whole render gives them: tokenizers that mark the start of their input (Metaspace with
+    prepend_scheme "first", as SentencePiece-style Llama tokenizers ship) prepend a word marker to a piece encoded on
+    its own, which the whole render has only at its start. The piece is encoded after one of the tokenizer's special
+    tokens, which ends the start of the input and merges with nothing, and that token's ids are dropped."""
+    special = sorted(getattr(model.tokenizer, "special_ids", ()) or ())
+    if not special:
+        return token_ids(model, text)
+    marker = model.tokenizer.added_tokens[special[0]].content
+    lead = token_ids(model, marker)
+    ids = token_ids(model, marker + text)
+    if ids[:len(lead)] != lead:
+        raise ValueError("the tokenizer does not encode its special token on its own")
+    return ids[len(lead):]
+
+
 def speed_messages(case, document=None):
     """The case's messages with content_file entries read from the suite and its tool definitions.
     document, when given, replaces {document} in the inline message contents (not in file contents)."""
@@ -214,7 +231,7 @@ def speed_messages(case, document=None):
 def document_frame(model, messages, tools=None):
     """A generation prompt around a document: the token ids before and after SENTINEL in the messages' render."""
     head, tail = chat_text(model, messages, True, tools).split(SENTINEL)
-    return token_ids(model, head), token_ids(model, tail)
+    return token_ids(model, head), piece_ids(model, tail)
 
 
 def with_document(messages, document):
@@ -234,7 +251,7 @@ def speed_prompt(model, case):
     head_ids, tail_ids = document_frame(model, messages, tools)
     document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
     need = case["prompt_tokens"] - len(head_ids) - len(tail_ids)
-    document_ids = token_ids(model, document)
+    document_ids = piece_ids(model, document)
     if need <= 0 or len(document_ids) < need:
         raise ValueError(f"{case['id']}: document has {len(document_ids)} tokens, needs {need}")
     return (head_ids + document_ids[:need] + tail_ids, with_document(messages, model.tokenizer.decode(document_ids[:need])),
@@ -275,7 +292,7 @@ def speed_entry(model, case, output_tokens):
 
 def filler_ids(model, long):
     """The long-prompt filler: the suite files long.json names, joined by blank lines, as token ids."""
-    return token_ids(model, "\n\n".join((SUITE_DIR / name).read_text(encoding="utf-8") for name in long["filler"]))
+    return piece_ids(model, "\n\n".join((SUITE_DIR / name).read_text(encoding="utf-8") for name in long["filler"]))
 
 
 def repeated(ids, length):
@@ -288,7 +305,7 @@ def quality_prompt(model, prompt_id, set_name, messages, continuation, tokens):
     """A quality text: the conversation's generation prompt (prompt_ids, and its messages for a server), followed by
     its written answer encoded as the model's tokens, cut to `tokens` (continuation_ids)."""
     return {"id": prompt_id, "set": set_name, "prompt_ids": prompt_ids(model, messages),
-            "continuation_ids": token_ids(model, continuation)[:tokens], "messages": api_messages(messages)}
+            "continuation_ids": piece_ids(model, continuation)[:tokens], "messages": api_messages(messages)}
 
 
 def long_quality_messages(model, conversation, preamble, filler, prompt_tokens):
@@ -357,7 +374,7 @@ def retrieval_pieces(model, long, filler):
                          "prompts with another start")
     return {"head_ids": head_ids, "tail_ids": tail_ids, "messages": retrieval_messages(rule), "filler_ids": list(filler),
             "curve_tail_ids": curve_tail, "curve_messages": api_messages(retrieval_messages(rule, "curve_user")),
-            "facts": [{"id": f["id"], "answer": f["answer"], "ids": token_ids(model, "\n\n" + f["text"] + "\n\n")}
+            "facts": [{"id": f["id"], "answer": f["answer"], "ids": piece_ids(model, "\n\n" + f["text"] + "\n\n")}
                       for f in rule["facts"]],
             "token_text": token_strings(model, model.tokenizer.vocab_size)}
 

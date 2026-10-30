@@ -625,6 +625,9 @@ class ChatServerTests(unittest.TestCase):
             def identity(self, model_sha):
                 return {"model_sha256": model_sha, "reference": reference.REFERENCE_VERSION}
 
+            def declared_activations(self):
+                return []   # plain weights: an empty as_quantized allowance, no second pass
+
             def score_texts(self, found, top_k, valid_vocab, scratch, log, long, check):
                 # Rows as the real reference returns them, tensors store_texts reads with tolist(), without torch.
                 class Rows(list):
@@ -640,9 +643,9 @@ class ChatServerTests(unittest.TestCase):
                 reference.score_data("other", self.data, log=lambda m: None)
             how = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((how["method"], how["positions"]), ("scored", sum(len(i) - 1 for i, _ in texts.values())))
-            self.assertEqual(how["spread"], "scored")
+            self.assertEqual((how["spread"], how["allowance"]), ("scored", "none"))
             again = reference.score_data("source", self.data, log=lambda m: None)
-            self.assertEqual((again["method"], again["spread"]), ("stored", "stored"))
+            self.assertEqual((again["method"], again["spread"], again["allowance"]), ("stored", "stored", "stored"))
         prepared = json.loads((self.data / "prepared.json").read_text())
         stored = fixed.load(self.data, {"model_sha256": "model", **fixed.identity(texts, 16, prepared["valid_vocab"])})
         self.assertEqual(set(stored), {"tides", "tides@3000", "tides@5000"})

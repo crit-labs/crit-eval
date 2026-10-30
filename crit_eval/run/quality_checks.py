@@ -74,24 +74,28 @@ def stored_spread(data, prepared, protocol, reference_identity, store=fixed.STOR
                                     "spread_texts": texts}, store)
 
 
-def set_limits(thresholds, spread, factor):
+def set_limits(thresholds, spread, factor, cap=None):
     """A set's drift limits (quality_thresholds) raised to `factor` times the reference's own spread on it
-    (protocol quality.spread): kld_mean_max and kld_p99_max to factor times the spread's, ppl_ratio_max to 1 plus
-    factor times the spread ratio's distance from 1. Returns (limits, the keys raised)."""
+    (protocol quality.spread), or the as_quantized allowance (protocol quality.allowance): kld_mean_max and
+    kld_p99_max to factor times the spread's, ppl_ratio_max to 1 plus factor times the spread ratio's distance from 1,
+    each raise stopping at cap's value for that limit when cap names one. Returns (limits, the keys raised)."""
     if not spread:
         return dict(thresholds), []
+    cap = cap or {}
     limits, raised = dict(thresholds), []
     for key, name in (("kld_mean_max", "kld_mean"), ("kld_p99_max", "kld_p99")):
-        if key in limits and spread.get(name) is not None and factor * spread[name] > limits[key]:
-            limits[key], raised = factor * spread[name], raised + [key]
+        if key in limits and spread.get(name) is not None:
+            value = min(factor * spread[name], cap.get(key, float("inf")))
+            if value > limits[key]:
+                limits[key], raised = value, raised + [key]
     if "ppl_ratio_max" in limits and spread.get("ppl_ratio") is not None:
-        from_spread = 1.0 + factor * abs(spread["ppl_ratio"] - 1.0)
+        from_spread = min(1.0 + factor * abs(spread["ppl_ratio"] - 1.0), cap.get("ppl_ratio_max", float("inf")))
         if from_spread > limits["ppl_ratio_max"]:
             limits["ppl_ratio_max"], raised = from_spread, raised + ["ppl_ratio_max"]
     return limits, raised
 
 
-def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None):
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, allowance=None):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.run.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.quality.fixed.load, None when the data has none). Each set is judged on
@@ -101,7 +105,10 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     Then the honesty check (run_honesty). A set whose texts do not fit the engine's max_context is skipped. Sets
     are scored in the prepared order and judged as each completes; a set far over the budget (clearly_failed) stops
     the scoring, and the result says so (stopped_early). spread: the reference's own spread per set and path
-    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits)."""
+    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). allowance (quality mode
+    as_quantized): how far the checkpoint run with its own activation quantization lands from the reference per set
+    and path (fixed.load_allowance), which raises a set's limits to protocol quality.allowance.margin times it where
+    that exceeds them, at most to quality.allowance.cap."""
     rule = protocol["quality"]
     # A served engine scores through the paths it serves with; an in-process adapter's score() is development evidence:
     # reported, never a gate result (protocol quality.development).
@@ -119,8 +126,8 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if reference is None:
         log("quality: not measured (no reference scores for this data)")
         return {**out, "status": "unsupported",
-                "reason": "the data holds no reference scores for this quality mode: run crit eval reference "
-                          "--model --data (with the run's --quality-mode) first"}
+                "reason": "the data holds no reference scores (or, for quality mode as_quantized, no allowance "
+                          "measured with them): run crit eval reference --model --data first"}
     started, skipped, parts, labels, timings = time.time(), {}, {}, {}, []
     sets, buckets, judged, stopped = {}, {}, 0.0, None
     order = list(dict.fromkeys(text["set"] for text in prepared["quality"]))
@@ -159,6 +166,17 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             row = metrics.text_quality(reference_rows, found)
             limits, raised = set_limits(thresholds, (spread or {}).get(name), float(rule["spread"]["factor"])
                                         if rule.get("spread") else 0.0)
+            allowed = []
+            if allowance is not None:
+                # protocol quality.allowance: the checkpoint's own quantization drift, times the margin, capped.
+                limits, allowed = set_limits(limits, allowance.get(name), float(rule["allowance"]["margin"]),
+                                             rule["allowance"].get("cap"))
+            if name.endswith("/prompt"):
+                # protocol quality.prompt_perplexity: reported, not judged on the prompt positions.
+                limits.pop("ppl_ratio_max", None)
+                raised = [key for key in raised if key != "ppl_ratio_max"]
+                allowed = [key for key in allowed if key != "ppl_ratio_max"]
+            raised = [key for key in raised if key not in allowed]   # the larger raise names the limit
             failures = metrics.judge(row, limits)
             # The share's dependence on the positions the set holds (protocol quality.position_spread): reported.
             noise = rule.get("position_spread") or {}
@@ -167,10 +185,14 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
                           "budget_used": metrics.budget_used(row, limits), "limits": limits,
                           **({"budget_spread": spread_found} if spread_found else {}),
-                          **({"reference_spread": spread[name], "raised": raised} if raised else {})}
+                          **({"reference_spread": spread[name], "raised": raised} if raised else {}),
+                          **({"allowance": allowance[name], "allowance_raised": allowed} if allowed else {})}
             if raised:
                 log(f"quality {name}: judged against the reference's own spread, "
                     + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in raised))
+            if allowed:
+                log(f"quality {name}: judged with the checkpoint's own quantization drift as allowance, "
+                    + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in allowed))
             buckets[name] = {label: {key: value[key] for key in ("targets", "ppl_ratio", "kld_mean", "kld_p99",
                                                                   "top1_agreement")}
                              for label, value in metrics.bucketed(reference_rows, found, labels[name]).items()}
@@ -196,7 +218,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
 
 
 def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
-                    context_tokens=None):
+                    context_tokens=None, allowance=None):
     """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
     exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
     {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
@@ -216,7 +238,7 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
         engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
         try:
             scored = run_quality(engine, info, prepared, protocol, lambda line: log(f"attribution {name}: {line}"),
-                                 reference, thresholds, spread)
+                                 reference, thresholds, spread, allowance)
         finally:
             engine.close()
         sets = {set_name: s["budget_used"] for set_name, s in (scored.get("sets") or {}).items()}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.2.0"
+version = "0.3.0"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
@@ -26,4 +26,4 @@ crit-eval = "crit_eval.cli:main"
 include = ["crit_eval*"]
 
 [tool.setuptools.package-data]
-crit_eval = ["protocol.json", "suite/**/*", "probe/*", "examples/*"]
+crit_eval = ["protocol.json", "suite/**/*", "probe/*", "examples/*", "workbench/harness.py"]

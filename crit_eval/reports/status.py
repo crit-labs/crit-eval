@@ -121,6 +121,15 @@ def _quality_gate(result):
             f"{name} (" + ", ".join(f"{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}"
                                     for k in quality["sets"][name]["raised"]) + ")"
             for name in raised)
+    allowed = [name for name, s in quality["sets"].items() if s.get("allowance_raised")]
+    if allowed:
+        detail += "; judged with the checkpoint's own quantization drift as allowance: " + ", ".join(
+            f"{name} (" + ", ".join(f"{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}"
+                                    for k in quality["sets"][name]["allowance_raised"]) + ")"
+            for name in allowed)
+    rejudged = [name for name, s in quality["sets"].items() if s.get("rejudged")]
+    if rejudged:
+        detail += "; judged again by " + quality["sets"][rejudged[0]]["rejudged"] + ": " + ", ".join(rejudged)
     if development:
         # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).
         return {"name": "quality", "state": "unmeasured",
@@ -222,11 +231,24 @@ def _context_gates(result):
     else:
         rows = lower.get("cases", {})
         parts = [f"{cid} {kind} {rows[cid][kind + '_change']:+.1%} (tolerance {rows[cid][kind + '_tolerance']:.1%})"
-                 + _host_load(rows[cid]) for cid, kinds in lower.get("slower", {}).items() for kind in kinds]
+                 + (_ttft_split(rows[cid]) if kind == "ttft" else "") + _host_load(rows[cid])
+                 for cid, kinds in lower.get("slower", {}).items() for kind in kinds]
         parts += [f"{cid} not measured" for cid in lower.get("unmeasured", [])]
         lowered = {"name": "lower_context", "state": "fail",
                    "detail": f"slower at {lower['context']:,} tokens than at {required:,}: " + "; ".join(parts)}
     return [capacity] + _retrieval_gate(result, required) + [lowered]
+
+
+def _ttft_split(row):
+    """Where a slower first token's time went: the engine's own first token and the time outside it, at both
+    contexts; the larger change names the cause."""
+    if row.get("engine_ttft_ms") is None or row.get("engine_ttft_ms_at_required") is None:
+        return ""
+    engine = row["engine_ttft_ms"] - row["engine_ttft_ms_at_required"]
+    outside = row["outside_engine_ms"] - row["outside_engine_ms_at_required"]
+    cause = "outside the engine (host or server time)" if outside > engine else "in the engine"
+    return (f": engine {row['engine_ttft_ms_at_required']:,.1f} -> {row['engine_ttft_ms']:,.1f} ms, outside the engine "
+            f"{row['outside_engine_ms_at_required']:,.1f} -> {row['outside_engine_ms']:,.1f} ms, mostly {cause}")
 
 
 def _host_load(row):
@@ -318,9 +340,13 @@ def _quality_kpi(quality, thresholds):
         return None
     thresholds = quality.get("thresholds") or thresholds
     sets = quality["sets"]
-    used = max(((metrics.budget_used(s, thresholds), name) for name, s in sets.items()),
+    # A set's own limits where it records them: the prompt positions leave out the perplexity ratio
+    # (protocol quality.prompt_perplexity), so its worst is taken over the sets that judge it.
+    used = max(((metrics.budget_used(s, s.get("limits") or thresholds), name) for name, s in sets.items()),
                key=lambda v: -1 if v[0] is None else v[0])
-    worst = {key: max(((s[key], name) for name, s in sets.items()), key=lambda v: v[0])
+    worst = {key: max(((s[key], name) for name, s in sets.items()
+                       if key != "ppl_ratio" or "ppl_ratio_max" in (s.get("limits") or thresholds)),
+                      key=lambda v: v[0], default=(None, None))
              for key in ("kld_mean", "kld_p99", "ppl_ratio")}
     lowest_top1 = min(((s["top1_agreement"], name) for name, s in sets.items()), key=lambda v: v[0])
     spread = (sets.get(used[1]) or {}).get("budget_spread") or {}
@@ -368,8 +394,9 @@ def _render_mode(p, t, ct):
     """The quality mode the result was judged in, and what the other mode's limits are: the trade, stated once."""
     mode = p.get("quality_mode") or "preserve"
     if mode == "as_quantized":
-        return ["  quality mode as_quantized: quality judged against the checkpoint run as quantized (its own "
-                "activation quantization); prefill and first-token limits at its stored format"]
+        return ["  quality mode as_quantized: quality judged against the checkpoint's exact activations with each "
+                "set's budget widened by its own activation quantization's drift (protocol quality.allowance); "
+                "prefill and first-token limits at its stored format"]
     if p.get("ceiling_activations") in (None, "stored") or not p.get("stored_ceiling"):
         return ["  quality mode preserve: quality judged against the checkpoint's exact activations"]
     trade = f"prefill {p['stored_ceiling']:,.0f} tok/s"
@@ -541,7 +568,32 @@ def _context_kpi(result):
                                                 "ttft_score_ms_at_required")} if lower.get("context") else None}
 
 
+def _rejudged(quality, protocol):
+    """A stored quality result judged again by this protocol's rules (the drift budget the run measured with stays):
+    a set's prompt positions without the perplexity ratio (protocol quality.prompt_perplexity), so a status rendered
+    later from an older result gives the verdict a measurement today would. Sets whose verdict changes say so
+    (rejudged)."""
+    if not quality or quality.get("status") != "scored" or "prompt_perplexity" not in protocol["quality"]:
+        return quality
+    sets = {}
+    for name, s in quality["sets"].items():
+        if name.endswith("/prompt") and "ppl_ratio_max" in (s.get("limits") or {}):
+            limits = {k: v for k, v in s["limits"].items() if k != "ppl_ratio_max"}
+            failures = metrics.judge(s, limits)
+            s = {**s, "limits": limits, "failures": failures, "passed": not failures,
+                 "budget_used": metrics.budget_used(s, limits), "raised": [k for k in s.get("raised", []) if k in limits],
+                 "allowance_raised": [k for k in s.get("allowance_raised", []) if k in limits],
+                 **({"rejudged": protocol["protocol"]} if (not failures) != s["passed"] else {})}
+            for key in ("raised", "allowance_raised"):
+                if not s[key]:
+                    s.pop(key)
+        sets[name] = s
+    honesty = quality.get("honesty") or {}
+    return {**quality, "sets": sets, "passed": all(s["passed"] for s in sets.values()) and honesty.get("passed") is not False}
+
+
 def build(result, protocol, baseline=None):
+    result = {**result, "quality": _rejudged(result.get("quality"), protocol)} if result.get("quality") else result
     room = result.get("headroom") or {}
     speed = result.get("speed") or {}
     projection = room.get("projection") or {}
@@ -1061,6 +1113,12 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
     if _major(result) != _major(protocol):
         raise SystemExit(f"{path} was measured with {result.get('protocol')}; its status is the one stored in it")
     baseline = load_json(baseline_path) if baseline_path else None
+    # Judged again by today's rules before the prompt activations' evidence is read from them.
+    rejudged = False
+    for value in (result, baseline):
+        if value is not None and value.get("quality"):
+            value["quality"] = _rejudged(value["quality"], protocol)
+            rejudged |= any(s.get("rejudged") for s in value["quality"].get("sets", {}).values())
     if data is not None:
         from ..quality.prepare import PREPARED
         prepared = load_json(Path(data) / PREPARED)
@@ -1069,7 +1127,8 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
         result["ceiling"] = prepared.get("ceiling")
     device = load_json(device_path) if device_path else None
     room = result.get("headroom")
-    if room is not None and (device is not None or data is not None or (result.get("ceiling") and "activations" not in room)):
+    if room is not None and (device is not None or data is not None or (result.get("ceiling") and "activations" not in room)
+                             or (rejudged and result.get("ceiling"))):
         rates, sources = best_rates(device if device is not None else result.get("device"))
         result["headroom"] = headroom.price_prompts(result, rates, sources, protocol["speed"].get("prefill_cases", []),
                                                     [baseline] if baseline else [])

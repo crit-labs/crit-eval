@@ -33,6 +33,8 @@ def _timed(call, prompt, output_tokens, expected=None, keep=()):
         sample["served"] = served
     sample["engine_timing"] = result.get("timing")
     sample["accepted"] = result.get("accepted")
+    if isinstance(result.get("drafted"), list):
+        sample["drafted"] = result["drafted"]
     # Optional engine-measured times: the prefill and the first token from the engine's own clock (what the time to
     # first token holds beyond them is the server's, the tokenizer's, transfer and scheduling), and the decode's time
     # in verify passes and in draft steps (ms, whole request).
@@ -87,22 +89,77 @@ class Disturbed(Exception):
 
 
 DISTURBED_MIN_REQUEST_MS = 100  # shorter requests vary with timer and scheduler jitter, not with the device
+# Other processes' CPU load below which a disturbed case points at the engine itself rather than at the machine.
+QUIET_HOST_CORES = 2.0
 
 
 def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps"):
     """Raise Disturbed when the measured `key` (decode tok/s, or round_ms for sampled repetitions, whose texts and
-    so their tokens per round differ) of one case spreads (max - min over the median) by more than `limit`. Quiet
+    so their tokens per round differ; at the median drafts per round where the rounds' widths vary,
+    width_adjusted_rounds) of one case spreads (max - min over the median) by more than `limit`. Quiet
     rounds recorded at most about 10%; a disturbed one 37%. other_cores: CPU cores other processes kept busy during
     the case (HostLoad), named in the message."""
     measured = [s for s in samples if not s.get("warmup")]
     if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
         return
-    spread = headroom.spread([s[key] for s in measured if s.get(key)])
+    adjusted = width_adjusted_rounds(measured) if key == "round_ms" else None
+    spread = headroom.spread(adjusted if adjusted else [s[key] for s in measured if s.get(key)])
     if spread is not None and spread > limit:
         load = f"; other processes kept {other_cores:.1f} CPU cores busy" if other_cores is not None else ""
-        what = "decode" if key == "decode_tps" else "the time per target pass"
+        what = ("decode" if key == "decode_tps" else
+                "the time per target pass at the drafts each round made" if adjusted else "the time per target pass")
+        if other_cores is not None and other_cores < QUIET_HOST_CORES:
+            cause = ("the host was quiet, so the engine itself is the likely cause: reads of file-backed weights or "
+                     "tables that miss the page cache (read-ahead, page faults), host threads, or expert misses that "
+                     "change between requests. Time the case's repetitions inside the engine before measuring again")
+        else:
+            cause = ("the device was disturbed, or the engine varies on its own (cold reads of file-backed weights or "
+                     "tables, host threads). Measure again when nothing else uses the device; if it varies again on a "
+                     "quiet host, look inside the engine")
         raise Disturbed(f"speed {case_id}: {what} varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
-                        "the device was disturbed. Measure again when nothing else uses it")
+                        + cause + _memory_note())
+
+
+def width_adjusted_rounds(samples):
+    """For an engine whose rounds draft a varying number of tokens (drafted telemetry: an adaptive budget that falls back
+    to plain steps, or a width that follows acceptance), each sample's round_ms at the median drafts per round: its
+    round_ms less slope x (its mean drafts per round - the median), the slope fitted over the samples (least squares,
+    at least 0). A seed's mix of wide rounds and plain steps changes its time per round as its text does, which a
+    disturbance check must not read as the device's. None with fewer than three samples, a sample without drafted
+    counts, or the same mean drafts per round in every sample (round_ms already compares like with like)."""
+    rows = [(sum(s["drafted"]) / len(s["drafted"]), s["round_ms"]) for s in samples
+            if isinstance(s.get("drafted"), list) and s["drafted"] and s.get("round_ms")]
+    if len(rows) < 3 or len(rows) < len(samples):
+        return None
+    widths = [w for w, _ in rows]
+    if max(widths) - min(widths) < 1e-9:
+        return None
+    mean_w, mean_r = sum(widths) / len(rows), sum(r for _, r in rows) / len(rows)
+    slope = max(0.0, sum((w - mean_w) * (r - mean_r) for w, r in rows) / sum((w - mean_w) ** 2 for w in widths))
+    middle = metrics.median(widths)
+    return [r - slope * (w - middle) for w, r in rows]
+
+
+LOW_DEVICE_MEMORY = 1 << 30  # below it a full device may page its memory to the host (WDDM) or stall allocations
+
+
+def _memory_note():
+    """What a Disturbed message adds about the device's memory: its free bytes as nvidia-smi sees them, and when they
+    are below LOW_DEVICE_MEMORY, that the engine's own memory may be the disturbance. Under Windows' WDDM a device
+    past its memory pages to host RAM instead of failing, and the requests slow unevenly as on a shared device."""
+    from .host import device_memory
+    try:
+        found = device_memory()
+    except Exception:   # a probe never fails the run
+        found = None
+    if not found or found.get("free_bytes") is None:
+        return ""
+    free, total = found["free_bytes"], found.get("total_bytes")
+    note = f" (device memory: {free / 1e9:.2f}" + (f" of {total / 1e9:.1f}" if total else "") + " GB free"
+    if free < LOW_DEVICE_MEMORY:
+        return note + (": nearly full, so the engine's own memory may be the disturbance; a device past its memory "
+                       "pages to host RAM under Windows' WDDM and slows unevenly. Check its peak memory first)")
+    return note + ")"
 
 
 SUMMARY_KEYS = ("decode_tps", "prefill_tps", "ttft_ms", "request_ms", "tokens_per_round", "round_ms")
