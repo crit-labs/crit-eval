@@ -9,6 +9,13 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-10-30
+
+### Fixed
+
+- crit-eval installs beside crit-core 0.13 (`crit-core>=0.12.0,<0.14`). crit 0.13.0 ships crit-core 0.13.0, and 0.4.0's
+  `<0.13` bound left the two with no common install; crit-eval uses nothing of crit-core that changed between them.
+
 ## [0.4.0] - 2026-10-30
 
 ### Overview
@@ -328,7 +335,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.4.1...HEAD
+[0.4.1]: https://github.com/crit-labs/crit-eval/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/crit-labs/crit-eval/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/crit-labs/crit-eval/compare/v0.1.2...v0.2.0
