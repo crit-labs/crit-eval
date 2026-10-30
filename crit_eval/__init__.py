@@ -7,7 +7,7 @@ from pathlib import Path
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.
@@ -48,7 +48,7 @@ def checkouts():
 
 
 def machine_settings():
-    """Memory thresholds from settings.toml (vram_headroom_gib, context_reserve_gib), the wanted context
+    """Memory thresholds from settings.toml (vram_headroom_gib, ram_headroom_gib, context_reserve_gib), the wanted context
     (context_tokens) and the reference package source (eval_packages, crit_eval.quality.packages): crit-eval's checkout's,
     else the crit checkout's (checkouts); without one crit-eval uses the protocol's defaults and
     DEFAULT_CONTEXT_TOKENS."""
@@ -57,7 +57,7 @@ def machine_settings():
         return {}
     import tomllib
     value = tomllib.loads(path.read_text(encoding="utf-8"))
-    found = {key: float(value[key]) for key in ("vram_headroom_gib", "context_reserve_gib")
+    found = {key: float(value[key]) for key in ("vram_headroom_gib", "ram_headroom_gib", "context_reserve_gib")
              if isinstance(value.get(key), (int, float)) and not isinstance(value.get(key), bool)}
     if type(value.get("context_tokens")) is int and value["context_tokens"] > 0:
         found["context_tokens"] = value["context_tokens"]

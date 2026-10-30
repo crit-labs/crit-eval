@@ -76,16 +76,48 @@ def decode_suite(result):
     return "greedy", result.get("speed") or {}
 
 
-def pass_floor_ms(bytes_per_pass, bandwidth_gbs):
+def pass_floor_ms(bytes_per_pass, bandwidth_gbs, host=None):
+    """One pass's floor in ms: its bytes over the device bandwidth. With `host` (host_pass), the bytes the engine reads
+    from host memory are priced at their own rates: those copied over the host link at the link's, those its CPU
+    computes from at host memory's, and both together at host memory's (a copy reads the same memory); the pass takes
+    the longest of the device, the link and host memory."""
     if not bytes_per_pass or not bandwidth_gbs:
         return None
-    return bytes_per_pass / (bandwidth_gbs * 1e9) * 1000
+    link, cpu = (host["link"], host["cpu"]) if host else (0, 0)
+    if not host or not host.get("memory_gbs") or (link and not host.get("link_gbs")):
+        # Without the probe's host rates every byte is priced at the device's bandwidth.
+        return bytes_per_pass / (bandwidth_gbs * 1e9) * 1000
+    parts = [max(0, bytes_per_pass - link - cpu) / (bandwidth_gbs * 1e9) * 1000,
+             (link + cpu) / (host["memory_gbs"] * 1e9) * 1000]
+    if link:
+        parts.append(link / (host["link_gbs"] * 1e9) * 1000)
+    return max(parts)
 
 
-def tokens_by_width(accepted, width):
-    """Expected tokens per round for widths 0..width from per-round accepted-draft counts."""
+def host_pass(info, host_rates):
+    """What a pass of an engine that declares `host_bytes_per_pass` ({"link": bytes copied over the host link, "cpu":
+    bytes its CPU computes from host memory}, both part of bytes_per_pass) reads from host memory, with the probe's
+    rates (host_rates: {"link": host-to-device GB/s, "memory": host memory read GB/s}); None when it declares none."""
+    found = info.get("host_bytes_per_pass")
+    if not isinstance(found, dict) or not (found.get("link") or found.get("cpu")):
+        return None
+    rates = host_rates or {}
+    return {"link": found.get("link") or 0, "cpu": found.get("cpu") or 0, "link_gbs": rates.get("link"),
+            "memory_gbs": rates.get("memory")}
+
+
+def tokens_by_width(accepted, width, drafted=None):
+    """Expected tokens per round for widths 0..width from per-round accepted-draft counts. With drafted (the drafts
+    each round made, for an engine whose width varies) each depth's acceptance counts only the rounds that drafted
+    that deep."""
     if not accepted:
         return None
+    if drafted is not None:
+        curve, reach = [1.0], 1.0
+        for rate in conditional_acceptance(accepted, width, drafted):
+            reach *= rate
+            curve.append(curve[-1] + reach)
+        return curve
     rounds = len(accepted)
     curve, total = [1.0], 1.0
     for j in range(1, width + 1):
@@ -94,14 +126,23 @@ def tokens_by_width(accepted, width):
     return curve
 
 
-def conditional_acceptance(accepted, width):
-    """P(accepted >= j | accepted >= j - 1) for depths j = 1..width."""
-    rates, reached = [], len(accepted)
+def conditional_acceptance(accepted, width, drafted=None):
+    """P(accepted >= j | accepted >= j - 1) for depths j = 1..width. With drafted, only the rounds that made a
+    j-th draft count at depth j: a round that kept all of fewer drafts says nothing about the next one."""
+    rates = []
+    drafted = drafted or [width] * len(accepted)
     for j in range(1, width + 1):
-        count = sum(1 for a in accepted if a >= j)
-        rates.append(count / reached if reached else 0.0)
-        reached = count
+        offered = sum(1 for a, d in zip(accepted, drafted) if a >= j - 1 and d >= j)
+        count = sum(1 for a, d in zip(accepted, drafted) if a >= j and d >= j)
+        rates.append(count / offered if offered else 0.0)
     return rates
+
+
+def _drafted(sample):
+    """A sample reports the drafts made in each round, one per accepted count."""
+    drafted, accepted = sample.get("drafted"), sample.get("accepted")
+    return (isinstance(drafted, list) and isinstance(accepted, list) and len(drafted) == len(accepted) > 0
+            and sum(drafted) > 0)
 
 
 def tokens_at_rate(rate, width):
@@ -615,17 +656,20 @@ def price_prompts(result, rates, sources, prefill_cases, evidence=()):
 
 
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
-              prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy"):
+              prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy",
+              host_rates=None):
     """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
     in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s; ceiling:
     the prepared model arithmetic (ceiling.model_ceiling); tflops: GEMM rates by format; steps:
     ordinary step ms by case; prefill_cases: case ids in the prefill score; context: the result's
     context section (the requirement and the measured curve); context_settings: the protocol's;
-    decode_speed: the suite the decode terms describe (decode_suite), named decode_name; speed by default."""
+    decode_speed: the suite the decode terms describe (decode_suite), named decode_name; speed by default; host_rates:
+    the probe's host rates ({"link", "memory"} GB/s) that price an engine's declared host_bytes_per_pass (host_pass)."""
     decode_speed = decode_speed or speed
     width = info.get("draft_width")
     bandwidth_gbs = bandwidth_gbs or info.get("bandwidth_gbs")
-    floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs)
+    host = host_pass(info, host_rates)
+    floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs, host)
     draft_floor = pass_floor_ms(info.get("draft_bytes_per_step"), bandwidth_gbs)
     kv_per_token = info.get("kv_bytes_per_token") or (ceiling or {}).get("kv_bytes_per_token") or 0
     steps = steps or {}
@@ -642,20 +686,25 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         if width and case.get("tokens_per_round"):
             row["saturation"] = case["tokens_per_round"] / (width + 1)
         if floor:
-            row["pass_floor_ms"] = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * _context(case), bandwidth_gbs)
+            row["pass_floor_ms"] = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * _context(case), bandwidth_gbs, host)
             if case.get("round_ms"):
                 row["round_over_pass_floor"] = case["round_ms"] / row["pass_floor_ms"]
         measured_samples = [s for s in case.get("samples", []) if not s.get("warmup")]
-        parts = [(s["verify_ms"] / s["rounds"], s["draft_ms"] / (s["rounds"] * width)) for s in measured_samples
+        parts = [(s["verify_ms"] / s["rounds"], s["draft_ms"] / (sum(s["drafted"]) if _drafted(s) else s["rounds"] * width))
+                 for s in measured_samples
                  if width and s.get("rounds") and s.get("verify_ms") is not None and s.get("draft_ms") is not None]
         if parts and len(parts) == len(measured_samples):
             row["verify_ms"] = metrics.median([v for v, _ in parts])
             row["draft_step_ms"] = metrics.median([d for _, d in parts])
         accepted = [a for s in measured_samples for a in (s.get("accepted") or [])]
+        # Drafts made per round when every sample reports them (an engine whose width varies), else None: each round
+        # drafted the full width.
+        drafted = ([min(d, width or d) for s in measured_samples for d in s["drafted"]]
+                   if accepted and all(_drafted(s) for s in measured_samples if s.get("accepted")) else None)
         greedy = (speed or {}).get("cases", {}).get(case_id) or {} if decode_speed is not speed else {}
         greedy_accepted = [a for s in greedy.get("samples", []) if not s.get("warmup") for a in (s.get("accepted") or [])]
         if width and (accepted or greedy_accepted):
-            row["tokens_by_width"] = (tokens_by_width(accepted, width) if accepted
+            row["tokens_by_width"] = (tokens_by_width(accepted, width, drafted) if accepted
                                       else [case.get("tokens_per_round") or 1.0] * (width + 1))
             probed = ((wider.get("cases") or {}).get(case_id) or {}).get("accepted")
             if probed and wider_width > width:
@@ -666,7 +715,9 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                 row["probed_width"] = wider_width
             rate = 0.0
             if accepted:
-                row["conditional_acceptance"] = conditional_acceptance(accepted, width)
+                row["conditional_acceptance"] = conditional_acceptance(accepted, width, drafted)
+                if drafted:
+                    row["mean_drafted"] = sum(drafted) / len(drafted)
                 rate = row["conditional_acceptance"][0]
             if greedy_accepted:
                 rate = max(rate, conditional_acceptance(greedy_accepted, width)[0])
@@ -676,6 +727,8 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         cases[case_id] = row
 
     efficiency = floor / step_ms if floor and step_ms else None
+    if host and (not host["memory_gbs"] or (host["link"] and not host["link_gbs"])):
+        missing.append("host rates for host_bytes_per_pass (re-run crit eval probe)")
     if efficiency is None:
         lacking = [name for name, value in (("bytes_per_pass from the adapter", info.get("bytes_per_pass")),
                                             ("device bandwidth (--device)", bandwidth_gbs),
@@ -749,7 +802,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     long_context = None
     if (context or {}).get("points"):
         long_context = context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token,
-                                       context_settings or {})
+                                       context_settings or {}, host)
         gaps += long_context.pop("gaps")
         missing += [m for m in long_context["missing"] if m not in missing]
         if long_context["decode"]["fraction_of_ceiling"] is not None:
@@ -758,6 +811,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
                             f"{long_context['decode']['ceiling_score']:.1f}")
     return {
         "decode_suite": decode_name, "draft_width": width, "bytes_per_pass": info.get("bytes_per_pass"), "bandwidth_gbs": bandwidth_gbs,
+        "host_pass": host,
         "kv_bytes_per_token": kv_per_token or None,
         "pass_floor_ms": floor, "step_ms": step_ms, "pass_efficiency": efficiency,
         "projection": projection, "cases": cases, "prefill": prefill, "ttft": ttft, "gaps": gaps,
@@ -766,7 +820,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     }
 
 
-def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token, settings):
+def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token, settings, host=None):
     """Decode and time to first token over the long-context curve against their floors, and the gaps:
     rounds at their floor, the KV cache at the protocol's precision (with everything else as measured)
     and the first token at its floor."""
@@ -778,7 +832,7 @@ def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, 
         row = {k: point.get(k) for k in ("context", "prompt_tokens", "output_tokens", "decode_tps", "ttft_ms",
                                           "prefill_tps", "tokens_per_round", "round_ms")}
         reading = point["prompt_tokens"] + point["output_tokens"] / 2
-        pass_floor = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * reading, bandwidth_gbs) if info.get(
+        pass_floor = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * reading, bandwidth_gbs, host) if info.get(
             "bytes_per_pass") else None
         if pass_floor is not None and (not width or draft_floor is not None):
             row["round_floor_ms"] = pass_floor + width * (draft_floor or 0.0)
@@ -819,7 +873,7 @@ def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, 
             saved = (kv_per_token - target) * reading / (bandwidth_gbs * 1e9) * 1000
             floor = 0.0
             if info.get("bytes_per_pass"):
-                floor = pass_floor_ms(info["bytes_per_pass"] + target * reading, bandwidth_gbs) + width * (draft_floor or 0.0)
+                floor = pass_floor_ms(info["bytes_per_pass"] + target * reading, bandwidth_gbs, host) + width * (draft_floor or 0.0)
             projected = max(r["round_ms"] - saved, floor)
             if projected <= 0:
                 speeds = []

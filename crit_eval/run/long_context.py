@@ -166,6 +166,15 @@ def compare_lower(at_max, at_lower, lower, settings):
         row["decode_change"] = (low["decode_tps"] / high["decode_tps"] - 1
                                 if low.get("decode_tps") and high.get("decode_tps") else None)
         row["ttft_change"] = low["ttft_ms"] / high["ttft_ms"] - 1 if low.get("ttft_ms") and high.get("ttft_ms") else None
+        # The engine's own first-token time at both contexts, when it reports one: a change outside the engine
+        # (HTTP, templating, host launches) reads differently from a slower prefill.
+        parts, parts_at_required = headroom.ttft_parts(low), headroom.ttft_parts(high)
+        if "outside_engine_ms" in parts and "outside_engine_ms" in parts_at_required:
+            engine, engine_at_required = (p.get("engine_first_token_ms", p.get("engine_prefill_ms"))
+                                          for p in (parts, parts_at_required))
+            row.update(engine_ttft_ms=engine, engine_ttft_ms_at_required=engine_at_required,
+                       outside_engine_ms=parts["outside_engine_ms"],
+                       outside_engine_ms_at_required=parts_at_required["outside_engine_ms"])
         kinds = []
         if row["decode_change"] is not None and row["decode_change"] < -row["decode_tolerance"]:
             kinds.append("decode")

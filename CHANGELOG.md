@@ -9,6 +9,118 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-10-30
+
+### Overview
+
+crit-eval 0.3.0 starts protocol series crit-eval-v0.3: the `as_quantized` quality mode judges against the exact
+reference scores, each set's limits raised by the checkpoint's own activation quantization drift (the allowance),
+so one `crit eval reference` run serves both quality modes. It carries protocols crit-eval-v0.2.1 and v0.2.2 as well:
+prompt positions are judged by KLD alone, and the reference's spread pass probes the short texts first. Engines
+that read weights from host memory get their pass floor priced at the probe's host rates, and `crit eval context`
+names the placement scenario of a model on a device. Data prepared under 0.2.x is prepared again; the reference
+scores carry over.
+
+### Added
+
+- Protocol crit-eval-v0.2.2: the reference's spread pass scores the texts shorter than 8,192 tokens first, and the
+  long texts again only when that probe's spread is not tiny (below 1/20 of the level at which it would raise a
+  limit, protocol `quality.spread.probe`). The second run of the 32K text measured a dense model's spread hundreds
+  of times below the budget and took most of the spread pass: Nanbeige4.3-33B NVFP4's reference took 380 s instead
+  of 660 s on an RTX 5090, with the same scores and the same spread on every probed set. Skipping can only keep a
+  limit, never raise one; `spread.json` names the skipped texts (`spread_skipped`), and `crit eval reference`
+  reports the spread as `probed`.
+- `crit_eval.limits.context.placement` and `crit eval context` name the placement scenario of a model on a device
+  at the required context: `fits_device`, `sparse_device_host` (experts beyond device memory fit host memory),
+  `sparse_device_host_disk`, `dense_device_host` or `beyond_host`, with the bytes each tier holds, where the lookup
+  tables (gathered embedding and n-gram rows) go, and one plain pass's floor and ceiling per expert source: on the
+  device, misses copied over the host link, misses computed on the CPU, priced at the probe's host-to-device and host
+  memory rates. Before, the probe measured those rates and nothing used them. `--ram-headroom-gib` (else
+  settings.toml's `ram_headroom_gib`) sets the host memory left free.
+- An engine that declares `host_bytes_per_pass` (`{"link", "cpu"}`, the part of `bytes_per_pass` read from host
+  memory) gets its pass floor priced at the probe's host rates: the longest of the device's bytes at its bandwidth,
+  the link's bytes at the pinned host-to-device rate and all host bytes at host memory's read rate. Before, every byte
+  was priced at the device's bandwidth, so an engine streaming 1.3 GB of experts per token over a 27 GB/s link saw a
+  floor near 1 ms against 90 ms measured. headroom records `host_pass`.
+
+- `crit eval reference --quality-mode as_quantized` quantizes the inputs of fused experts (every expert's matrices
+  stacked, gate and up joined along the output rows, as transformers' MoE models hold them) with each expert matrix's
+  own declared scale, instead of refusing the model. NVIDIA's Qwen3.8-Flash-Next NVFP4 declares NVFP4 inputs on all
+  512 experts of every layer and was refused.
+- `crit eval run` says when its device file is older than this checkout's probe (`device.outdated` in the result,
+  and a log line naming what it lacks: raw tensor-core rates, host rates, or another probe source). Eval prices
+  nothing a device file lacks, so an older probe left the fp16_acc prefill ceiling unpriced and prefill above 100% of
+  its limit without saying why (the Nanbeige4.3-33B run's device file had cuBLASLt rates only).
+- `max_context(..., drafters=)` and `crit eval context --drafter DIR` keep a companion drafter's stored weights out of
+  the KV cache (`basis.companion_drafter_bytes`), so an engine built for the required context can still load the
+  drafter it speculates with. `companion_drafter_bytes` also gives what one drafter pass reads: its weights plus the
+  output head its logits go through (the target's, where the drafter stores none). Nanbeige4.3-33B with its 1.96 GB
+  DFlash2 drafter on an RTX 5090: 98,304 tokens instead of 115,712 at no reserve.
+- `crit eval workbench check|bench|profile FOLDER` measures a kernel in a workbench folder crit's `crit kernels new`
+  scaffolds, running the folder's harness (shipped here as `crit_eval/workbench/harness.py`) in the engine's Python:
+  the kernel against its FP64 reference, repeatable and column invariant; its time and a yardstick provider's on
+  inputs cycled past the L2 against the probe's floor (bench.json, a plan's yardstick evidence); the compiled kernels'
+  registers, shared memory and spills, and Nsight Compute's sections with `--ncu`.
+
+### Fixed
+
+- `run`, `pin`, `ab` and `kernels` with `--adapter` start from the `configuration.json` packaged beside the adapter,
+  the configuration `crit serve` opens the candidate with, and apply `--config` over it. Before, a package's adapter
+  opened with its defaults, so `crit eval kernels` on a candidate's package profiled another engine than the one Eval
+  measured.
+- `prepare` encodes the parts of a render that follow other text (a long case's document and template tail, the
+  long-prompt filler, the quality answers, the retrieval facts) as the whole render encodes them. Tokenizers that mark
+  the start of their input (Metaspace with `prepend_scheme: "first"`, as SentencePiece-style Llama tokenizers ship)
+  gave each part encoded on its own a word marker of its own, so a server rendering the frozen messages counted other
+  tokens (Nanbeige4.3-33B: `agent-long` at 14,335 instead of 14,336, and Eval stopped). Byte-level tokenizers encode
+  as before; data prepared for a start-marking tokenizer is prepared again, with its reference.
+
+### Changed
+
+- Protocol crit-eval-v0.3.0: quality mode `as_quantized` judges against the exact reference scores, each set's limits
+  raised to four times the checkpoint's own quantization drift where that exceeds the mode's budget, at most to four
+  times that budget (mean KLD 0.4, p99 4.0, PPL ratio 1.4; protocol `quality.allowance`), instead of against a
+  second set of scores of the checkpoint run as quantized. One
+  `crit eval reference` run now serves both modes: for a checkpoint that declares quantized input activations it
+  scores the texts a second time with them quantized and keeps only how far that lands from the exact scores, per set
+  and path (`reference/allowance.json`, carried by reference packages), so a checkpoint has one package and one
+  set of scores. A checkpoint that declares none (weight-only schemes) has an empty allowance and runs no second
+  pass; one that declares a form crit does not emulate (DeepSeek-V4-Flash W4A16-FP8's dynamic FP8 attention inputs in
+  groups of 128) records the allowance as unsupported, and an as_quantized run of it says so. `crit eval reference --quality-mode` is accepted and ignored; the reference derives the
+  allowance from an earlier crit-eval's `reference-as-quantized/` store without running again, and `crit eval fetch`
+  removes that store. Results record `allowance` and `allowance_raised` per set, and status names the sets.
+
+- A disturbed speed case's message names the engine as the likely cause when other processes kept fewer than 2 CPU
+  cores busy (file-backed reads that miss the page cache, host threads, expert misses), and both causes otherwise.
+  Before, it always blamed the device, and one engine's own n-gram reads cost a restart on an idle machine.
+- A disturbed speed case names the device's free memory, and below 1 GiB says the engine's own memory may be the
+  disturbance: under Windows' WDDM a device past its memory pages to host RAM and slows unevenly instead of failing,
+  which Eval read as another process using the device (a Nanbeige4.3-33B candidate whose prefill temporaries passed
+  32 GB, 45% between repetitions).
+- The sampled suite's disturbance check reads an engine whose rounds draft a varying number of tokens at the median
+  drafts per round: with `drafted` telemetry in three or more repetitions, each repetition's time per target pass is
+  adjusted by a slope fitted over the repetitions (`timing.width_adjusted_rounds`). An adaptive budget that falls back
+  to plain steps mixes 1-pass steps and wider rounds by each seed's acceptance, so its time per round followed the
+  seed and Eval stopped it as a disturbed device (a Nanbeige4.3-33B candidate with DFlash2, 33% between seeds).
+- An engine whose draft width varies is read round by round: with `drafted` (the drafts made in each round, from
+  `generate()` or crit serve's `crit_telemetry`) beside `accepted`, a depth's acceptance counts only the rounds that
+  drafted that deep, and a draft step's time divides by the drafts made. Before, every round counted as the widest
+  draft, so a short round that kept all its drafts looked rejected beyond them and the width projections ran low.
+- A lower-context case whose first token came later names where the time went: the engine's own first-token time and
+  the time outside the engine at both contexts (`context.lower.cases[*].engine_ttft_ms`, `outside_engine_ms` and their
+  `_at_required` values, from the engine's reported prefill time), so a failed `lower_context` gate says whether host
+  or server time moved or the prefill did.
+- Protocol crit-eval-v0.2.1 (same series: data and scores carry over): a set's prompt positions (`SET/prompt`) report
+  their perplexity ratio and are judged by KLD mean and p99 only (protocol `quality.prompt_perplexity`). They predict
+  the user's turn, where a chat model calls most tokens near-impossible, so the ratio follows rounding: the Qwen3.8-27B
+  NVFP4 as_quantized reference scored again with its FP32 prompt in 4,096-token chunks lands at 0.68 on long-4096
+  (TF32 reruns: 0.77 to 1.40 across the sets), and engines with less KLD than those reruns failed on it. Status takes a
+  set's own limits for its share of the budget and its worst perplexity ratio from the sets that judge it.
+- Status judges a stored result's quality again by today's rules: a result measured before crit-eval-v0.2.1 has its
+  prompt sets judged without the perplexity ratio (each changed verdict says `rejudged`, and the gate names them), so
+  a status rendered later, as replays do, gives the verdict a measurement today would. The prompt activations' evidence
+  (which formats quality passes or rules out, the reachable limit) is priced again from that verdict.
+
 ## [0.2.0] - 2026-10-27
 
 ### Overview
@@ -184,7 +296,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/crit-labs/crit-eval/compare/v0.1.2...v0.2.0
 [0.1.2]: https://github.com/crit-labs/crit-eval/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/crit-labs/crit-eval/compare/46c7757...v0.1.1

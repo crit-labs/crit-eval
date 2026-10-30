@@ -8,7 +8,7 @@
 
 ### Speed and quality measurement tool to compare inference engines honestly.
 
-[![Version 0.1.2](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.3.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![Python 3.11+](docs/assets/badge-python.svg)](pyproject.toml)
 
@@ -148,7 +148,7 @@ plugs in through a Python [adapter](docs/ADAPTER.md) instead of `--url`.
 | Reference coverage | The reference runs the model through transformers' modeling code in FP32, so it needs an architecture transformers implements and a CUDA GPU with the machine to itself for 5 to 25 minutes. Checkpoints in exl2 or exl3 are refused. Reference packages for three checkpoints are published on Hugging Face ([crit-labs/crit-eval-references](https://huggingface.co/datasets/crit-labs/crit-eval-references)) and fetched by default. |
 | Rounding-sensitive models | Where a model amplifies rounding (MoE routing near-ties, sparse-attention ties, recurrent state), two valid FP32 runs of the reference disagree; quality is then judged against twice the reference's own spread instead of the budget, which is looser for those models. |
 | Speed | One request at a time: `crit-eval` measures single-stream decode, prefill and time to first token, not throughput under concurrent requests or batching. A noisy sampled decode is repeated at up to nine seeds per case, so an engine whose speed swings with the drawn text takes longer to measure (`--no-adaptive-sampled` keeps three, an override the result records). |
-| Hardware | NVIDIA GPUs only: the probe builds with nvcc and measures one GPU. Multi-GPU engines are not measured as such. PCIe, host memory and CPU rates are recorded, but no limit uses them yet, so engines that offload weights or compute on the CPU get GPU-only limits. On Windows the CPU probe uses AVX2, which under-reports an AVX-512 CPU. |
+| Hardware | NVIDIA GPUs only: the probe builds with nvcc and measures one GPU. Multi-GPU engines are not measured as such. PCIe, host memory and CPU rates are recorded; an engine that declares the bytes it reads from host memory per pass (`host_bytes_per_pass`) gets them priced at those rates, every other engine gets GPU-only limits. On Windows the CPU probe uses AVX2, which under-reports an AVX-512 CPU. |
 | Long context | The hub profile measures the long-context curve at its two ends and interpolates the points between; only the full profile measures every point. |
 | Comparability | Results compare only under the same protocol series and profile, on prepared data of the same checkpoint. |
 

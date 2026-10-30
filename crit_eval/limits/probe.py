@@ -185,3 +185,21 @@ def probe(out, nvcc=None, repeats=3, log=print):
                   measured_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
     write_json(out, result)
     return result
+
+
+# What a probe from today measures that older probes did not, and what each prices.
+MEASURED = {"mma_tflops": "raw tensor-core rates (fp16_acc, fp4_fp8 prompt activations)",
+            "host_to_device_gbs": "host-to-device rates (weights kept in host memory)",
+            "host_memory_gbs": "host memory rates", "cpu_gflops": "CPU rates"}
+
+
+def outdated(device):
+    """Why a `crit eval probe` result is older than this probe: the measurements it lacks (MEASURED) and a probe
+    source other than this checkout's. [] for a current one, or no device file. Eval prices nothing it lacks, so a
+    floor that needs it reads as missing (an fp16_acc prefill ceiling) until the device is probed again."""
+    if not device:
+        return []
+    reasons = [f"no {what}" for key, what in MEASURED.items() if not device.get(key)]
+    if device.get("probe_sha256") != hashlib.sha256(SOURCE.read_bytes()).hexdigest():
+        reasons.append("measured by another probe source" if device.get("probe_sha256") else "no probe_sha256")
+    return reasons

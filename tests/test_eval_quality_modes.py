@@ -7,6 +7,7 @@ from pathlib import Path
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -127,69 +128,43 @@ class ActivationTests(unittest.TestCase):
 
     def test_a_run_judges_by_the_spread_of_every_text_the_rule_names(self):
         # protocol quality.spread covers every length (from_tokens 0): a spread stored under an earlier rule, for the
-        # long texts alone, is not judged by until the reference scores it again.
+        # long texts alone, is not judged by until the reference scores it again; a probed spread names every text.
         from crit_eval import load_json, EVAL_DIR
         from crit_eval.run import quality_checks
         protocol = load_json(EVAL_DIR / "protocol.json")
         self.assertEqual(protocol["quality"]["spread"]["from_tokens"], 0)
         prepared = {"quality": [{"id": "c", "set": "conversations", "prompt_ids": [1, 2], "continuation_ids": [3]},
                                 {"id": "l", "set": "long-1024", "prompt_ids": [1] * 9000, "continuation_ids": [3]}]}
-        identity = {"reference": 3, "quality_mode": "as_quantized"}
-        store = fixed.STORES["as_quantized"]
+        identity = {"reference": 3}
         spread = {"conversations/prompt": {"kld_mean": 0.04, "kld_p99": 0.6, "ppl_ratio": 1.02}}
         with tempfile.TemporaryDirectory() as data:
-            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity, store))
-            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["l"]}, spread, store)
-            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity, store))   # the long text alone
-            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["c", "l"]}, spread,
-                               store)
-            self.assertEqual(quality_checks.stored_spread(data, prepared, protocol, identity, store), spread)
-            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity))   # preserve's store has none
+            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity))
+            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["l"]}, spread)
+            self.assertIsNone(quality_checks.stored_spread(data, prepared, protocol, identity))   # the long text alone
+            fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["c", "l"],
+                                      "spread_skipped": ["l"]}, spread)
+            self.assertEqual(quality_checks.stored_spread(data, prepared, protocol, identity), spread)
 
-    def test_each_quality_mode_has_its_own_store(self):
+    def test_the_allowance_is_stored_beside_the_scores_under_their_identity(self):
         with tempfile.TemporaryDirectory() as data:
-            scores = {"t": ([-0.5], [[1]], [[-0.5]])}
-            fixed.write(data, {"reference": 3}, scores)
-            fixed.write(data, {"reference": 3, "quality_mode": "as_quantized"}, {"t": ([-0.9], [[2]], [[-0.9]])},
-                        fixed.STORES["as_quantized"])
-            self.assertEqual(fixed.load(data, {"reference": 3})["t"][0]["logprob"], -0.5)
-            self.assertEqual(fixed.load(data, {"quality_mode": "as_quantized"}, fixed.STORES["as_quantized"])["t"][0]
-                             ["logprob"], -0.9)
-            self.assertIsNone(fixed.load(data, {"quality_mode": "as_quantized"}))
+            fixed.write(data, {"reference": 3}, {"t": ([-0.5], [[1]], [[-0.5]])})
+            allowance = {"activations": ["nvfp4"], "sets": {"long-1/prompt": {"kld_mean": 0.05}}}
+            self.assertIsNone(fixed.load_allowance(data, {"reference": 3}))
+            fixed.write_allowance(data, {"reference": 3, "allowance": "as_quantized"}, allowance)
+            self.assertEqual(fixed.load_allowance(data, {"reference": 3}), allowance)
+            self.assertIsNone(fixed.load_allowance(data, {"reference": 4}))   # another reference's
+            self.assertTrue((Path(data) / fixed.STORE / fixed.ALLOWANCE).is_file())
 
 
 @unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers, safetensors and tokenizers")
 class AsQuantizedReferenceTests(unittest.TestCase):
     def test_the_reference_quantizes_every_declared_input_as_the_checkpoint_does(self):
         import torch
-        from safetensors.torch import save_file
         from transformers import AutoConfig, AutoModelForCausalLM
         from crit_eval.limits.schemes import activations, quantize_activations
-        from test_eval_formats import scored, sequences, tiny
+        from test_eval_formats import scored, sequences
         with tempfile.TemporaryDirectory() as temp:
-            original = tiny(Path(temp) / "original")
-            model = AutoModelForCausalLM.from_pretrained(original, dtype=torch.float32)
-            folder = Path(temp) / "nvfp4"
-            folder.mkdir()
-            for name in ("tokenizer.json", "tokenizer_config.json"):
-                (folder / name).write_bytes((original / name).read_bytes())
-            tensors = {}
-            for key, value in model.state_dict().items():
-                base = key[: -len(".weight")]
-                if key.endswith(".weight") and value.dim() == 2 and ".layers." in key:
-                    tensors.update({f"{base}.{k}": v for k, v in nvfp4_matrix(value, 448.0 * 6 / 0.2).items()})
-                    tensors[f"{base}.input_global_scale"] = torch.tensor([448.0 * 6 / 3.0])
-                else:
-                    tensors[key] = value.contiguous()
-            save_file(tensors, str(folder / "model.safetensors"))
-            config = json.loads((original / "config.json").read_text())
-            config["quantization_config"] = {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
-                                             "config_groups": {"group_0": {"targets": ["Linear"],
-                                                                           "weights": {"num_bits": 4, "type": "float",
-                                                                                       "group_size": 16},
-                                                                           "input_activations": NVFP4_INPUTS}},
-                                             "ignore": ["lm_head"]}
-            (folder / "config.json").write_text(json.dumps(config))
+            folder, tensors, config = nvfp4_checkpoint(Path(temp))
             exact = scored(folder, sequences())
             with patch_mode("as_quantized"):
                 quantized = scored(folder, sequences())
@@ -214,6 +189,199 @@ class AsQuantizedReferenceTests(unittest.TestCase):
                     logprobs = torch.log_softmax(twin(torch.tensor([ids])).logits[0].double(), -1)
                     self.assertEqual(got, [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
                     self.assertNotEqual(got, plain)
+
+    def test_one_reference_run_stores_the_scores_and_the_as_quantized_allowance(self):
+        # protocol quality.allowance: a checkpoint that declares quantized activations is scored a second time with
+        # them quantized, and only how far that lands from the exact scores is kept, per set and path; scores an
+        # earlier crit-eval stored for the as_quantized mode give the same allowance without the second run, and a
+        # checkpoint with plain weights declares none.
+        from crit_eval.quality import reference
+        from crit_eval.reports import metrics
+        from test_eval_formats import sequences
+        with tempfile.TemporaryDirectory() as temp:
+            folder, _, _ = nvfp4_checkpoint(Path(temp))
+            texts = {f"t{i}": (ids, False) for i, (ids, _) in enumerate(sequences())}
+            layout = {"t0": ("conversations", 5), "t1": ("long-23", 3)}
+            measured = Path(temp) / "measured"
+            exact = reference.StreamingReference(folder, "cpu")
+            reference.store_texts(exact, texts, 4, None, measured, "m", log=lambda m: None)
+            self.assertEqual(exact.declared_activations(), ["nvfp4"])
+            identity = {**exact.identity("m"), **fixed.identity(texts, 4, None)}
+            logged = []
+            how = reference.store_allowance(folder, measured, texts, 4, None, identity, layout, ["nvfp4"],
+                                            log=logged.append, device="cpu")
+            self.assertEqual(how, "measured")
+            allowance = fixed.load_allowance(measured, identity)
+            self.assertEqual((allowance["activations"], allowance["source"]), (["nvfp4"], "measured"))
+            self.assertEqual(sorted(allowance["sets"]), ["conversations/prompt", "conversations/served",
+                                                         "long-23/prompt", "long-23/served"])
+            # What it holds: the quantized run against the exact scores, as an engine's rows would be judged.
+            quantized = reference.StreamingReference(folder, "cpu", quality_mode="as_quantized")
+            rows = dict(zip(texts, quantized.score_texts([ids for ids, _ in texts.values()], 4, None,
+                                                         Path(temp) / "scratch", log=lambda m: None)))
+            stored = fixed.load(measured, identity)
+            again = [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
+                     for lp, ids, tops in zip(*(part.tolist() for part in rows["t0"]))]
+            self.assertEqual(allowance["sets"]["conversations/served"],
+                             metrics.text_quality(stored["t0"][4:], again[4:]))
+            self.assertGreater(allowance["sets"]["conversations/served"]["kld_mean"], 0)
+            self.assertTrue(any(line.startswith("reference allowance conversations/served") for line in logged))
+            self.assertEqual(reference.store_allowance(folder, measured, texts, 4, None, identity, layout, ["nvfp4"],
+                                                       log=lambda m: None, device="cpu"), "stored")
+            # An earlier crit-eval's as_quantized store of the same texts: the same allowance, no second run.
+            derived = Path(temp) / "derived"
+            reference.store_texts(exact, texts, 4, None, derived, "m", log=lambda m: None)
+            fixed.write(derived, {**identity, "quality_mode": "as_quantized"},
+                        {name: tuple(part.tolist() for part in row) for name, row in rows.items()},
+                        fixed.LEGACY_AS_QUANTIZED)
+            with patch.object(reference.StreamingReference, "score_texts", side_effect=AssertionError("ran again")):
+                self.assertEqual(reference.store_allowance(folder, derived, texts, 4, None, identity, layout,
+                                                           ["nvfp4"], log=lambda m: None, device="cpu"), "derived")
+            self.assertEqual(fixed.load_allowance(derived, identity)["sets"], allowance["sets"])
+            # A declared form crit does not emulate: recorded, so an as_quantized run says why it has no allowance.
+            refused = Path(temp) / "refused"
+            reference.store_texts(exact, texts, 4, None, refused, "m", log=lambda m: None)
+            from crit_eval.limits.schemes import SchemeError
+            self.assertEqual(reference.store_allowance(folder, refused, texts, 4, None, identity, layout,
+                                                       SchemeError("int4 activations"), log=lambda m: None),
+                             "unsupported")
+            self.assertEqual(fixed.load_allowance(refused, identity)["unsupported"], "int4 activations")
+            # Plain weights declare nothing: an empty allowance, as_quantized judges as preserve.
+            plain = Path(temp) / "original"
+            self.assertEqual(reference.StreamingReference(plain, "cpu").declared_activations(), [])
+            self.assertEqual(reference.store_allowance(plain, refused, texts, 4, None, {**identity, "model_sha256": "p"},
+                                                       layout, [], log=lambda m: None), "none")
+            self.assertEqual(fixed.load_allowance(refused, {"model_sha256": "p"}), {"activations": [], "sets": {}})
+
+    def test_fused_experts_quantize_each_matrix_input_with_its_own_scale(self):
+        # Experts the modeling code multiplies through fused parameters (gate and up joined, every expert stacked):
+        # each expert's gate, up and down inputs are quantized with that matrix's own stored global scale.
+        import torch
+        from safetensors.torch import load_file, save_file
+        from transformers import AutoConfig, AutoModelForCausalLM
+        from crit_eval.limits.schemes import quantize_activations
+        from crit_eval.quality import reference
+        from test_eval_formats import scored, sequences, tokenizer
+        with tempfile.TemporaryDirectory() as temp:
+            original = Path(temp) / "original"
+            original.mkdir()
+            tokenizer(original)
+            torch.manual_seed(0)
+            experts = 4
+            config = AutoConfig.for_model("qwen3_moe", vocab_size=320, eos_token_id=0, hidden_size=64,
+                                          intermediate_size=128, moe_intermediate_size=32, num_experts=experts,
+                                          num_experts_per_tok=2, num_hidden_layers=2, num_attention_heads=4,
+                                          num_key_value_heads=2, head_dim=16, tie_word_embeddings=False)
+            model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
+            with torch.no_grad():
+                for key, parameter in model.named_parameters():
+                    parameter.copy_(torch.randn_like(parameter) * 0.05 + (1.0 if "norm" in key else 0))
+            model.save_pretrained(original)
+            stored = load_file(str(original / "model.safetensors"))
+            folder = Path(temp) / "nvfp4"
+            folder.mkdir()
+            for name in ("tokenizer.json", "tokenizer_config.json"):
+                (folder / name).write_bytes((original / name).read_bytes())
+            tensors, scales = {}, {}
+            for key, value in stored.items():
+                base = key[: -len(".weight")]
+                if ".mlp.experts." in key:
+                    tensors.update({f"{base}.{k}": v for k, v in nvfp4_matrix(value, 448.0 * 6 / 0.2).items()})
+                    # A scale of its own per expert and matrix, so a wrong pairing changes the scores.
+                    scales[base] = 448.0 * 6 / (1.0 + len(scales) % 7)
+                    tensors[f"{base}.input_global_scale"] = torch.tensor([scales[base]])
+                else:
+                    tensors[key] = value.contiguous()
+            self.assertEqual(len(scales), 2 * experts * 3)
+            save_file(tensors, str(folder / "model.safetensors"))
+            saved = json.loads((original / "config.json").read_text())
+            saved["quantization_config"] = {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
+                                            "config_groups": {"group_0": {"targets": ["re:.*mlp\\.experts.*"],
+                                                                          "weights": {"num_bits": 4, "type": "float",
+                                                                                      "group_size": 16},
+                                                                          "input_activations": NVFP4_INPUTS}},
+                                            "ignore": ["lm_head"]}
+            (folder / "config.json").write_text(json.dumps(saved))
+            with patch_mode("as_quantized"), patch.object(reference.StreamingReference, "stream_experts", True):
+                streamed = scored(folder, sequences())
+            with patch_mode("as_quantized"), patch.object(reference.StreamingReference, "stream_experts", False):
+                whole = scored(folder, sequences())
+            exact = scored(folder, sequences())
+            # The twin: the decoded weights in transformers' eager experts loop, every matrix's input quantized alike.
+            from crit_eval.quality.checkpoints import _text_config, open_checkpoint
+            checkpoint = open_checkpoint(folder, _text_config(folder))
+            twin = AutoModelForCausalLM.from_config(config, dtype=torch.float32, attn_implementation="eager")
+            state = {}
+            for key in twin.state_dict():
+                if key.endswith("experts.gate_up_proj") or key.endswith("experts.down_proj"):
+                    layer = key[: -len("gate_up_proj" if key.endswith("gate_up_proj") else "down_proj")]
+                    parts = ("gate_proj", "up_proj") if key.endswith("gate_up_proj") else ("down_proj",)
+                    state[key] = torch.stack([torch.cat([checkpoint.dense(f"{layer}{e}.{part}", "cpu") for part in parts])
+                                              for e in range(experts)])
+                else:
+                    state[key] = stored[key].float()
+            twin.load_state_dict(state, strict=True)
+
+            def quantized_loop(module, layer):
+                def forward(hidden_states, top_k_index, top_k_weights):
+                    out = torch.zeros_like(hidden_states)
+                    mask = torch.nn.functional.one_hot(top_k_index, num_classes=experts + 1).permute(2, 1, 0)
+                    for (e,) in torch.greater(mask.sum(dim=(-1, -2)), 0).nonzero().tolist():
+                        if e == experts:
+                            continue
+                        position, token = torch.where(mask[e])
+                        x = hidden_states[token]
+                        q = lambda v, part: quantize_activations(v, "nvfp4", scales[f"{layer}{e}.{part}"])
+                        rows = module.gate_up_proj[e]
+                        gate = torch.nn.functional.linear(q(x, "gate_proj"), rows[:32])
+                        up = torch.nn.functional.linear(q(x, "up_proj"), rows[32:])
+                        h = module.act_fn(gate) * up
+                        h = torch.nn.functional.linear(q(h, "down_proj"), module.down_proj[e])
+                        out.index_add_(0, token, h * top_k_weights[token, position, None])
+                    return out
+                return forward
+            for name, module in twin.named_modules():
+                if name.endswith("mlp.experts"):
+                    module.forward = quantized_loop(module, name + ".")
+            with torch.no_grad():
+                for (ids, first), got, again, (plain, _, _) in zip(sequences(), streamed, whole, exact):
+                    logprobs = torch.log_softmax(twin(torch.tensor([ids])).logits[0].double(), -1)
+                    self.assertEqual(got[0], [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
+                    self.assertEqual(got, again)
+                    self.assertNotEqual(got[0], plain)
+
+
+def nvfp4_checkpoint(root):
+    """test_eval_formats.tiny's model stored as compressed-tensors NVFP4 with NVFP4 input activations on every decoder
+    matrix (the head left plain), in root / "nvfp4": (folder, its tensors, its config)."""
+    import torch
+    from safetensors.torch import save_file
+    from transformers import AutoModelForCausalLM
+    from test_eval_formats import tiny
+    original = tiny(root / "original")
+    model = AutoModelForCausalLM.from_pretrained(original, dtype=torch.float32)
+    folder = root / "nvfp4"
+    folder.mkdir()
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        (folder / name).write_bytes((original / name).read_bytes())
+    tensors = {}
+    for key, value in model.state_dict().items():
+        base = key[: -len(".weight")]
+        if key.endswith(".weight") and value.dim() == 2 and ".layers." in key:
+            tensors.update({f"{base}.{k}": v for k, v in nvfp4_matrix(value, 448.0 * 6 / 0.2).items()})
+            tensors[f"{base}.input_global_scale"] = torch.tensor([448.0 * 6 / 3.0])
+        else:
+            tensors[key] = value.contiguous()
+    save_file(tensors, str(folder / "model.safetensors"))
+    config = json.loads((original / "config.json").read_text())
+    config["quantization_config"] = {"quant_method": "compressed-tensors", "format": "nvfp4-pack-quantized",
+                                     "config_groups": {"group_0": {"targets": ["Linear"],
+                                                                   "weights": {"num_bits": 4, "type": "float",
+                                                                               "group_size": 16},
+                                                                   "input_activations": NVFP4_INPUTS}},
+                                     "ignore": ["lm_head"]}
+    (folder / "config.json").write_text(json.dumps(config))
+    return folder, tensors, config
 
 
 class patch_mode:

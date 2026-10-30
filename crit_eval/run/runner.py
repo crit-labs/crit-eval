@@ -13,7 +13,7 @@ from ..limits.ceiling import best_rates, model_ceiling
 from .chat import Server
 from .deadline import RequestDeadline
 from .estimate import estimate, summary as estimate_summary
-from ..limits.context import GIB, draft_step_bytes, interpolated_curve, pass_bytes
+from ..limits.context import GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes
 from .pin import load_continuations
 from ..quality.prepare import PREPARED, check_prepared, check_template, model_description
 from ..quality.reference import REFERENCE_VERSION
@@ -89,12 +89,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     the seeds' repetitions alone, an override the result records (sampled_speed.adaptive null), as --repetitions is.
     A fixed repetition count (--repetitions, a profile's sampled_repetitions) is never extended.
     quality_mode: "preserve" judges quality against the reference with exact activations, "as_quantized" against the
-    checkpoint run as quantized (its own store of reference scores, crit eval reference --quality-mode as_quantized);
-    the result records it in requirements and its status prices prefill against that mode's arithmetic."""
+    same scores with each set's limits widened by the checkpoint's own activation quantization drift (the allowance
+    crit eval reference measures beside them, protocol quality.allowance); the result records it in requirements and
+    its status prices prefill against that mode's arithmetic."""
     times = PartTimes()
     if quality_mode not in fixed.QUALITY_MODES:
         raise SystemExit(f"quality mode must be one of {', '.join(fixed.QUALITY_MODES)}")
-    store = fixed.STORES[quality_mode]
     protocol = load_json(EVAL_DIR / "protocol.json")
     thresholds = quality_thresholds(protocol, quality_budget, quality_mode)
     exactness = exactness or protocol["exactness"].get("default", "required")
@@ -136,10 +136,16 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
             ceiling = None
     continuations = load_continuations(data, prepared)
     reference_identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
-                          **({"quality_mode": quality_mode} if quality_mode != "preserve" else {}),
                           **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
-    reference_scores = fixed.load(data, reference_identity, store) if "quality" in parts else None
-    reference_spread = stored_spread(data, prepared, protocol, reference_identity, store) if "quality" in parts else None
+    reference_scores = fixed.load(data, reference_identity) if "quality" in parts else None
+    reference_spread = stored_spread(data, prepared, protocol, reference_identity) if "quality" in parts else None
+    reference_allowance = None
+    if quality_mode == "as_quantized" and "quality" in parts:
+        allowance = fixed.load_allowance(data, reference_identity)
+        if allowance is None or allowance.get("unsupported"):
+            reference_scores = None   # judged against the exact scores, as_quantized needs the allowance
+        else:
+            reference_allowance = allowance["sets"]
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
@@ -148,7 +154,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "crit_eval_version": __version__,
         "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
         "model": model_description(model),
-        "reference": reference_origin(data, store) if "quality" in parts else None,
+        "reference": reference_origin(data) if "quality" in parts else None,
         "host": host.describe(),
         # The adapter by its checkout-relative path (no user's home in results) and its bytes.
         "adapter": None if url or opener else portable_path(adapter),
@@ -167,6 +173,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "ceiling": ceiling,
     }
     log("host: " + host.summary(result["host"]))
+    from ..limits.probe import outdated
+    stale = outdated(device)
+    if stale:
+        result["device"]["outdated"] = stale
+        log("device: the device file is older than this probe (" + ", ".join(stale) + "): floors that need what it "
+            "lacks read as missing; re-run crit eval probe")
     if required:
         log(f"context: {required:,} tokens ({requirement['source']}"
             + (f", {requirement['bound']} bound" if requirement.get("bound") else "") + ")"
@@ -182,7 +194,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
                         continuations, required, settings, exactness, disturbed, bandwidth_gbs,
                         device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
-                        reference_spread, attribute_drift, adaptive_sampled)
+                        reference_spread, attribute_drift, adaptive_sampled, reference_allowance)
     except Disturbed as error:
         log(f"aborted: {error}")
         result["aborted"] = {"reason": "disturbed", "detail": str(error)}
@@ -195,7 +207,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
              out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None,
-             attribute_drift=False, adaptive_sampled=True):
+             attribute_drift=False, adaptive_sampled=True, reference_allowance=None):
     times = times or PartTimes()
     lower = None
     if "context" in parts and "speed" in parts and required and settings.get("measure_lower") is False:
@@ -277,7 +289,8 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "quality" in parts:
             with times.part("quality"):
                 result["quality"] = run_quality(engine, info, prepared, protocol, log, reference_scores,
-                                                result["requirements"]["quality_budget"], reference_spread)
+                                                result["requirements"]["quality_budget"], reference_spread,
+                                                reference_allowance)
             stopped = result["quality"].get("stopped_early")
             if stopped:
                 # protocol quality.fail_fast: nothing after quality can pass a run this far over the budget.
@@ -354,7 +367,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 result["quality"]["attribution"] = run_attribution(
                     module, model, config, prepared, protocol, log, reference_scores,
                     result["requirements"]["quality_budget"], reference_spread, result["quality"],
-                    info.get("exact_variants"), required)
+                    info.get("exact_variants"), required, reference_allowance)
     wider = info.get("wider_draft")
     if (wider and "speed" in result and info.get("speculative") and not info.get("served")
             and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
@@ -410,7 +423,9 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                                 ceiling=ceiling, tflops=rates or None, steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
                                                 context=result["context"], context_settings=settings,
-                                                decode_speed=decode_speed, decode_name=decode_name)
+                                                decode_speed=decode_speed, decode_name=decode_name,
+                                                host_rates={"link": link_gbs(device),
+                                                            "memory": ((device or {}).get("host_memory_gbs") or {}).get("read")})
         # Bytes per pass from the engine, or from the stored model when it reports none (crit_eval.limits.context.pass_bytes).
         result["headroom"]["bytes_per_pass_source"] = source
         result["headroom"]["draft_bytes_per_step_source"] = draft_source

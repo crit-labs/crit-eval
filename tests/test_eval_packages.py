@@ -100,34 +100,34 @@ class PackageTests(unittest.TestCase):
                 with self.assertRaisesRegex(SystemExit, "another model or suite"):
                     packages.fetch("checkpoint", root / "run", root / "packages")
 
-    def test_each_quality_modes_scores_carry_their_spread(self):
-        # The reference's own spread travels with the scores it was measured against, in each mode's store; a
-        # spread of other scores (an earlier reference, say) stays behind.
+    def test_the_scores_carry_their_spread_and_allowance(self):
+        # The reference's own spread and the as_quantized allowance travel with the scores they were measured
+        # against; ones of other scores (an earlier reference, say) stay behind, and a fetch removes the
+        # as_quantized scores an earlier crit-eval kept in a store of their own.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = scored(root / "data")
-            quantized = {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2, "quality_mode": "as_quantized"}
-            store = fixed.STORES["as_quantized"]
-            fixed.write(data, quantized, {"text": ([-0.6, -1.4], [[3, 4], [5, 6]], [[-0.1, -0.2], [-0.3, -0.4]])},
-                        store)
+            identity = {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2}
             spread = {"long-1/prompt": {"kld_mean": 0.03, "kld_p99": 0.7, "ppl_ratio": 1.01}}
-            fixed.write_spread(data, {**quantized, "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread,
-                               store)
+            allowance = {"activations": ["nvfp4"], "sets": spread}
             first, second, third = self.identities()
             with first, second, third:
                 entry = packages.pack(data, root / "packages")
-                self.assertIn(f"{store}/{fixed.SPREAD}", entry["files"])
-                self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])   # none stored for preserve
-                fixed.write_spread(data, {"reference": REFERENCE - 1, "model_sha256": MODEL, "top_k": 2,
-                                          "spread_perturbation": "tf32"}, spread)
-                self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", packages.pack(data, root / "packages")["files"])
-                fixed.write_spread(data, {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2,
-                                          "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread)
+                self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])   # none stored
+                fixed.write_spread(data, {**identity, "reference": REFERENCE - 1, "spread_perturbation": "tf32"}, spread)
+                fixed.write_allowance(data, {**identity, "reference": REFERENCE - 1}, allowance)
+                entry = packages.pack(data, root / "packages")
+                self.assertFalse({f"{fixed.STORE}/{fixed.SPREAD}", f"{fixed.STORE}/{fixed.ALLOWANCE}"} & set(entry["files"]))
+                fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread)
+                fixed.write_allowance(data, {**identity, "allowance": "as_quantized"}, allowance)
                 entry = packages.pack(data, root / "packages")
                 self.assertIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])
+                self.assertIn(f"{fixed.STORE}/{fixed.ALLOWANCE}", entry["files"])
+                (root / "run" / fixed.LEGACY_AS_QUANTIZED).mkdir(parents=True)
                 packages.fetch("checkpoint", root / "run", root / "packages", log=lambda m: None)
-            self.assertEqual(fixed.load_spread(root / "run", quantized, store), spread)
             self.assertEqual(fixed.load_spread(root / "run", {"reference": REFERENCE}), spread)
+            self.assertEqual(fixed.load_allowance(root / "run", identity), allowance)
+            self.assertFalse((root / "run" / fixed.LEGACY_AS_QUANTIZED).exists())
 
     def test_scores_of_another_reference_are_not_packed(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -14,7 +14,7 @@ and quality references, so results from different runs, agents and machines comp
 crit eval probe --out device.json
 crit eval context --model MODEL_DIR --device device.json
 crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--context TOKENS]
-crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR [--quality-mode as_quantized]
+crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR
 crit eval fetch --model MODEL_DIR --data EVAL_DATA_DIR [--packages FOLDER_OR_URL]
 crit eval pack --data EVAL_DATA_DIR --packages FOLDER
 crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] [--quality-mode as_quantized] --out result.json
@@ -320,8 +320,8 @@ with each score:
 - `context` records the required context and its source (`given` or `computed`), `max_context`,
   the curve and the lower-context comparison.
 - Quality covers the sets whose texts fit the engine's context (`quality.skipped` names the
-  others), each judged on its prompt positions (`SET/prompt`, from the prefill) and its served
-  positions (`SET/served`), with `quality.buckets` by position and `quality.honesty`; it
+  others), each judged on its prompt positions (`SET/prompt`, from the prefill, by KLD; their
+  perplexity ratio is reported) and its served positions (`SET/served`), with `quality.buckets` by position and `quality.honesty`; it
   is unmeasured until `crit eval
   reference` has stored the reference scores in the data directory.
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
@@ -369,6 +369,32 @@ model identity does not hash every weight byte, so keep the exact identity in th
 A successful exit does not mean quality or exactness passed: inspect the fields. Follow
 [Building engines](https://github.com/crit-labs/crit/blob/main/docs/BUILDING_ENGINES.md#run-the-common-eval-suite) and
 [crit-eval evidence](https://github.com/crit-labs/crit/blob/main/docs/RUN_RECORDS.md#eval-evidence) to retain results.
+
+## Kernel workbench
+
+A kernel an engine writes or adapts lives in a workbench folder that `crit kernels new` scaffolds in crit (kernel.json,
+kernel.py, this package's `workbench/harness.py`, src/). crit-eval measures it, running the folder's harness in the
+engine's own Python (`--python`):
+
+```sh
+crit eval workbench check FOLDER [--python PY] [--shape INDEX]
+crit eval workbench bench FOLDER [--python PY] [--shape INDEX] [--iters N] [--device DEVICE_JSON] [--out FILE]
+crit eval workbench profile FOLDER [--python PY] [--ncu NCU]
+```
+
+- **check** compares `candidate()` with `reference()` (FP64) on every shape and column count of kernel.json: the
+  largest error relative to the reference's largest value within the tolerance, the same bits on two more calls
+  (atomics, races and reads past a buffer fail it), and with `column_invariant` each column computed alone equal bit
+  for bit to the same column in the multi-column call, the property greedy speculation needs. Result: FOLDER/check.json;
+  the command fails when any row does.
+- **bench** times `candidate()` and `yardstick()` with CUDA events after a quarter second of warm-up, cycling through
+  enough input copies to exceed three times the L2 so weights come from memory, and reports the floor of each call
+  (its bytes at the probe's bandwidth or its FLOPs at the probe's rate for kernel.json's `rate`), GB/s and TFLOPS for
+  both, and their geometric-mean ratio. Result: FOLDER/bench.json with the sources' SHA-256 and the toolchain, the
+  evidence a plan's `yardstick` cites.
+- **profile** reads every compiled kernel's registers, stack, shared memory and spill bytes (`cuobjdump -res-usage`)
+  and, with `--ncu`, Nsight Compute's SpeedOfLight, Occupancy and WarpStateStats sections over one call per column
+  count (FOLDER/profile-ncu.txt; needs the GPU's performance counters).
 
 ## Kernel profile
 

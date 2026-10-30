@@ -262,23 +262,36 @@ and stores each position's log-probability and the reference's top 16 under the 
 
 **Quality modes.** A run judges quality in one of two modes, recorded in `requirements.quality_mode`.
 `preserve`, the default, judges against the checkpoint's arithmetic with exact (FP32) activations:
-what the engine loses on top of the weights the user chose. `as_quantized` judges against the
-checkpoint run as quantized: the same reference with the activations of every matrix and output head
-whose stored scheme declares input activations quantized as declared (NVFP4 in groups of 16 with the
-stored global scale, FP8 per token or per tensor; `crit_eval.limits.schemes.activations`), the arithmetic
-serving stacks run such a checkpoint with (W4A4, W8A8). Its scores are a store of their own
-(`reference-as-quantized/`, `crit eval reference --quality-mode as_quantized`, and reference packages
-carry them), and `crit eval run --quality-mode as_quantized` judges against them with the same rules
-and a drift budget twice preserve's (protocol `quality.mode_thresholds`: PPL ratio ≤ 1.10, mean KLD ≤ 0.10,
-p99 KLD ≤ 1.0). 4-bit activation math turns rounding-level differences into large KL swings: on
-Qwen3.8-27B NVFP4, prompt rows move by a mean KLD of 0.045-0.08 (p99 0.5-1.4) under rounding alone, and two
-valid as-quantized references differ by about as much, which would leave an engine none of the preserve
-budget to spend. The KV cache stays exact in both, so an engine's KV quantization is drift in either
-mode. On Qwen3.8-27B NVFP4, 4-bit prompt activations on the MLP matrices use 244% of the preserve
-budget, and on both matrix groups 396%: an engine that runs the checkpoint as stored fails `preserve`
-and is judged on equal terms in `as_quantized`. A model whose declared matrices the modeling code
-multiplies other than through `nn.Linear` (fused experts) is refused in `as_quantized` rather than left
-exact.
+what the engine loses on top of the weights the user chose. `as_quantized` judges against the same
+scores with each set's limits widened by what the checkpoint's own activation quantization costs: when the
+checkpoint declares quantized input activations on any matrix or the output head (NVFP4 in groups of 16 with the
+stored global scale, FP8 per token or per tensor; `crit_eval.limits.schemes.activations`), the arithmetic serving
+stacks run it with (W4A4, W8A8), the same `crit eval reference` run scores the texts a second time with those
+activations quantized as declared and keeps only how far that lands from the exact scores, per set and path
+(`allowance.json` beside the scores; reference packages carry it). `crit eval run --quality-mode as_quantized`
+then judges with a drift budget twice preserve's (protocol `quality.mode_thresholds`: PPL ratio ≤ 1.10, mean
+KLD ≤ 0.10, p99 KLD ≤ 1.0), each limit raised further to four times the allowance where that is larger, but
+never past four times that budget (PPL ratio 1.4, mean KLD 0.4, p99 KLD 4.0; protocol `quality.allowance`, its
+`margin` and `cap`; the result records `allowance` and `allowance_raised` per set, `status` names the sets). The cap
+stops a format the checkpoint carries badly from turning into room an engine may spend: Qwen3.8-Flash-Next NVFP4's
+own drift on the long-1024 prompt (mean KLD 0.28) would allow 1.1 nats per position without it. Qwen3.8-27B's
+raised limits stay below it (mean KLD 0.23, p99 3.7 at most), and its mtp4-nvfp4-mma engine uses 64% of them. A
+checkpoint that declares no quantized activations has an empty allowance, and `as_quantized` judges it as
+`preserve` with the wider budget. 4-bit activation math turns rounding-level differences into large KL swings:
+on Qwen3.8-27B NVFP4, prompt rows move by a mean KLD of 0.045-0.08 (p99 0.5-1.4) under rounding alone, so an
+engine that runs the format faithfully lands about as far from the checkpoint run as quantized as that run lands
+from the exact scores, and the margin leaves room for both. The checkpoints' own drift, as a share of the preserve
+budget on their worst set: Qwen3.8-27B NVFP4 183% (long-32768 prompt p99), Nanbeige4.3-33B NVFP4 319% (long-32768
+prompt p99), Qwen3.8-Flash-Next NVFP4 555% (long-1024 prompt mean). The KV cache stays exact in both, so an engine's
+KV quantization is drift in either mode. Fused experts (every expert's matrices stacked, gate and up joined along
+the output rows) quantize each expert matrix's input with that matrix's own declared scale; a model whose declared
+matrices the modeling code multiplies any other way than through `nn.Linear` or such fused experts gets no
+allowance (`unsupported`), and an `as_quantized` run of it says so rather than judging it as exact.
+
+Until crit-eval-v0.3.0 `as_quantized` kept a second full set of scores (`reference-as-quantized/`, with its own
+spread), judged against with twice preserve's budget: a second reference run and package per checkpoint.
+`crit eval reference` derives the allowance from such a store when the data holds one, without running again, and
+`crit eval fetch` removes it.
 
 The mode also sets the limits prefill and the first tokens are measured against, since an engine that keeps the
 activations exact cannot reach the stored format's rate (W4A4 runs several times faster than 16-bit activations).
@@ -300,7 +313,14 @@ it serves (`SET/served`), the answer, its first token from the prefill's last po
 from decode. No request returns the prompt positions' logits, but they are the prefill's arithmetic
 that every reply's first token comes from, a single position among a set's served ones: an engine
 whose prefill drifts far more than its decode (lower-precision prefill activations, for one) is
-judged on it. Both are also reported by position: absolute position in log2 buckets (1-511,
+judged on it. The prompt positions are judged by KLD alone, their perplexity ratio reported (since
+crit-eval-v0.2.1): they predict the user's own turn, which a chat model gives little probability
+(Qwen3.8-27B puts nearly all of it on `<|im_end|>`, for a prompt perplexity of about 3,000 to 5,300
+on the long texts), so the ratio is decided by the log-probabilities of tokens the model calls
+near-impossible. Scoring the reference again in FP32 with its prompt cut into 4,096-token instead
+of 8,192-token chunks moved single positions by up to 37 nats and the long-4096 prompt ratio to
+0.68 (TF32: 0.77 to 1.40 across the sets), while KLD, weighted by the reference's own
+probabilities, judges the same arithmetic. Both are also reported by position: absolute position in log2 buckets (1-511,
 512-1023, 1024-2047, ...) for the prompt and offset in the answer (1-31, 32-63, 64-127, 128-255) for
 the served positions, so a threshold where the engine switches kernels shows as a step (reported, not
 judged).
@@ -356,15 +376,22 @@ matmuls taking TF32 inputs (10-bit mantissas, about 1e-3 relative: the size of p
 engine's arithmetic introduces; FP32 rounding alone, another chunking at 1e-6, measured a spread a
 hundred times smaller on Flash-Next and so would have under-estimated what any engine faces) and stores
 how far that run lands from the stored scores, per set and path, by the same metrics
-(`spread.json` in each mode's store, protocol `quality.spread`; reference packages carry it). Quantized
-activations amplify it too: a TF32 difference that moves a value across an NVFP4 rounding boundary changes
-its 4-bit code even in a short text, so the spread is measured on every text, in both modes
-(until crit-eval-v0.2.0 only texts of at least 8,192 tokens had one; a spread stored under that rule is
-not used until `crit eval reference` scores it again). A run judges such a set against the larger of
+(`spread.json` beside the scores, protocol `quality.spread`; reference packages carry it). The spread is
+measured on every text (until crit-eval-v0.2.0 only texts of at least 8,192 tokens had one; a spread stored under
+that rule is not used until `crit eval reference` scores it again). A run judges such a set against the larger of
 the budget and twice the reference's own spread (mean and p99 KLD; the PPL ratio's distance from 1), and
 the result records the spread and the limits it raised (`reference_spread`, `limits`, `raised`);
 `status` names the sets so judged. A dense model's two runs stay far inside the budget, so nothing
 changes for it.
+
+The second run costs as much as the first, and most of it goes to the 32K text. Since crit-eval-v0.2.2 the texts
+shorter than 8,192 tokens run again first (protocol `quality.spread.probe`): when every set and path they hold stays
+below a twentieth of the level at which its spread would raise a limit (the budget over the factor of 2; the PPL
+ratio only on the served positions), the longer texts are not scored again and their sets are judged against the
+budget alone. Skipping can keep a limit where it is but never raise one, so it cannot let an engine pass that a full
+pass would fail. The margin of 20 covers how a dense model's spread grows from 4K to 32K tokens (12 times at most,
+on Nanbeige4.3-33B, still 180 times below the level); a model that amplifies rounding shows it in the short texts
+already and gets the full pass. `spread.json` then names the texts it skipped (`spread_skipped`).
 
 **Drift attribution.** `crit eval run --adapter A --attribute-drift` (with `--only quality` during development)
 scores the quality texts again after the run's own engine closes, on an engine opened with each of the adapter's
@@ -383,7 +410,7 @@ percentiles, and the KLD p99's 5th and 95th. `status` prints the worst set's 5th
 beside its share. It is reported, not judged: the gate judges the measured set.
 
 The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5 (`preserve`; twice
-that in `as_quantized`).
+that in `as_quantized`, raised per set by the allowance).
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
 `{"ppl_ratio_max": 1.0, "kld_mean_max": 0, "kld_p99_max": 0}` asks for no drift. Each set
 reports `budget_used`, its largest share of any limit. The budget is there to be spent on speed:

@@ -15,10 +15,15 @@ import sys
 from pathlib import Path
 
 STORE = "reference"
-# Each quality mode's reference scores: preserve, the model's own arithmetic with exact activations; as_quantized, with
-# the activations quantized as the checkpoint's own inference does (crit_eval.quality.reference).
-STORES = {"preserve": STORE, "as_quantized": "reference-as-quantized"}
-QUALITY_MODES = tuple(STORES)
+# The quality modes a run judges in: preserve, against the model's own arithmetic with exact activations; as_quantized,
+# against the same scores with the drift budget widened by the checkpoint's own activation quantization (ALLOWANCE).
+QUALITY_MODES = ("preserve", "as_quantized")
+# Where crit-eval before protocol crit-eval-v0.3.0 kept the as_quantized mode's own scores: read only to derive an
+# allowance from (crit_eval.quality.reference.store_allowance), removed by a fetch.
+LEGACY_AS_QUANTIZED = "reference-as-quantized"
+# How far the checkpoint run with its activations quantized as it declares lands from the stored scores, per set and
+# path (crit_eval.quality.reference.store_allowance): the as_quantized mode's allowance, beside the scores.
+ALLOWANCE = "allowance.json"
 # The reference's own spread (protocol quality.spread): how a second run of the long texts under an engine-sized
 # perturbation (TF32 matmuls) disagrees with the stored scores, per set and path, with the identity it was computed
 # under.
@@ -79,7 +84,7 @@ def safetensors(tensors, metadata=None):
 
 def write(data, identity_value, scores, store=STORE):
     """Store scores ({text id: (target [n - 1], top ids [n - 1][k], top logprobs [n - 1][k])}, sequences of
-    numbers) under prepared data folder `data` (in `store`, a quality mode's of STORES): one file per text, then
+    numbers) under prepared data folder `data` (in `store`): one file per text, then
     index.json with `identity_value` and each file's sha256. Returns the bytes written."""
     folder = Path(data) / store
     folder.mkdir(parents=True, exist_ok=True)
@@ -119,6 +124,29 @@ def load_spread(data, expected, store=STORE):
     if any(found.get(key) != value for key, value in expected.items()):
         return None
     return stored["sets"]
+
+
+def write_allowance(data, identity_value, allowance):
+    """Store the as_quantized allowance ({"activations", "sets": {"SET/path": text_quality row}, ...}) beside the
+    reference scores of prepared data folder `data`."""
+    folder = Path(data) / STORE
+    folder.mkdir(parents=True, exist_ok=True)
+    temporary = folder / (ALLOWANCE + ".tmp")
+    temporary.write_text(json.dumps({"identity": identity_value, **allowance}, indent=1), encoding="utf-8")
+    temporary.replace(folder / ALLOWANCE)
+
+
+def load_allowance(data, expected):
+    """The allowance stored under `data` whose identity holds every key of `expected` ({"activations", "sets", ...},
+    without the identity); None when none is stored or it is another identity's."""
+    path = Path(data) / STORE / ALLOWANCE
+    if not path.is_file():
+        return None
+    stored = json.loads(path.read_text(encoding="utf-8"))
+    found = stored.pop("identity", None) or {}
+    if any(found.get(key) != value for key, value in expected.items()):
+        return None
+    return stored
 
 
 def load(data, expected, store=STORE):

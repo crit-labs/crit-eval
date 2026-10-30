@@ -44,14 +44,16 @@ config.json its metadata derives (crit_core.model.gguf_files) unless its folder 
 Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
 run once per prepared data.
 
-Quality mode as_quantized (`crit eval reference --quality-mode as_quantized`) scores the texts once more with the
-activations quantized as the checkpoint's own inference does: every matrix (and the output head) whose stored scheme
-declares input activations (crit_eval.limits.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
-token or per tensor) multiplies its inputs quantized and dequantized in FP32, the weights as in preserve mode. The KV
-cache and every other operation stay as in preserve mode. Its scores have a store of their own (crit_eval.quality.fixed
-STORES), so an engine that runs the checkpoint as quantized is judged against that arithmetic, not the exact one. A
-matrix with declared activations that the modeling code multiplies other than through an nn.Linear (fused experts) is
-refused rather than left exact.
+Quality mode as_quantized (protocol quality.allowance): when the checkpoint declares quantized input activations,
+the same run scores the texts once more with the activations quantized as the checkpoint's own inference does: every
+matrix (and the output head) whose stored scheme declares input activations (crit_eval.limits.schemes.activations:
+NVFP4 in groups of 16 with the stored global scale, FP8 per token or per tensor) multiplies its inputs quantized and
+dequantized in FP32, the weights as in preserve mode. The KV cache and every other operation stay as in preserve mode.
+Only how far that run lands from the stored scores is kept, per set and path (store_allowance, fixed.ALLOWANCE): an
+engine that runs the checkpoint as quantized is judged against the exact scores with its limits widened by that drift.
+Fused experts (MergeModulelist, then Concatenate along the output rows) quantize each expert matrix's input with that
+matrix's own declared scale (_FusedInputs). A matrix with declared activations that the modeling code multiplies any
+other way is refused rather than left exact.
 """
 import math
 import re
@@ -62,7 +64,7 @@ from pathlib import Path
 from .. import EVAL_DIR, load_json
 from ..architectures.indexers import FORM_VERSIONS, exact_forms
 from .prepare import PREPARED, model_identity, prepared_template
-from .fixed import QUALITY_MODES, STORE, STORES
+from .fixed import QUALITY_MODES, STORE
 from ..limits.schemes import PRIMARY, SchemeError
 from .attention import CHUNKED, CHUNKED_SINKS, _sink_attention, chunked_attention, chunked_sink_attention
 from .checkpoints import (STAGE_LIMIT, TORCH_DTYPES, TensorCheckpoint, _Substituted, _stored_tensor, _text_config,
@@ -159,7 +161,76 @@ class _StreamedExperts:
                                        target_patterns=self.converter.target_patterns, full_layer_name=self.name,
                                        config=self.reference.config)
         (tensor,) = inputs.values()
-        return tensor.float()[0]
+        tensor = tensor.float()[0]
+        if _FusedInputs.active is not None:
+            _FusedInputs.active.tag(self, expert, tensor)
+        return tensor
+
+
+class _FusedInputs:
+    """Quality mode as_quantized for a fused experts module (StreamingReference._fused_inputs): while its forward
+    runs, an expert's matrix read from one of its fused parameters (param[expert], or a _StreamedExperts index) is
+    remembered, and a linear with it as the weight multiplies each block of output rows by the input quantized as
+    that block's stored matrix declares (crit_eval.limits.schemes.quantize_activations), the rows joined in order."""
+    active = None
+
+    def __init__(self, module, fused):
+        self.module, self.fused, self.tags = module, fused, {}
+
+    def tag(self, source, expert, tensor):
+        attribute = next((name for name in self.fused if getattr(self.module, name, None) is source), None)
+        if attribute is not None:
+            self.tags[id(tensor)] = (tensor, self.fused[attribute][expert])
+
+    def linear(self, x, weight, bias):
+        import torch
+        from ..limits.schemes import quantize_activations
+        _, parts = self.tags.pop(id(weight))
+        out, row = [], 0
+        for _, rows, declared in parts:
+            block = weight[row: row + rows]
+            out.append(torch.nn.functional.linear(quantize_activations(x, *declared) if declared else x, block,
+                                                  None if bias is None else bias[row: row + rows]))
+            row += rows
+        return torch.cat(out, dim=-1)
+
+
+def _quantize_fused_inputs(module, fused):
+    """Run `module`'s forward with _FusedInputs for its fused parameters `fused` (set once per module)."""
+    import torch
+    from torch.overrides import TorchFunctionMode
+    forward = module.forward
+
+    class Mode(TorchFunctionMode):
+        def __init__(self, inputs):
+            super().__init__()
+            self.inputs = inputs
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            if func is torch.Tensor.__getitem__ and isinstance(args[0], torch.nn.Parameter):
+                out = func(*args, **kwargs)
+                if isinstance(args[1], (int, torch.Tensor)) and (not isinstance(args[1], torch.Tensor)
+                                                                 or args[1].numel() == 1):
+                    self.inputs.tag(args[0], int(args[1]), out)
+                return out
+            if func is torch.nn.functional.linear:
+                weight = args[1] if len(args) > 1 else kwargs.get("weight")
+                if id(weight) in self.inputs.tags and self.inputs.tags[id(weight)][0] is weight:
+                    bias = args[2] if len(args) > 2 else kwargs.get("bias")
+                    return self.inputs.linear(args[0] if args else kwargs["input"], weight, bias)
+            return func(*args, **kwargs)
+
+    def quantized(*args, **kwargs):
+        inputs = _FusedInputs(module, fused)
+        previous, _FusedInputs.active = _FusedInputs.active, inputs
+        try:
+            with Mode(inputs):
+                return forward(*args, **kwargs)
+        finally:
+            _FusedInputs.active = previous
+
+    module.forward = quantized
 
 
 class _Captured(Exception):
@@ -469,6 +540,14 @@ class StreamingReference:
         self._config_dt_limit(module)
         return module
 
+    def declared_activations(self):
+        """The input activation formats the checkpoint declares for the text model's matrices and the output head
+        (crit_eval.limits.schemes.activations), sorted; empty for a checkpoint that declares none (weight-only schemes,
+        plain weights, a GGUF). SchemeError for a declared form crit does not emulate."""
+        head = self._key("lm_head.weight", "")[: -len(".weight")]
+        return sorted({declared[0] for base in self.members if base.startswith(self.prefix) or base == head
+                       for declared in [self._activations(base)] if declared})
+
     def _activations(self, base):
         from ..limits.schemes import activations
         if base not in self.inputs:
@@ -478,8 +557,9 @@ class StreamingReference:
     def _quantize_inputs(self, module, path):
         """Quality mode as_quantized: the nn.Linear matrices of `module` (modeling-code path `path`) whose checkpoint
         declares input activations quantize their inputs as it declares (crit_eval.limits.schemes.quantize_activations), by
-        a forward pre-hook set once per module. In a decoder layer, every stored matrix with declared activations must
-        be one of them: one the modeling code multiplies otherwise (fused experts, a converted parameter) is refused."""
+        a forward pre-hook set once per module, and fused experts per expert matrix (_fused_inputs). In a decoder layer,
+        every stored matrix with declared activations must be one of them: one the modeling code multiplies otherwise
+        (a converted parameter of another form) is refused."""
         from ..limits.schemes import quantize_activations
         hooked = set()
         for sub, child in module.named_modules():
@@ -498,6 +578,14 @@ class StreamingReference:
                 child._crit_hook = child.register_forward_pre_hook(
                     lambda _, args, kind=kind, scale=scale: (quantize_activations(args[0], kind, scale),) + tuple(args[1:]))
                 child._crit_inputs = declared
+        for sub, child in module.named_modules():
+            if getattr(child, "_crit_fused", None) is None:
+                fused = self._fused_inputs(child, path + (sub + "." if sub else ""))
+                if fused:
+                    _quantize_fused_inputs(child, fused)
+                child._crit_fused = fused
+            hooked.update(base for specs in (child._crit_fused or {}).values() for parts in specs
+                          for base, _, _ in parts)
         if path:
             prefix = self.prefix + path
             missed = sorted(base for base in self.members if base.startswith(prefix) and base not in hooked
@@ -506,6 +594,36 @@ class StreamingReference:
                 raise SchemeError(f"as_quantized: {', '.join(missed[:3])} declare quantized input activations, but the "
                                   "modeling code multiplies them other than through an nn.Linear (fused experts or a "
                                   "converted parameter); crit does not emulate their activations")
+
+    def _fused_inputs(self, module, path):
+        """Quality mode as_quantized: {attribute: per expert [(base, rows, activations), ...] in output-row order} for
+        `module`'s own fused expert parameters (modeling-code path `path`) whose stored matrices declare input
+        activations: the converter only stacks the experts' matrices (MergeModulelist along dim 0) and joins them
+        along the output rows (Concatenate along dim 1), so each output row of expert e comes from one stored matrix
+        and multiplies the input quantized as that matrix declares. Empty when none declares activations."""
+        found = {}
+        for attribute, value in module.named_parameters(recurse=False):
+            name = path + attribute
+            if name not in self.converted or value.dim() != 3 or self._target(name) in self.members:
+                continue
+            converter, parts = self.converted[name]
+            operations = converter.operations
+            if not operations or type(operations[0]).__name__ != "MergeModulelist" or operations[0].dim != 0 \
+                    or any(type(op).__name__ != "Concatenate" or op.dim != 1 for op in operations[1:]) \
+                    or any(len(sources) != value.shape[0] for sources in parts.values()):
+                if any(self._activations(base) for sources in parts.values() for base, _ in sources):
+                    raise SchemeError(f"as_quantized: {name} joins matrices that declare quantized input activations "
+                                      "in a way crit does not emulate")
+                continue
+            patterns = [pattern for pattern in converter.source_patterns if pattern in parts]
+            specs = [[(parts[pattern][expert][0], int(self.checkpoint.header(parts[pattern][expert][1]).shape[0]),
+                       self._activations(parts[pattern][expert][0])) for pattern in patterns]
+                     for expert in range(value.shape[0])]
+            if sum(rows for _, rows, _ in specs[0]) != value.shape[1]:
+                raise SchemeError(f"as_quantized: {name}: its stored matrices' rows do not make its {value.shape[1]}")
+            if any(declared for parts_ in specs for _, _, declared in parts_):
+                found[attribute] = specs
+        return found
 
     def _streamed(self, module, path):
         """{name: _StreamedExperts} of `module`'s fused expert parameters to decode expert by expert: those whose
@@ -1049,7 +1167,7 @@ class StreamingReference:
 
 
 def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print, check=lambda: None, spread=None,
-                layout=None, store=STORE):
+                layout=None, store=STORE, budget=None):
     """Score every fixed text once per identity and store the scores under prepared data folder `data`
     (crit_eval.quality.fixed: each position's target log-probability, top_k ids and their log-probabilities, with the identity:
     the reference's, top_k, valid_vocab and every text's ids). texts: {text id: (ids, long)}. Returns how they were
@@ -1057,8 +1175,9 @@ def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print
     spread (protocol quality.spread) with layout ({text id: (set, prompt tokens)}): the texts of at least
     spread["from_tokens"] tokens are scored once more under spread["perturbation"] (store_spread), the model's own
     arithmetic perturbed as an engine's would be, and how far that run lands from the stored scores is stored per set
-    and path (fixed.write_spread), the spread a run judges those sets against; "spread" says whether it was stored or
-    scored. store: the folder of the reference's quality mode (crit_eval.quality.fixed STORES)."""
+    and path (fixed.write_spread), the spread a run judges those sets against; "spread" says whether it was stored,
+    scored or probed (store_spread). store: the scores' folder (crit_eval.quality.fixed STORE). budget: the drift
+    budget the spread's probe is measured against (protocol quality.thresholds)."""
     import shutil
     from . import fixed
     identity = dict(reference.identity(model_sha), **fixed.identity(texts, top_k, valid_vocab))
@@ -1077,7 +1196,7 @@ def store_texts(reference, texts, top_k, valid_vocab, data, model_sha, log=print
         out = {"method": "scored", "seconds": round(time.time() - started, 1), "positions": positions, "bytes": size}
     if spread and layout:
         out["spread"] = store_spread(reference, texts, top_k, valid_vocab, data, identity, spread, layout, log, check,
-                                     store)
+                                     store, budget)
     return out
 
 
@@ -1085,7 +1204,7 @@ SPREAD_PERTURBATIONS = ("tf32",)
 
 
 def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, layout, log=print, check=lambda: None,
-                 store=STORE):
+                 store=STORE, budget=None):
     """The reference's own spread on the texts of at least rule["from_tokens"] tokens (store_texts): scored once more
     under rule["perturbation"] and compared with the stored scores by crit_eval.reports.metrics.text_quality per set and path
     (SET/prompt: the prompt positions, SET/served: the continuation's), stored with the identity plus the perturbation
@@ -1093,10 +1212,12 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
     size of perturbation a BF16 or FP8 engine's arithmetic introduces, so a model that amplifies rounding (routing
     near-ties, hard top-k, a recurrent state) shows how far such an engine must be expected to land; FP32 rounding alone
     (another chunking, 1e-6) proved a hundred times too small on a sparse MoE model. On a device without TF32 (the
-    CPU) the pass is the same arithmetic and the spread is zero. Returns "stored", "scored" or "none" (no text that
+    CPU) the pass is the same arithmetic and the spread is zero. With rule["probe"] and a budget, the texts shorter
+    than probe["below_tokens"] run first, and the longer ones only when the probe's spread is not tiny (_spread_tiny):
+    a spread stored so holds the probed sets and names the texts it skipped (spread_skipped), whose sets are judged
+    against the budget alone. Returns "stored", "scored", "probed" (the longer texts skipped) or "none" (no text that
     long)."""
     from . import fixed
-    from ..reports import metrics
     perturbation = rule.get("perturbation", "tf32")
     if perturbation not in SPREAD_PERTURBATIONS:
         raise SystemExit(f"quality.spread.perturbation must be one of {', '.join(SPREAD_PERTURBATIONS)}")
@@ -1106,42 +1227,148 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
         return "none"
     if fixed.load_spread(data, spread_identity, store) is not None:
         return "stored"
-    names = list(long_texts)
-    log(f"reference spread: {len(names)} text(s) scored again with {perturbation} matmuls")
+    probe = rule.get("probe") if budget else None
+    first = [name for name in long_texts if probe is None or len(long_texts[name][0]) < int(probe["below_tokens"])]
+    later = [name for name in long_texts if name not in first]
+    if not first or not later:
+        first, later = list(long_texts), []
+    log(f"reference spread: {len(first)} text(s) scored again with {perturbation} matmuls"
+        + (f" (the {len(later)} of at least {int(probe['below_tokens']):,} tokens only if their spread is not tiny)"
+           if later else ""))
+    rows = _spread_rows(reference, {name: long_texts[name] for name in first}, top_k, valid_vocab, data, store, log,
+                        check)
+    sets = _spread_sets(rows, fixed.load(data, identity, store), layout)
+    skipped = []
+    if later:
+        tiny = _spread_tiny(sets, budget, float(rule["factor"]), float(probe["margin"]))
+        if tiny:
+            skipped = sorted(later)
+            log(f"reference spread: below 1/{probe['margin']:g} of the budget over factor on every probed set; "
+                f"{', '.join(skipped)} not scored again (their sets are judged against the budget alone)")
+        else:
+            log(f"reference spread: not tiny on the probed sets; {len(later)} more text(s) scored again")
+            rows.update(_spread_rows(reference, {name: long_texts[name] for name in later}, top_k, valid_vocab, data,
+                                     store, log, check))
+            sets = _spread_sets(rows, fixed.load(data, identity, store), layout)
+    for name, row in sets.items():
+        log(f"reference spread {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
+            f"PPL x{row['ppl_ratio']:.4f} over {row['targets']:,} positions")
+    fixed.write_spread(data, {**spread_identity, **({"spread_skipped": skipped,
+                                                      "spread_probe": {key: probe[key] for key in ("below_tokens",
+                                                                                                   "margin")}}
+                                                     if skipped else {})}, sets, store)
+    return "probed" if skipped else "scored"
+
+
+def _spread_rows(reference, texts, top_k, valid_vocab, data, store, log, check):
+    """{text id: rows} of `texts` ({id: (ids, long)}) scored with TF32 matmuls (store_spread)."""
     torch = reference.torch
+    names = list(texts)
     previous = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
     try:
-        rows = reference.score_texts([long_texts[name][0] for name in names], top_k, valid_vocab,
+        rows = reference.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
                                      Path(data) / store / "scratch-spread", log=log,
-                                     long={i for i, name in enumerate(names) if long_texts[name][1]}, check=check)
+                                     long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
     finally:
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous
-    stored = fixed.load(data, identity, store)
+    return dict(zip(names, rows))
+
+
+def _spread_sets(rows, stored, layout):
+    """{"SET/path": text_quality row} of a run's rows ({text id: (target, top ids, top log-probabilities)} tensors)
+    against the stored scores, the texts' positions split as crit_eval.run.quality_checks.run_quality splits them."""
+    return _compare_sets({name: [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
+                                 for lp, ids, tops in zip(target.tolist(), top.tolist(), values.tolist())]
+                          for name, (target, top, values) in rows.items()}, stored, layout)
+
+
+def _compare_sets(found_rows, stored, layout):
+    """_spread_sets of rows in an engine's form ({text id: [{"logprob", "top": [[id, logprob], ...]}, ...]})."""
+    from ..reports import metrics
     parts = {}
-    for name, (target, top, values) in zip(names, rows):
+    for name, again in found_rows.items():
         set_name, prompt = layout[name]
-        again = [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
-                 for lp, ids, tops in zip(target.tolist(), top.tolist(), values.tolist())]
-        last = prompt - 1   # as quality_checks.run_quality splits a text's positions
+        last = prompt - 1
         for part, pick in (("prompt", slice(0, last)), ("served", slice(last, None))):
             reference_rows, found = parts.setdefault(f"{set_name}/{part}", ([], []))
             reference_rows += stored[name][pick]
             found += again[pick]
-    sets = {}
-    for name, (reference_rows, found) in parts.items():
-        if found:
-            sets[name] = metrics.text_quality(reference_rows, found)
-            log(f"reference spread {name}: KLD mean {sets[name]['kld_mean']:.2e}, p99 {sets[name]['kld_p99']:.2e}, "
-                f"PPL x{sets[name]['ppl_ratio']:.4f} over {sets[name]['targets']:,} positions")
-    fixed.write_spread(data, spread_identity, sets, store)
-    return "scored"
+    return {name: metrics.text_quality(reference_rows, found)
+            for name, (reference_rows, found) in parts.items() if found}
 
 
-def score_data(model, data, log=print, check=lambda: None, quality_mode="preserve"):
+def _spread_tiny(sets, budget, factor, margin):
+    """Whether every set and path's spread stays below 1/margin of the level where it would raise a limit
+    (crit_eval.run.quality_checks.set_limits: the budget over factor), the perplexity ratio judged on the served
+    positions only (protocol quality.prompt_perplexity)."""
+    for name, row in sets.items():
+        if row["kld_mean"] * factor * margin > budget["kld_mean_max"] or \
+                row["kld_p99"] * factor * margin > budget["kld_p99_max"]:
+            return False
+        if name.endswith("/served") and abs(row["ppl_ratio"] - 1.0) * factor * margin > budget["ppl_ratio_max"] - 1.0:
+            return False
+    return True
+
+
+def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, declared, log=print,
+                    check=lambda: None, device="cuda"):
+    """protocol quality.allowance: how far the checkpoint run with its activations quantized as it declares
+    (`declared`: StreamingReference.declared_activations) lands from the stored scores, per set and path
+    (_compare_sets), stored beside them (fixed.write_allowance) for runs in quality mode as_quantized. A checkpoint
+    that declares none stores an empty allowance (as_quantized is then preserve). Scores of the as_quantized mode
+    stored by crit-eval before protocol crit-eval-v0.3.0 (fixed.LEGACY_AS_QUANTIZED) of the same model, texts and
+    reference give it without the second run. Returns "stored", "none", "derived", "measured" or "unsupported" (a
+    declared form crit does not emulate, recorded so runs in that mode say why)."""
+    from . import fixed
+    allowance_identity = {**identity, "allowance": "as_quantized"}
+    if fixed.load_allowance(data, allowance_identity) is not None:
+        return "stored"
+    if isinstance(declared, Exception):
+        fixed.write_allowance(data, allowance_identity, {"unsupported": str(declared), "sets": {}})
+        log(f"reference allowance: not measured ({declared})")
+        return "unsupported"
+    if not declared:
+        fixed.write_allowance(data, allowance_identity, {"activations": [], "sets": {}})
+        return "none"
+    stored = fixed.load(data, identity)
+    legacy = fixed.load(data, {**{key: identity[key] for key in ("reference", "model_sha256", "top_k", "valid_vocab",
+                                                                 "texts")}, "quality_mode": "as_quantized"},
+                        fixed.LEGACY_AS_QUANTIZED)
+    started = time.time()
+    if legacy is not None:
+        found = {name: [{"logprob": row["logprob"], "top": list(zip(row["top_ids"], row["top_logprobs"]))}
+                        for row in rows] for name, rows in legacy.items()}
+        sets, how = _compare_sets(found, stored, layout), "derived"
+        log(f"reference allowance: derived from the {fixed.LEGACY_AS_QUANTIZED} scores stored beside the data")
+    else:
+        names = list(texts)
+        log(f"reference allowance: the texts scored again with the activations quantized as the checkpoint declares "
+            f"({', '.join(declared)})")
+        try:
+            quantized = StreamingReference(model, device, quality_mode="as_quantized")
+            rows = quantized.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
+                                         Path(data) / STORE / "scratch-allowance", log=log,
+                                         long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
+        except SchemeError as error:
+            fixed.write_allowance(data, allowance_identity, {"unsupported": str(error), "sets": {}})
+            log(f"reference allowance: not measured ({error})")
+            return "unsupported"
+        sets, how = _spread_sets(dict(zip(names, rows)), stored, layout), "measured"
+    for name, row in sets.items():
+        log(f"reference allowance {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
+            f"PPL x{row['ppl_ratio']:.4f} over {row['targets']:,} positions")
+    fixed.write_allowance(data, allowance_identity, {"activations": declared, "sets": sets, "source": how,
+                                                     "seconds": round(time.time() - started, 1)})
+    return how
+
+
+def score_data(model, data, log=print, check=lambda: None, quality_mode=None):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
-    store the scores under the data (crit_eval.quality.fixed, the store of `quality_mode`), unless they are stored already
-    under the same identity. check() runs between layers and texts: it raises to stop. Returns how they were
+    store the scores under the data (crit_eval.quality.fixed), with the reference's own spread and, for a checkpoint
+    that declares quantized activations, the as_quantized allowance (store_allowance), unless they are stored already
+    under the same identity: one run serves both quality modes (quality_mode is accepted from callers of earlier
+    versions and changes nothing). check() runs between layers and texts: it raises to stop. Returns how they were
     obtained."""
     from . import fixed
     protocol = load_json(EVAL_DIR / "protocol.json")
@@ -1149,7 +1376,19 @@ def score_data(model, data, log=print, check=lambda: None, quality_mode="preserv
     if model_identity(model, prepared_template(prepared))["sha256"] != prepared["model"]["sha256"]:
         raise SystemExit(f"{model} is not the checkpoint {data} was prepared from: the reference is that checkpoint")
     layout = {t["id"]: (t["set"], len(t["prompt_ids"])) for t in prepared["quality"]}
-    return store_texts(StreamingReference(model, quality_mode=quality_mode), fixed.texts(prepared),
-                       protocol["quality"]["top_k"], prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log,
-                       check=check, spread=protocol["quality"].get("spread"), layout=layout,
-                       store=STORES[quality_mode])
+    texts, top_k = fixed.texts(prepared), protocol["quality"]["top_k"]
+    reference = StreamingReference(model)
+    out = store_texts(reference, texts, top_k, prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log,
+                      check=check, spread=protocol["quality"].get("spread"), layout=layout,
+                      budget=protocol["quality"]["thresholds"])
+    identity = dict(reference.identity(prepared["model"]["sha256"]), **fixed.identity(texts, top_k, prepared["valid_vocab"]))
+    try:
+        declared = reference.declared_activations()
+    except SchemeError as error:
+        declared = error
+    del reference   # its device memory and staging buffers, before the quantized pass builds its own
+    import gc
+    gc.collect()
+    out["allowance"] = store_allowance(model, data, texts, top_k, prepared["valid_vocab"], identity, layout, declared,
+                                       log, check)
+    return out
