@@ -6,7 +6,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval.run import chat, history, runner, timing
+from crit_eval.run import chat, estimate, history, runner, stages, timing
 from crit_eval.reports import status  # noqa: E402
 
 TURNS = [{"turn": 1, "prompt_ids": list(range(1, 101))},
@@ -15,15 +15,16 @@ TURNS = [{"turn": 1, "prompt_ids": list(range(1, 101))},
 
 
 class Engine(chat.ChatEngine):
-    """An engine behind a server: with `cache`, it serves the longest prompt prefix it saw before from its cache;
-    with `drifts`, a reply after a cache hit differs from a fresh one."""
+    """An engine behind a server: with `cache`, it serves the longest prompt prefix it saw before from its cache, with
+    `exact` only a prompt it saw whole; with `drifts`, a reply after a cache hit differs from a fresh one."""
 
-    def __init__(self, cache=False, drifts=False):
-        self.cache, self.drifts, self.seen, self.asked = cache, drifts, [], []
+    def __init__(self, cache=False, drifts=False, exact=False):
+        self.cache, self.drifts, self.exact, self.seen, self.asked = cache or exact, drifts, exact, [], []
 
     def generate(self, prompt, max_new_tokens, on_tokens, prompt_cache=False):
         self.asked.append(prompt_cache)
-        cached = max((len(p) for p in self.seen if prompt[:len(p)] == p), default=0) if self.cache else 0
+        cached = max((len(p) for p in self.seen if prompt[:len(p)] == p and (not self.exact or p == prompt)),
+                     default=0) if self.cache else 0
         self.seen.append(list(prompt))
         tokens = [len(prompt) % 50 + (1 if self.drifts and cached else 0)] * max_new_tokens
         on_tokens(tokens)
@@ -34,12 +35,12 @@ class Engine(chat.ChatEngine):
 class FollowupTests(unittest.TestCase):
     protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
 
-    def measure(self, engine, max_context=1000):
-        prepared = {"followup": TURNS}
-        first = history.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None)
+    def measure(self, engine, max_context=1000, **info):
+        prepared, info = {"followup": TURNS}, {"max_context": max_context, **info}
+        first = history.run_followup(engine, info, prepared, self.protocol, lambda m: None)
         if first["status"] == "measured":
             first["again"] = history.compare_followup(
-                first, history.run_followup(engine, {"max_context": max_context}, prepared, self.protocol, lambda m: None))
+                first, history.run_followup(engine, info, prepared, self.protocol, lambda m: None))
         gate = next(g for g in status._gates({"requirements": {"exactness": "reported"}, "context": {"tokens": None,
                     "reason": "-", "missing": []}, "followup": first}) if g["name"] == "prompt_cache")
         return first, gate
@@ -65,6 +66,30 @@ class FollowupTests(unittest.TestCase):
         first, gate = self.measure(Engine(cache=True, drifts=True))
         self.assertEqual(gate["state"], "fail")
         self.assertIn("turn 1 differs at token 0", gate["detail"])   # cached the second time, fresh the first
+
+    def test_an_exact_prompt_cache_hits_only_in_the_second_pass(self):
+        # Cached tokens of 0 in the first pass declare no "no prompt cache": this cache serves each turn again whole.
+        first, gate = self.measure(Engine(exact=True, drifts=True))
+        self.assertEqual([t["cached_tokens"] for t in first["turns"]], [0, 0, 0])
+        self.assertEqual(gate["state"], "fail")
+
+    def test_an_engine_that_declares_no_prompt_cache_is_not_sent_the_turns_and_passes(self):
+        engine = Engine()
+        first, gate = self.measure(engine, prompt_cache=False)
+        self.assertEqual((first["status"], first["no_prompt_cache"], engine.seen), ("skipped", True, []))
+        self.assertEqual(gate["state"], "pass")
+        self.assertIn("declares no prompt cache", gate["detail"])
+        # Neither pass is priced: not in the run's estimate, nor in stage 2 and 3 of a staged run.
+        protocol, prepared = self.protocol, {"speed": [], "followup": TURNS}
+        for declared, expected in ((None, {"followup", "followup_again"}), (False, set())):
+            info = {"max_context": 1000, **({} if declared is None else {"prompt_cache": declared})}
+            found = estimate.requests(prepared, protocol, ("followup",), None, info=info)
+            self.assertEqual(set(found), expected)
+            planned = stages.stage_requests(prepared, protocol, None, info, protocol["context"])
+            self.assertEqual({part for stage in (2, 3) for part in planned[stage]} & {"followup", "followup_again"},
+                             expected)
+        # crit serve publishes it among the engine facts.
+        self.assertIn("prompt_cache", chat.FACTS)
 
     def test_turns_that_do_not_fit_are_skipped_and_unmeasured(self):
         first, gate = self.measure(Engine(), max_context=150)

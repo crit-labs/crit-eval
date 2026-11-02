@@ -5,7 +5,7 @@ from pathlib import Path
 import sys
 
 # runner.PARTS, kept here so parsing imports nothing else.
-PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup")
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
 CHAT_TEMPLATE_HELP = ("Chat template (jinja) to render the prompts with, for a model that carries none (default: the "
                       "one crit ships for the model's family); it becomes part of the model's identity")
 
@@ -54,7 +54,8 @@ def main(argv=None):
     run.add_argument("--only", choices=list(PARTS), action="append",
                      help="Run only these parts (repeatable); default is all. context: the long-context curve and "
                           "retrieval up to the required context and the speed cases again at a lower context; "
-                          "history: the same requests on the fresh engine and after every other part")
+                          "history: the same requests on the fresh engine and after every other part; "
+                          "concurrency: closed-loop clients on a served engine that runs several requests at once")
     run.add_argument("--repetitions", type=int, help="Override the protocol's measured repetitions")
     run.add_argument("--warmups", type=int, help="Override the protocol's warmup runs")
     run.add_argument("--label", help="Name shown in comparisons")
@@ -66,7 +67,7 @@ def main(argv=None):
                      help='Drift limits over the protocol defaults, e.g. \'{"ppl_ratio_max": 1.02}\'; '
                           'keys ppl_ratio_max, kld_mean_max, kld_p99_max')
     run.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
-                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized: against the same scores with each set's budget widened by how far the checkpoint's own activation quantization lands from them (the allowance crit eval reference measures)")
+                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized, the mode for speed: against the same scores with a budget eight times preserve's, output differences that part at near-ties allowed")
     run.add_argument("--exactness", choices=["reported", "required"],
                      help="reported (default): agreement with plain greedy is shown and the quality budget judges "
                           "the output; required: any difference fails the gate")
@@ -94,11 +95,10 @@ def main(argv=None):
                           "context_reserve_gib, else the protocol's reserve_gib)")
     run.add_argument("--vram-headroom-gib", type=float, default=None,
                      help="Device memory left free when crit-eval computes the max context (default 1)")
-    run.add_argument("--adaptive-sampled", action=argparse.BooleanOptionalAction, default=True,
+    run.add_argument("--adaptive-sampled", action=argparse.BooleanOptionalAction, default=False,
                      help="Repeat each sampled speed case at further seeds until its relative standard error reaches "
-                          "the protocol's target or its repetition cap (protocol sampled_speed.adaptive; the default). "
-                          "--no-adaptive-sampled keeps the seeds' repetitions alone: an override like --repetitions, "
-                          "recorded in the result")
+                          "the protocol's target or its repetition cap (protocol sampled_speed.adaptive), recorded in "
+                          "the result; off by default: the protocol's one seed")
     run.add_argument("--attribute-drift", action="store_true",
                      help="After quality, score it again on an engine opened with each of the adapter's exact_variants "
                           "(one matrix group or arithmetic choice exact) and report each one's share of the drift budget")
@@ -107,6 +107,17 @@ def main(argv=None):
                           "the round stops there; protocol speed.disturbed_spread)")
     run.add_argument("--chat-template", metavar="FILE",
                      help=CHAT_TEMPLATE_HELP + "; data prepared already must have been prepared with it")
+    run.add_argument("--resume", metavar="JOURNAL",
+                     help="Go on from a round that stopped (interrupted, crashed, a disturbed device, a hung engine): "
+                          "its journal (R.journal.jsonl beside its result R.json) answers the requests it served, "
+                          "the engine loads only for the requests left; the round's options must be the same")
+    run.add_argument("--jitter-seed", type=int, metavar="SEED",
+                     help="Draw the held-out prompts' and the long-context curve's lengths from this seed, a recorded "
+                          "result's jitter.seed, to measure at its lengths again (default: a new seed per run; a "
+                          "resumed round's from its journal; protocol jitter)")
+    run.add_argument("--no-journal", action="store_true",
+                     help="Write no journal beside the result (by default every engine opened and request served is "
+                          "one line of OUT's .journal.jsonl, synced as it completes)")
 
     context = subs.add_parser("context", help="The max context for a model on a device: the model's positions and "
                                               "the KV cache that fits next to its weights")
@@ -127,10 +138,17 @@ def main(argv=None):
                               "out of the KV cache (repeatable)")
     context.add_argument("--json", action="store_true", help="Print the computation as JSON")
 
-    probe = subs.add_parser("probe", help="Measure device bandwidth and GEMM rates per weight format (needs nvcc)")
+    probe = subs.add_parser("probe", help="Measure device bandwidth and GEMM rates per weight format (needs nvcc, "
+                                          "or hipcc on ROCm)")
     probe.add_argument("--out", required=True, help="Device JSON path for `run --device`")
+    probe.add_argument("--backend", choices=("cuda", "hip"), help="Device API to probe (default: cuda when nvcc is found, "
+                                                                  "else hip when hipcc is)")
     probe.add_argument("--nvcc", help="nvcc to build the probe with (default: PATH, CUDA_HOME, /usr/local/cuda*)")
+    probe.add_argument("--hipcc", help="hipcc to build the HIP probe with (default: PATH, ROCM_PATH, /opt/rocm*)")
     probe.add_argument("--repeats", type=int, default=3, help="Probe runs; each value is the median")
+    probe.add_argument("--devices", metavar="all|N,M", type=lambda v: v if v == "all" else [int(x) for x in v.split(",")],
+                       help="Probe several GPUs (CUDA): each one's figures and the copy rate between each pair, for "
+                            "multi-GPU limits (default: device 0 alone)")
 
     status = subs.add_parser("status", help="Gates, goals, KPIs against their physical limits, gaps and missing inputs")
     status.add_argument("result")
@@ -159,8 +177,11 @@ def main(argv=None):
     reference.add_argument("--data", required=True, help="Prepared suite directory")
     reference.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default=None,
                            help="Accepted from earlier versions and ignored: one run scores what both quality modes "
-                                "need (the scores, their spread and, for a checkpoint that declares quantized "
-                                "activations, the as_quantized allowance)")
+                                "need (the scores and their spread)")
+    reference.add_argument("--allowance", action="store_true",
+                           help="Also score the texts with the activations quantized as the checkpoint declares and "
+                                "store how far that lands from the scores (allowance.json): what the format itself "
+                                "costs, reported, not judged; a second scoring pass")
 
     fetch = subs.add_parser("fetch", help="Fetch the checkpoint's reference package (prepared data and reference "
                                           "scores) into the data, so a run needs only the engine")
@@ -174,6 +195,10 @@ def main(argv=None):
     pack = subs.add_parser("pack", help="Add prepared data scored by the reference to a package folder")
     pack.add_argument("--data", required=True, help="Prepared suite directory holding reference scores")
     pack.add_argument("--packages", required=True, help="Package folder to add it to")
+
+    journaled = subs.add_parser("journal", help="How far a round got: its journal's engines, parts and requests, "
+                                                "replayed and live, and how it ended")
+    journaled.add_argument("journal", help="A round's journal (R.journal.jsonl beside its result R.json)")
 
     compare = subs.add_parser("compare", help="Print a side-by-side table of result files")
     compare.add_argument("results", nargs="+")
@@ -209,6 +234,9 @@ def main(argv=None):
     kernels.add_argument("--case", action="append", help="Trace only these speed cases (repeatable); default all")
     kernels.add_argument("--device", metavar="JSON", help="Device ceilings from `crit eval probe` for share of peak")
     kernels.add_argument("--nvcc", help="nvcc of a CUDA toolkit that ships CUPTI")
+    kernels.add_argument("--backend", choices=("cuda", "hip"), default="cuda",
+                         help="Device API the engine runs on: cuda (CUPTI) or hip (rocprofiler-sdk)")
+    kernels.add_argument("--hipcc", help="hipcc of a ROCm that ships rocprofiler-sdk (--backend hip)")
     kernels.add_argument("--top", type=int, default=12, help="Kernels listed per phase")
     kernels.add_argument("--work", metavar="JSON", help="kernel_work rules ahead of the adapter's own, as JSON text or a "
                                                        "file: [{\"match\": NAME_PART, \"term\": matmul|attention|recurrent|"
@@ -262,7 +290,8 @@ def _command(args):
         work = json_option(args.work, "--work") if args.work else None
         result = trace(args.adapter, args.model, args.data, args.out, adapter_config(args.adapter, args.config, "--config"), args.case,
                        args.nvcc,
-                       load(args.device) if args.device else None, context_tokens=args.context, work=work)
+                       load(args.device) if args.device else None, context_tokens=args.context, work=work,
+                       backend=args.backend, hipcc=args.hipcc)
         print(f"wrote {args.out}")
         print(render_kernels(result, args.top))
         return 0
@@ -283,7 +312,7 @@ def _command(args):
     if args.command == "reference":
         from .quality.reference import score_data
         from .quality.fixed import STORE
-        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True))
+        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), allowance=args.allowance)
         print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / STORE}"
               + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else "")
               + (f"; the reference's own spread {how['spread']}" if how.get("spread") else "")
@@ -326,6 +355,10 @@ def _command(args):
         print(json.dumps({**value, "placement": where}, indent=1) if args.json
               else render_context(value) + "\n" + render_placement(where))
         return 0 if value["tokens"] else 1
+    if args.command == "journal":
+        from .run.journal import describe
+        print(describe(args.journal))
+        return 0
     if args.command == "compare":
         from .reports.compare import compare as do_compare
         print(do_compare(args.results))
@@ -351,7 +384,7 @@ def _command(args):
         return 0
     if args.command == "probe":
         from .limits.probe import probe as do_probe
-        device = do_probe(args.out, args.nvcc, args.repeats)
+        device = do_probe(args.out, args.nvcc, args.repeats, backend=args.backend, hipcc=args.hipcc, devices=args.devices)
         print(f"wrote {args.out}: {device['bandwidth_gbs']:.0f} GB/s, "
               + ", ".join(f"{k} {v:.0f} TFLOPS" for k, v in device["tflops"].items())
               + "; raw MMA " + (", ".join(f"{k} {v:.0f}" for k, v in (device.get("mma_tflops") or {}).items()) or "none")
@@ -395,10 +428,14 @@ def _command(args):
                     profile=args.profile, chat_template=template, attribute_drift=args.attribute_drift,
                     adaptive_sampled=args.adaptive_sampled, quality_mode=args.quality_mode,
                     stage=args.stage if args.stage in (None, "full") else int(args.stage), certify=args.certify,
-                    budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None)
+                    budget_seconds=args.budget_minutes * 60 if args.budget_minutes else None,
+                    journaled=not args.no_journal, resume=args.resume, jitter_seed=args.jitter_seed)
     print(f"wrote {args.out}")
     if result.get("aborted"):
         print(f"aborted: {result['aborted']['detail']}")
+        if result.get("journal"):
+            from .run.journal import path_for
+            print(f"its journal keeps what it measured: --resume {path_for(args.out)} goes on from there")
         return 3
     print(render(result["status"]))
     return 0

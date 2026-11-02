@@ -146,6 +146,9 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
     model's positions and the device's memory may cap it (`bound`, and `note` says by how much). drafters: companion
     drafter folders the engine may load beside the model; their stored weights (companion_drafter_bytes) are kept
     out of the KV cache, so a candidate that speculates with one still fits the required context."""
+    from .devices import pooled
+    # Several GPUs (crit eval probe --devices): their memory together, each keeping its headroom and reserve.
+    device = pooled(device, vram_headroom_bytes, int(float(settings["reserve_gib"]) * GIB))
     config = model_config(model)
     limit, source = config.position_limit()
     element = float(settings["kv_bytes_per_element"])
@@ -239,7 +242,12 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     SCENARIOS applies, the bytes each memory tier holds, where the lookup tables go, and the bound one plain decode
     pass (one token, no speculation, routing spread evenly over the experts so a device cache holds its share of them)
     has in each expert source: on the device, misses copied over the host link, misses computed on the CPU from host
-    memory. None when Eval cannot size the model (max_context's `missing`)."""
+    memory, and misses split between the CPU and the link, which both read host memory and so together read it at
+    most at its read rate. Even routing is the pessimistic case: real routing concentrates on fewer experts, so a
+    cache hits more often than its share and its hit rate is the main lever. Where experts stay off the device, the
+    device's expert cache also gets the reserve (expert_cache_bytes): prompt buffers are lent from cache slots while a
+    prompt runs and returned for decode, not held as a fixed workspace. None when Eval cannot size the model
+    (max_context's `missing`)."""
     value = max_context(model, device, vram_headroom_bytes, settings, tokens, drafters)
     basis = value.get("basis")
     if not basis:
@@ -250,14 +258,23 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     total, available = (device or {}).get("host_memory_total_bytes"), (device or {}).get("host_memory_available_bytes")
     host = max(0, (total or available or 0) - int(ram_headroom_bytes)) if (total or available) else None
     on_device = max(0, min(experts, room))
-    off_device = experts - on_device
+    left = max(0, room - on_device)
     if not value["tokens"]:
         name = "dense_device_host" if host is None or resident + experts <= host else "beyond_host"
-    elif not off_device:
+    elif on_device == experts:
         name = "fits_device"
     else:
-        name = "sparse_device_host" if host is None or off_device <= host else "sparse_device_host_disk"
-    left = max(0, room - on_device)
+        # A device expert cache lends slots to the prompt's buffers while a prompt runs and gets them back for decode,
+        # so the reserve kept out of the KV cache for workspaces holds cached experts between prompts.
+        on_device = max(0, min(experts, room + basis["reserve_bytes"]))
+        name = "sparse_device_host" if host is None or experts - on_device <= host else "sparse_device_host_disk"
+    off_device = experts - on_device
+    # The weights read on every pass that do not fit next to the required context's KV cache (dense_device_host, or a
+    # requirement beyond the context the device holds with them): a pass reads them from host memory.
+    kv_needed = (value.get("kv_bytes_per_token") or 0) * int(tokens)
+    weights_room = (basis["memory_free_bytes"] - basis["vram_headroom_bytes"] - basis["reserve_bytes"]
+                    - basis["fixed_state_bytes"] - basis.get("companion_drafter_bytes", 0) - kv_needed)
+    resident_off = min(resident, max(0, resident - weights_room))
     host_left = None if host is None else max(0, host - (off_device if value["tokens"] else resident + experts))
     tier = ("device" if tables <= left else "host" if host_left is None or tables <= host_left else "disk") if tables else None
     moe = config.moe
@@ -272,12 +289,24 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
             floors["link"] = max(own, missed / (link * 1e9) * 1000)
         if missed and memory:
             floors["cpu"] = max(own, missed / (memory * 1e9) * 1000)
+        if missed and link and memory:
+            # A link copy reads host memory as the CPU's arithmetic does: split so both finish together, the misses
+            # come at the two rates' sum only up to host memory's read rate.
+            floors["split"] = max(own, missed / (min(link + memory, memory) * 1e9) * 1000)
+    # A device cache over host experts (scenario 2's starting design) copies its slots from host memory, so the host
+    # holds every expert, those the device also caches included; where only the off-device share fits, the device's
+    # experts must be its own (a static split), not cached copies.
+    every = None if host is None or name != "sparse_device_host" else experts <= host
     return {"scenario": name, "number": SCENARIOS[name][0], "meaning": SCENARIOS[name][1], "tokens": int(tokens),
-            "bytes": {"resident": resident, "experts": experts, "experts_on_device": on_device,
-                      "experts_off_device": off_device, "lookup_tables": tables, "host_memory_for_weights": host},
+            "expert_cache_bytes": on_device if off_device else None,
+            "bytes": {"resident": resident, "resident_off_device": resident_off, "experts": experts,
+                      "experts_on_device": on_device, "experts_off_device": off_device, "lookup_tables": tables,
+                      "host_memory_for_weights": host},
+            "host_holds_every_expert": every,
             "lookup_tables": {"bytes": tables, "tier": tier} if tables else None,
             "active_expert_bytes_per_token": int(active), "missed_expert_bytes_per_token": int(missed),
             "rates_gbs": {"device": bandwidth, "link": link, "host_memory_read": memory},
+            "cpu_gflops": ((device or {}).get("cpu_gflops") or {}).get("fp32"),
             "plain_pass_floor_ms": floors,
             "plain_pass_ceiling_tps": {k: round(1000 / v, 1) for k, v in floors.items() if v}}
 
@@ -291,6 +320,13 @@ def render_placement(value):
              f"  resident weights {b['resident'] / gb:.1f} GB; experts {b['experts'] / gb:.1f} GB, "
              f"{b['experts_on_device'] / gb:.1f} GB on the device, {b['experts_off_device'] / gb:.1f} GB off it"
              + (f"; host memory for weights {b['host_memory_for_weights'] / gb:.1f} GB" if b["host_memory_for_weights"] is not None else "")]
+    if b.get("resident_off_device"):
+        lines.append(f"  resident weights off the device {b['resident_off_device'] / gb:.2f} GB: they do not fit next to "
+                     f"the {value['tokens']:,}-token KV cache, so every pass reads them from host memory")
+    if value.get("host_holds_every_expert") is False:
+        lines.append(f"  host memory holds the {b['experts_off_device'] / gb:.1f} GB off the device but not all "
+                     f"{b['experts'] / gb:.1f} GB of experts: a device cache copying from host memory does not fit; "
+                     "keep the device's experts there alone (a static split) and cache only within the rest")
     if value["lookup_tables"]:
         lines.append(f"  lookup tables {value['lookup_tables']['bytes'] / gb:.1f} GB (gathered rows) in {value['lookup_tables']['tier']} memory"
                      if value["lookup_tables"]["tier"] != "disk" else
@@ -298,9 +334,19 @@ def render_placement(value):
     if value["missed_expert_bytes_per_token"]:
         lines.append(f"  experts per token {value['active_expert_bytes_per_token'] / gb:.2f} GB, "
                      f"{value['missed_expert_bytes_per_token'] / gb:.2f} GB of them off the device at even routing")
-    names = {"device": "all on the device", "link": "misses copied over the host link", "cpu": "misses computed on the CPU"}
+    if value.get("expert_cache_bytes"):
+        lines.append(f"  device expert cache {value['expert_cache_bytes'] / gb:.1f} GB, no fixed prompt workspace: prompt "
+                     "(prefill) buffers are lent from cache slots while a prompt runs and returned for decode")
+    names = {"device": "all on the device", "link": "misses copied over the host link", "cpu": "misses computed on the CPU",
+             "split": "misses split between CPU and link"}
     for key, tps in value["plain_pass_ceiling_tps"].items():
-        lines.append(f"  plain pass, {names[key]}: {value['plain_pass_floor_ms'][key]:.2f} ms floor, {tps:,.1f} tok/s")
+        lines.append(f"  plain pass, {names[key]}: {value['plain_pass_floor_ms'][key]:.2f} ms floor, {tps:,.1f} tok/s"
+                     + (f" (both read host memory, together at most its {value['rates_gbs']['host_memory_read']:g} GB/s "
+                        "read: a split beats the CPU alone only where the CPU's arithmetic reads slower, and is set "
+                        "from both paths' measured rates, alone and together)" if key == "split" else ""))
+    if value["missed_expert_bytes_per_token"]:
+        lines.append("  even routing is the pessimistic case: real routing concentrates on fewer experts, so the "
+                     "cache's hit rate under it is the main lever")
     return "\n".join(lines)
 
 

@@ -1,18 +1,20 @@
 """Timed requests and what a run reads from their timings: one generation, plain, sampled or replayed, timed by
 phase; runs disturbed by other processes; summaries and rates."""
-import time
+import hashlib
+import json
 
 from ..limits import headroom
 from ..reports import metrics
 from .chat import ChatEngine
+from .journal import clock   # the round's clock: a resumed round's journaled requests keep their times
 
 
 def _timed(call, prompt, output_tokens, expected=None, keep=()):
     deliveries = []
 
     def on_tokens(tokens):
-        deliveries.append((time.perf_counter(), list(tokens)))
-    started = time.perf_counter()
+        deliveries.append((clock(), list(tokens)))
+    started = clock()
     result = call(on_tokens)
     tokens = list(result["tokens"])
     # An engine behind a chat API streams text: the server counts its tokens, and its reply may end early.
@@ -29,12 +31,16 @@ def _timed(call, prompt, output_tokens, expected=None, keep=()):
     first = next(t for t, chunk in deliveries if chunk)
     prompt_tokens = len(prompt) if served is None else int(served["prompt_tokens"])
     sample = metrics.speed_sample(prompt_tokens, count, started, first, deliveries[-1][0], result.get("rounds"))
+    sample["chunk_gaps"] = chunk_gaps([t for t, chunk in deliveries if chunk])
     if served is not None:
         sample["served"] = served
     sample["engine_timing"] = result.get("timing")
     sample["accepted"] = result.get("accepted")
     if isinstance(result.get("drafted"), list):
         sample["drafted"] = result["drafted"]
+    # The decode's routed expert reads and those the device cache served: the hit rate the tiers price (headroom.tiers).
+    if type(result.get("expert_reads")) is int and type(result.get("expert_hits")) is int             and 0 <= result["expert_hits"] <= result["expert_reads"]:
+        sample["expert_reads"], sample["expert_hits"] = result["expert_reads"], result["expert_hits"]
     # Optional engine-measured times: the prefill and the first token from the engine's own clock (what the time to
     # first token holds beyond them is the server's, the tokenizer's, transfer and scheduling), and the decode's time
     # in verify passes and in draft steps (ms, whole request).
@@ -45,6 +51,29 @@ def _timed(call, prompt, output_tokens, expected=None, keep=()):
     return tokens, sample
 
 
+def chunk_gaps(arrivals):
+    """The gaps between the streamed chunks of one request after its first token (protocol speed.stalls), from the
+    host times the non-empty chunks arrived: their count and the longest and p99 gap in ms. A speculative engine sends
+    several tokens per chunk, so these are chunk gaps, not token gaps. None with fewer than two chunks after the first
+    token's: an engine that delivers its reply in one piece shows no stall."""
+    gaps = [(b - a) * 1000 for a, b in zip(arrivals, arrivals[1:])]
+    if len(gaps) < 2:
+        return None
+    return {"chunks": len(arrivals), "max_ms": max(gaps), "p99_ms": metrics.percentile(gaps, 0.99)}
+
+
+def stalls(samples, round_ms):
+    """A speed case's stalls over its measured samples (chunk_gaps): the longest gap and the largest p99 gap, in ms
+    and over the case's median round_ms; None when no sample streamed enough chunks."""
+    found = [s["chunk_gaps"] for s in samples if not s.get("warmup") and s.get("chunk_gaps")]
+    if not found:
+        return None
+    longest, p99 = max(g["max_ms"] for g in found), max(g["p99_ms"] for g in found)
+    return {"max_gap_ms": longest, "p99_gap_ms": p99, "chunks": min(g["chunks"] for g in found),
+            "max_gap_rounds": longest / round_ms if round_ms else None,
+            "p99_gap_rounds": p99 / round_ms if round_ms else None}
+
+
 def timed_generate(engine, prompt, output_tokens, prompt_cache=False, logprobs=None):
     """prompt_cache: the request is judged on its text alone, so an engine behind a server may serve it from its
     prompt cache. logprobs: ask a served engine for that many alternatives per reply token; the sample then carries
@@ -52,8 +81,9 @@ def timed_generate(engine, prompt, output_tokens, prompt_cache=False, logprobs=N
     served = isinstance(engine, ChatEngine)
     options = {**({"prompt_cache": True} if prompt_cache and served else {}),
                **({"logprobs": logprobs} if logprobs and served else {})}
+    # tool_calls: the calls a server parsed from its reply (protocol speed.tool_calls).
     return _timed(lambda on_tokens: engine.generate(list(prompt), output_tokens, on_tokens, **options), prompt,
-                  output_tokens, keep=("reply", "reply_unmapped") if logprobs else ())
+                  output_tokens, keep=("tool_calls",) + (("reply", "reply_unmapped") if logprobs else ()))
 
 
 def timed_plain(engine, prompt, output_tokens):
@@ -103,7 +133,13 @@ def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps")
     if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
         return
     adjusted = width_adjusted_rounds(measured) if key == "round_ms" else None
-    spread = headroom.spread(adjusted if adjusted else [s[key] for s in measured if s.get(key)])
+    if key == "decode_tps" and all(s.get("reply_sha256") for s in measured) and len(replies(measured)) > 1:
+        # Repetitions that decoded different replies differ in speed by their content, not by a disturbance: only
+        # repetitions of the same reply are compared (protocol speed.output_varies).
+        spread = max((headroom.spread([s[key] for s in group if s.get(key)]) or 0.0
+                      for group in replies(measured).values() if len(group) > 1), default=None)
+    else:
+        spread = headroom.spread(adjusted if adjusted else [s[key] for s in measured if s.get(key)])
     if spread is not None and spread > limit:
         load = f"; other processes kept {other_cores:.1f} CPU cores busy" if other_cores is not None else ""
         what = ("decode" if key == "decode_tps" else
@@ -118,6 +154,20 @@ def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps")
                      "quiet host, look inside the engine")
         raise Disturbed(f"speed {case_id}: {what} varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
                         + cause + _memory_note())
+
+
+def replies(samples):
+    """The samples grouped by the reply they decoded (their `reply_sha256`, which the speed part records for every
+    greedy request)."""
+    groups = {}
+    for sample in samples:
+        groups.setdefault(sample.get("reply_sha256"), []).append(sample)
+    return groups
+
+
+def reply_sha256(tokens):
+    """A greedy reply's identity: the SHA-256 of its token ids."""
+    return hashlib.sha256(json.dumps(list(tokens)).encode()).hexdigest()
 
 
 def width_adjusted_rounds(samples):
@@ -184,9 +234,49 @@ def decode_text(info, continuations):
     return {"source": "generated", "reason": reason}
 
 
+def settling(samples, sample, rule, key="decode_tps"):
+    """Whether `sample`, the request that would be a case's first measured repetition, is still warming up
+    (protocol speed.steady_state): its `key` (decode tok/s, or round_ms for sampled repetitions) and the request's
+    before it spread by more than rule["tolerance"], and the case's warmups are not yet done: fewer than
+    rule["max_warmup_runs"], or fewer than rule["max_warmup_tokens"] tokens decoded in them,
+    and in either case fewer than rule["max_warmup_requests"]. Such a request stands as one more warmup. A case's
+    first request, a request after a measured one, and requests too short to time stand as measured."""
+    if not rule or not samples or any(not s.get("warmup") for s in samples):
+        return False
+    warm = [s for s in samples if s.get("warmup")]
+    tokens = sum(s.get("output_tokens") or 0 for s in warm)
+    if len(warm) >= int(rule.get("max_warmup_requests", rule["max_warmup_runs"])):
+        return False
+    if len(warm) >= int(rule["max_warmup_runs"]) and tokens >= int(rule.get("max_warmup_tokens", 0)):
+        return False
+    before = samples[-1]
+    if min(before.get("request_ms") or 0, sample.get("request_ms") or 0) < DISTURBED_MIN_REQUEST_MS:
+        return False
+    found = headroom.spread([before.get(key), sample.get(key)])
+    return found is not None and found > float(rule["tolerance"])
+
+
+def steady_state(samples, rule, added, key="decode_tps"):
+    """A case's warmup as protocol speed.steady_state recorded it: its warmups, how many of them the drift added,
+    whether its first measured repetition agreed with the request before it (None without one), and the drift: the
+    first measured repetition's `key` over the case's first request's, less one (None when either lacks it)."""
+    warm = [s for s in samples if s.get("warmup")]
+    first = next((i for i, s in enumerate(samples) if not s.get("warmup")), None)
+    steady, drift = None, None
+    if rule and warm and first is not None and first > 0:
+        found = headroom.spread([samples[first - 1].get(key), samples[first].get(key)])
+        steady = None if found is None else found <= float(rule["tolerance"])
+        if samples[0].get(key) and samples[first].get(key):
+            drift = round(samples[first][key] / samples[0][key] - 1, 4)
+    return {"warmup_runs": len(warm), "added": added, "steady": steady, "drift": drift, "measure": key}
+
+
 def disagree(samples, outputs, tolerance):
     """Whether a case's measured repetitions disagree (protocol speed.extra_repetition): decode tok/s or time to
-    first token spread by more than `tolerance`, or the outputs differ."""
+    first token spread by more than `tolerance`, or the outputs differ. With one measured repetition the warmup
+    before it is compared in its place."""
     measured = [s for s in samples if not s.get("warmup")]
+    if len(measured) == 1:
+        measured = [s for s in samples if s.get("warmup")][-1:] + measured
     spreads = [headroom.spread([s[key] for s in measured if s.get(key)]) for key in ("decode_tps", "ttft_ms")]
     return any(spread is not None and spread > tolerance for spread in spreads) or any(o != outputs[0] for o in outputs)

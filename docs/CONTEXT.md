@@ -28,7 +28,14 @@ may only make the engine faster.
 Weights read every pass are all tensors except gathered embedding rows (unless the output head
 is tied to them), the vision tower and mixture-of-experts experts; draft layers count. Experts
 are read sparsely and may live in host memory or on disk; at the max context they get only the
-device memory the KV cache leaves, and the result says how much. Fixed state is the
+device memory the KV cache leaves, and the result says how much. Where some stay off the device, the placement
+scenario `crit eval context` prints gives the device's expert cache the reserve too: prompt (prefill) buffers
+are lent from cache slots while a prompt runs and returned for decode, so no fixed prompt workspace sits idle during
+decode. Its plain-pass floors assume routing spread evenly over the experts, the pessimistic case (real routing
+concentrates, so the cache's hit rate is the main lever), and bound misses split between the CPU and the host link
+by host memory's read rate, which both paths share. Resident weights that do not fit next to the required context's
+KV cache are `bytes.resident_off_device`, read from host memory on every pass. The headroom's floors price the same
+split ([memory tiers](MEASUREMENTS.md#memory-tiers)). Fixed state is the
 linear-attention recurrence (FP32 state, BF16 convolution window) and sliding-window KV. The KV
 cache stays on the device because decode reads all of it every pass.
 
@@ -48,10 +55,15 @@ unmeasured.
 
 - **One build:** the engine opens with `context_tokens` set to the requirement, and speed,
   quality and exactness all run on it.
+- **Several GPUs:** with a device file of several (`crit eval probe --devices all`: each GPU's figures and
+  every pair's copy rate) the members' memory counts together, each keeping its headroom and reserve, and the
+  floors price the set as one device by the faster split of the weights across it
+  ([measurements](MEASUREMENTS.md#several-gpus)).
 - **Capacity gate:** `max_context` is at least the requirement and a request filling it completes.
-- **Long-context curve:** after speed and quality, one greedy request per point fills the context
-  exactly, prompt plus 256 output tokens, at powers of two from 32,768 below the requirement and
-  at the requirement. Each prompt is the retrieval check's archive, suite filler text
+- **Long-context curve:** after speed and quality, one greedy request per point fills the context,
+  prompt plus 256 output tokens, at powers of two from 32,768 below the requirement, each filling
+  the share of its point the run draws ([prompt-length jitter](MEASUREMENTS.md#prompt-length-jitter),
+  80-100%, recorded as the point's `filled_context`), and at the requirement, filled exactly. Each prompt is the retrieval check's archive, suite filler text
   ([long.json](../crit_eval/suite/long.json)) cut to fit with three retrieval facts in it (at 2%, 50%
   and 97%), and `retrieval.curve_user`'s request: list the facts, then summarize the archive in
   detail. Every prompt is chat messages that an engine behind a server is sent too. Each point
@@ -73,7 +85,8 @@ unmeasured.
   against their floors (pass floor with the KV read at that context, plus draft steps at their
   floor, at the measured tokens per round). `context_ttft` is the geometric mean TTFT against
   the points' TTFT floors.
-- **Lower-context gate:** just before the full build opens, the speed cases run on an engine
+- **Lower-context gate:** on a certified run (`--certify`, after the engine at the requirement closes)
+  and with `--stage full` (just before the full build opens), the speed cases run on an engine
   opened at a quarter of the requirement (never below the longest speed case). A case fails when
   it decodes slower, or reaches its first token later, than on the full build by more than 5% or
   its own run-to-run spread, whichever is larger. Failing to open or run there fails too.

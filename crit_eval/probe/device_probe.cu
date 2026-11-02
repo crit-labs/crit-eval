@@ -83,6 +83,53 @@ double copy_bandwidth_gbs(size_t bytes, int batches, int copies) {
     return total / batches;
 }
 
+// GB/s copying `bytes` from device `from` to device `to` (cudaMemcpyPeerAsync, peer access enabled where the pair
+// supports it), timed on `to`; 0 when an allocation or a copy fails. The same device twice times a device-to-device
+// copy's one direction.
+double peer_bandwidth_gbs(int from, int to, size_t bytes, int batches, int copies, int* access) {
+    *access = 0;
+    if (from != to) {
+        cudaDeviceCanAccessPeer(access, to, from);
+        if (*access) {
+            cudaSetDevice(to);
+            if (cudaDeviceEnablePeerAccess(from, 0) == cudaErrorPeerAccessAlreadyEnabled) cudaGetLastError();
+        }
+    } else {
+        *access = 1;
+    }
+    void *src = nullptr, *dst = nullptr;
+    cudaSetDevice(from);
+    if (cudaMalloc(&src, bytes) != cudaSuccess) { cudaGetLastError(); return 0.0; }
+    cudaMemset(src, 1, bytes);
+    cudaSetDevice(to);
+    if (cudaMalloc(&dst, bytes) != cudaSuccess) { cudaGetLastError(); cudaSetDevice(from); cudaFree(src); return 0.0; }
+    cudaStream_t stream;
+    cudaStreamCreate(&stream);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaMemcpyPeerAsync(dst, to, src, from, bytes, stream);  // warmup
+    cudaStreamSynchronize(stream);
+    double total = 0.0;
+    for (int b = 0; b < batches; ++b) {
+        cudaEventRecord(start, stream);
+        for (int i = 0; i < copies; ++i) cudaMemcpyPeerAsync(dst, to, src, from, bytes, stream);
+        cudaEventRecord(stop, stream);
+        cudaEventSynchronize(stop);
+        float ms = 0.f;
+        cudaEventElapsedTime(&ms, start, stop);
+        total += ms > 0.f ? double(bytes) * copies / (ms * 1e-3) / 1e9 : 0.0;
+    }
+    const bool failed = cudaGetLastError() != cudaSuccess;
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    cudaStreamDestroy(stream);
+    cudaFree(dst);
+    cudaSetDevice(from);
+    cudaFree(src);
+    return failed ? 0.0 : total / batches;
+}
+
 __global__ void read_mapped(const uint4* __restrict__ src, uint4* __restrict__ dst, size_t words) {
     for (size_t i = blockIdx.x * size_t(blockDim.x) + threadIdx.x; i < words; i += size_t(gridDim.x) * blockDim.x) dst[i] = src[i];
 }
@@ -449,9 +496,31 @@ done:
 
 }  // namespace
 
-int main() {
+// device_probe [--device N | --count | --peer FROM TO]: one device's figures (device 0 by default), the device count,
+// or the copy rate from one device to another.
+int main(int argc, char** argv) {
+    int device = 0;
+    if (argc == 2 && std::strcmp(argv[1], "--count") == 0) {
+        int count = 0;
+        if (cudaGetDeviceCount(&count) != cudaSuccess) count = 0;
+        std::printf("{\"devices\": %d}\n", count);
+        return 0;
+    }
+    if (argc == 4 && std::strcmp(argv[1], "--peer") == 0) {
+        const int from = std::atoi(argv[2]), to = std::atoi(argv[3]);
+        int access = 0;
+        const double gbs = peer_bandwidth_gbs(from, to, size_t(256) << 20, 5, 4, &access);
+        std::printf("{\"from\": %d, \"to\": %d, \"gbs\": %.1f, \"peer_access\": %s}\n", from, to, gbs,
+                    access ? "true" : "false");
+        return gbs > 0.0 ? 0 : 1;
+    }
+    if (argc == 3 && std::strcmp(argv[1], "--device") == 0) device = std::atoi(argv[2]);
+    if (cudaSetDevice(device) != cudaSuccess) {
+        std::printf("{\"error\": \"no CUDA device %d\"}\n", device);
+        return 1;
+    }
     cudaDeviceProp prop{};
-    if (cudaGetDeviceProperties(&prop, 0) != cudaSuccess) {
+    if (cudaGetDeviceProperties(&prop, device) != cudaSuccess) {
         std::printf("{\"error\": \"no CUDA device\"}\n");
         return 1;
     }

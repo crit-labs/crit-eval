@@ -4,21 +4,28 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .. import CONTRACT, EVAL_DIR, __version__, load_json, portable_path, write_json
+from .. import CONTRACT, EVAL_DIR, __version__, load_json, machine_settings, portable_path, write_json
 from ..quality import fixed
 from ..limits import headroom
-from . import host
+from . import host, journal
 from ..reports import status
-from ..limits.ceiling import best_rates, model_ceiling
+from ..limits.batched import batch_terms
+from ..limits.ceiling import best_rates, model_ceiling, model_config
 from .chat import Server
+from .concurrency import run_concurrency
 from .deadline import Hung, RequestDeadline
 from .estimate import estimate, summary as estimate_summary
-from ..limits.context import GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes
+from ..limits.context import GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes, placement, weight_split
+from ..limits.tiers import derive as derive_tiers
+from ..limits import devices as device_set
 from .pin import load_continuations
 from ..quality.prepare import PREPARED, check_prepared, check_template, model_description
 from ..quality.reference import REFERENCE_VERSION
 from .adapters import file_sha256, load_adapter, native_identity, open_engine, plain_on_engine
+from .forks import judge_forks
 from .history import compare_followup, compare_history, history_cases, history_outputs, run_followup
+from .jitter import new_seed, record as jitter_record
+from .tracks import closed as closed_track, engine_loads
 from .long_context import compare_lower, context_requirement, run_context, run_lower_context, run_retrieval
 from .quality_checks import (merge_honesty, merge_quality, quality_thresholds, reference_origin, run_attribution,
                              run_honesty, run_quality, stored_spread)
@@ -32,28 +39,33 @@ from .timing import Disturbed, decode_text
 EXACTNESS_MODES = ("reported", "required")
 
 
-PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup")
+PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
 
 
 class PartTimes:
     """Wall seconds each part of a run took, in the order the parts ran (result timing.parts), and the run's total
-    from its start to the result (timing.total_seconds). A part that runs again after everything else (the
-    follow-up turns, the request history) is an entry of its own."""
+    from its start to the result (timing.total_seconds), on the round's clock (crit_eval.run.journal.clock: a
+    resumed round's requests answered from its journal count their recorded seconds). A part that runs again after
+    everything else (the follow-up turns, the request history) is an entry of its own. Each part's start is a line
+    of the round's journal."""
 
     def __init__(self):
-        self.started = time.perf_counter()
+        self.started = journal.clock()
         self.parts = {}
 
     @contextmanager
     def part(self, name):
-        started = time.perf_counter()
+        written = journal.active()
+        if written is not None:
+            written.mark(name)
+        started = journal.clock()
         try:
             yield
         finally:
-            self.parts[name] = round(self.parts.get(name, 0.0) + time.perf_counter() - started, 3)
+            self.parts[name] = round(self.parts.get(name, 0.0) + journal.clock() - started, 3)
 
     def record(self):
-        return {"parts": dict(self.parts), "total_seconds": round(time.perf_counter() - self.started, 3)}
+        return {"parts": dict(self.parts), "total_seconds": round(journal.clock() - self.started, 3)}
 
     def summary(self):
         return ", ".join(f"{name} {seconds:.0f} s" for name, seconds in self.parts.items())
@@ -63,8 +75,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
         abort_disturbed=True, url=None, served_model=None, requested_context=None, context_basis=None, profile=None,
-        chat_template=None, attribute_drift=False, adaptive_sampled=True, quality_mode="preserve", stage=None,
-        certify=False, budget_seconds=None):
+        chat_template=None, attribute_drift=False, adaptive_sampled=False, quality_mode="preserve", stage=None,
+        certify=False, budget_seconds=None, journaled=True, resume=None, identity=None, jitter_seed=None):
     """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
     (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
     url instead, the engine behind that OpenAI-compatible server (crit_eval.run.chat), served_model naming its model.
@@ -90,17 +102,28 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     template (crit_eval.quality.prepare.check_template) otherwise.
     attribute_drift: after quality, score it again on an engine per declared exact variant (run_attribution).
     adaptive_sampled: repeat sampled cases past the protocol's seeds until their error reaches the protocol's target
-    (run_sampled_speed), the protocol's rule; False (crit eval run --no-adaptive-sampled) keeps
-    the seeds' repetitions alone, an override the result records (sampled_speed.adaptive null), as --repetitions is.
-    A fixed repetition count (--repetitions, a profile's sampled_repetitions) is never extended.
+    (run_sampled_speed; crit eval run --adaptive-sampled), recorded in the result (sampled_speed.adaptive); off by
+    default, the seeds' repetitions alone (sampled_speed.adaptive null). A fixed repetition count (--repetitions, a
+    profile's sampled_repetitions) is never extended.
     quality_mode: "preserve" judges quality against the reference with exact activations, "as_quantized" against the
-    same scores with each set's limits widened by the checkpoint's own activation quantization drift (the allowance
-    crit eval reference measures beside them, protocol quality.allowance); the result records it in requirements and
-    its status prices prefill against that mode's arithmetic.
+    same scores with its own budget (protocol quality.mode_thresholds), output differences that part at near-ties
+    allowed (protocol forks) and the honesty check bounded (quality.honesty.modes); the result records it in
+    requirements and its status prices prefill against that mode's arithmetic.
     stage: a run without a profile measures in stages (protocol stages): None goes as far as budget_seconds (default
     the protocol's) allows at the engine's measured rates, 1, 2 or 3 at most that far, "full" every part at the
     protocol's repetitions as before stages (warmups and repetitions apply to it alone). certify: the candidate that
-    will ship, stage 3 whatever the budget and one request at the requirement itself, which the capacity gate needs."""
+    will ship, stage 3 whatever the budget, one request at the requirement itself, which the capacity gate needs, and
+    the speed cases on an engine opened at the lower context, which the lower-context gate needs.
+    journaled: write the round's journal beside `out` (crit_eval.run.journal: R.json's is R.journal.jsonl), every
+    engine opened and request served one synced line as it completes; False writes none. resume: an earlier round's
+    journal to go on from: its requests are answered again at their recorded times while this round makes the same
+    ones, and an engine loads only for the requests left. identity: what else (a caller's package, attempt owner)
+    makes two rounds the same measurement, beside the data, protocol, adapter and options this run records; a
+    resumed journal's must be the same. A round that stops (interrupted, failed, a disturbed device, a hung engine)
+    writes what it measured to `out`, marked aborted, and its journal's end.
+    jitter_seed: the seed that draws the held-out prompts' and the curve's lengths (protocol jitter; crit eval run
+    --jitter-seed): a new one per run by default, the resumed journal's when resuming; the result records it and
+    every length it drew."""
     times = PartTimes()
     if quality_mode not in fixed.QUALITY_MODES:
         raise SystemExit(f"quality mode must be one of {', '.join(fixed.QUALITY_MODES)}")
@@ -113,6 +136,15 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     check_prepared(prepared, protocol, data)
     check_template(prepared, model, data, chat_template)
     device = device or {}
+    if device_set.indices(device):
+        # Several GPUs (crit eval probe --devices): priced as one device by the faster split of the weights across
+        # them (protocol context.devices), the members' memory pooled by max_context.
+        try:
+            config_ = model_config(model)
+            stored_ = pass_bytes(model, float(protocol["context"]["kv_bytes_per_element"]))
+            device = device_set.combined(device, stored_, config_.num_hidden_layers, config_.hidden_size)
+        except (OSError, ValueError, KeyError):
+            device = device_set.combined(device, None, None, None)
     bandwidth_gbs = bandwidth_gbs or device.get("bandwidth_gbs")
     settings = protocol["context"]
     if context_reserve_bytes is not None:  # the machine's own reserve for workspaces and speed techniques
@@ -158,13 +190,6 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                           **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
     reference_scores = fixed.load(data, reference_identity) if "quality" in parts else None
     reference_spread = stored_spread(data, prepared, protocol, reference_identity) if "quality" in parts else None
-    reference_allowance = None
-    if quality_mode == "as_quantized" and "quality" in parts:
-        allowance = fixed.load_allowance(data, reference_identity)
-        if allowance is None or allowance.get("unsupported"):
-            reference_scores = None   # judged against the exact scores, as_quantized needs the allowance
-        else:
-            reference_allowance = allowance["sets"]
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
@@ -184,6 +209,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                                                "cpu_isa",
                                                "host_memory_gbs", "cpu_gflops", "memory_total_bytes",
                                                "memory_free_bytes", "host_memory_total_bytes", "measured_at")}
+                   | {k: device[k] for k in ("backend", "arch", "runtime_version", "fp8_encoding", "unsupported_formats",
+                                           "device_set") if k in device}
                    if device else None,
         "bandwidth_gbs": bandwidth_gbs,
         "requirements": {"quality_budget": thresholds, "exactness": exactness, "quality_mode": quality_mode},
@@ -210,25 +237,73 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     sampled_repetitions = repetitions if repetitions is not None else profile_sampled   # None: one per protocol seed
     repetitions = protocol["speed"]["repetitions"] if repetitions is None else repetitions
     disturbed = protocol["speed"].get("disturbed_spread") if abort_disturbed else None
+    if resume is not None and not journaled:
+        raise SystemExit("resuming a round journals it: drop --no-journal")
+    if jitter_seed is None and resume is not None:   # a resumed round draws the lengths its journal's round drew
+        earlier = journal.read(resume)
+        jitter_seed = ((earlier[0].get("identity") or {}).get("jitter_seed") if earlier else None)
+    jitter = {"seed": int(new_seed() if jitter_seed is None else jitter_seed),
+              "fraction": list(protocol["jitter"]["fraction"])}
+    settings = {**settings, "jitter": jitter,
+                # The device memory left free, which the headroom's placement of the weights keeps too (headroom.tiers).
+                "vram_headroom_bytes": GIB if vram_headroom_bytes is None else int(vram_headroom_bytes)}
+    result["jitter"] = jitter_record(jitter)
+    # What makes two rounds the same measurement: a journal answers only a round with this identity.
+    round_identity = {"protocol": protocol["protocol"], "crit_eval_version": __version__,
+                      "model_sha256": result["model_sha256"], "suite_sha256": result["suite_sha256"],
+                      "adapter_sha256": result["adapter_sha256"], "server": result["server"],
+                      "config": config or {}, "parts": sorted(parts), "warmups": warmups, "repetitions": repetitions,
+                      "sampled_repetitions": sampled_repetitions, "profile": profile, "stages": staged,
+                      "context_tokens": required, "requirements": result["requirements"],
+                      "abort_disturbed": abort_disturbed, "adaptive_sampled": adaptive_sampled,
+                      "attribute_drift": attribute_drift, "device": (device or {}).get("device"),
+                      "jitter_seed": jitter["seed"], **({"caller": identity} if identity else {})}
+    written = journal.Journal(journal.path_for(out), round_identity, resume, log) if journaled else None
     try:
-        return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions, log,
-                        continuations, required, settings, exactness, disturbed, bandwidth_gbs,
-                        device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
-                        reference_spread, attribute_drift, adaptive_sampled, reference_allowance, staged)
-    except (Disturbed, Hung) as error:
-        # What the run measured until then stays in the result, marked aborted.
-        log(f"aborted: {error}")
-        result["aborted"] = {"reason": "disturbed" if isinstance(error, Disturbed) else "hung", "detail": str(error)}
-        result["timing"] = times.record()
-        result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
-        write_json(out, result)
-        return result
+        with written or _nothing():
+            times = PartTimes() if written is not None else times   # the round's clock starts with its journal
+            try:
+                return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions,
+                                log, continuations, required, settings, exactness, disturbed, bandwidth_gbs,
+                                device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
+                                reference_spread, attribute_drift, adaptive_sampled, staged)
+            except (Disturbed, Hung) as error:
+                # What the run measured until then stays in the result, marked aborted.
+                log(f"aborted: {error}")
+                _stopped(result, times, out, written, "disturbed" if isinstance(error, Disturbed) else "hung",
+                         str(error))
+                return result
+            except BaseException as error:
+                # Interrupted or failed: what it measured stays too, and the journal says how it ended.
+                reason = "interrupted" if isinstance(error, KeyboardInterrupt) else "failed"
+                log(f"aborted: {reason}" + (f": {type(error).__name__}: {error}" if reason == "failed" else ""))
+                _stopped(result, times, out, written, reason, f"{type(error).__name__}: {error}"[:2000])
+                raise
+    finally:
+        if written is not None and written.ended is None:
+            written.end("failed", "the round ended before its result")
+
+
+@contextmanager
+def _nothing():
+    yield None
+
+
+def _stopped(result, times, out, written, reason, detail):
+    """Write what a round that stopped measured, marked aborted, and end its journal with the reason."""
+    result["aborted"] = {"reason": reason, "detail": detail}
+    result["timing"] = times.record()
+    result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    if written is not None:
+        written.end(reason, detail)
+        result["journal"] = written.summary(portable_path)
+    write_json(out, result)
 
 
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
              out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None,
-             attribute_drift=False, adaptive_sampled=True, reference_allowance=None, staged=None):
+             attribute_drift=False, adaptive_sampled=False, staged=None):
     times = times or PartTimes()
     lower = None
     # A staged run measures the lower context in its stage 3, after its engine closed.
@@ -242,23 +317,42 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             with times.part("lower_context"):
                 lower = run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions,
                                           log, continuations, disturbed, exact_prompts="quality" in parts)
-    started = time.perf_counter()
+    started = journal.clock()
     with times.part("load"):
         engine, info = open_engine(module, model, config, speculative=True, context_tokens=required,
                                    exact_prompts="quality" in parts)
-    result["load_ms"] = (time.perf_counter() - started) * 1000
+    result["load_ms"] = (journal.clock() - started) * 1000
+    # A served engine's load count, again when its run ends: the closed track's one load (protocol tracks).
+    result["engine_loads"] = {"first": engine_loads(engine), "last": None}
     result["engine"] = info if not info.get("native_libraries") else         {**info, "native_libraries": [portable_path(p) for p in info["native_libraries"]]}
     result["context"]["engine_max_context"] = info["max_context"]
     # protocol context.device_memory: what the device keeps free with this engine built for the required context.
-    memory = {"after_load": host.device_memory()}
+    gpus = device_set.indices(device)   # every GPU of a device set, else the engine's one
+    memory = {"after_load": host.device_memory(indices=gpus)}
     if info.get("native_libraries"):
         result["native_libraries"] = native_identity(info)
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
+
+    def ceiling_inputs():
+        """The batched ceiling's inputs (crit_eval.limits.batched): the model's step terms, bandwidth and rates."""
+        try:
+            terms = batch_terms(model, float(settings["kv_bytes_per_element"]))
+        except (OSError, ValueError, KeyError):
+            terms = None
+        return terms, bandwidth_gbs, best_rates(device)[0] or None
+
+    def concurrency(fits=None):
+        """protocol concurrency: after every other part on this engine, the request history's closing request
+        included, so no single-stream figure or gate sees it."""
+        if "concurrency" in parts and not result.get("stopped_early"):
+            with times.part("concurrency"):
+                result["concurrency"] = run_concurrency(engine, info, prepared, protocol, result, required, log, fits,
+                                                        ceiling_inputs)
     try:
         if staged is not None:
             plan = _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required,
-                           settings, exactness, disturbed, reference_scores, reference_spread, reference_allowance,
-                           memory, times, baseline, staged)
+                           settings, exactness, disturbed, reference_scores, reference_spread,
+                           memory, times, baseline, staged, concurrency)
         else:
             fresh = None
             if "history" in parts:
@@ -310,7 +404,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                         result["sampling_check"] = run_sampling_check(engine, info, prepared, protocol, log, checked)
             if "heldout" in parts:
                 with times.part("heldout"):
-                    result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
+                    result["heldout"] = run_heldout(engine, info, prepared, protocol, log, settings["jitter"])
             elif settings.get("heldout_skipped"):
                 result["heldout"] = {"status": "skipped", "reason": settings["heldout_skipped"]}
             stopped = None
@@ -318,7 +412,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 with times.part("quality"):
                     result["quality"] = run_quality(engine, info, prepared, protocol, log, reference_scores,
                                                     result["requirements"]["quality_budget"], reference_spread,
-                                                    reference_allowance)
+                                                    mode=headroom.quality_mode(result))
                 stopped = result["quality"].get("stopped_early")
                 if stopped:
                     # protocol quality.fail_fast: nothing after quality can pass a run this far over the budget.
@@ -337,7 +431,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                         if long_reply.get("reply"):
                             more = run_honesty(engine, info, prepared, protocol, log, {}, texts=False,
                                                extra=[(f"curve@{long_reply['point']}", long_reply["prompt_ids"],
-                                                       long_reply["reply"])])
+                                                       long_reply["reply"])], mode=headroom.quality_mode(result))
                             result["quality"] = merge_honesty(result["quality"], more)
                         else:
                             result["quality"]["honesty"]["long_reply"] = {"status": "unmeasured", **long_reply}
@@ -348,7 +442,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                     for key, row in result["context"]["interpolated"].items():
                         log(f"context {int(key):,}: interpolated decode {row['decode_tps']:.1f} tok/s, first token "
                             f"after {row['ttft_ms']:,.0f} ms")
-                memory["after_curve"] = host.device_memory()
+                memory["after_curve"] = host.device_memory(indices=gpus)
                 with times.part("retrieval"):
                     result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log,
                                                                    asked)
@@ -374,7 +468,13 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 for case_id, row in result["history"]["cases"].items():
                     log(f"history {case_id}: " + (f"identical after {between}" if row["identical"] else
                                                   f"differs at token {row['first_difference']} after {between}"))
+            if headroom.quality_mode(result) == "as_quantized" and not stopped:
+                # protocol forks: each recorded output difference judged on this engine before it closes
+                with times.part("forks"):
+                    judge_forks(result, engine, prepared, protocol, log)
+            concurrency()
     finally:
+        result["engine_loads"]["last"] = engine_loads(engine)
         engine.close()
     if staged is not None and plan["lower"]:
         if plan["fits"]("lower_context", plan["lower_seconds"]):
@@ -402,7 +502,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 result["quality"]["attribution"] = run_attribution(
                     module, model, config, prepared, protocol, log, reference_scores,
                     result["requirements"]["quality_budget"], reference_spread, result["quality"],
-                    info.get("exact_variants"), required, reference_allowance)
+                    info.get("exact_variants"), required)
     wider = info.get("wider_draft")
     if (wider and "speed" in result and info.get("speculative") and not info.get("served")
             and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
@@ -438,12 +538,19 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             steps = {cid: headroom.step_ms_from([s for s in c["samples"] if not s["warmup"]]) for cid, c in measured.items()}
         decode_name, decode_speed = headroom.decode_suite(result)
         facts, source = dict(info), "engine" if info.get("bytes_per_pass") else None
+        element = float(settings["kv_bytes_per_element"])
+        try:
+            stored = pass_bytes(model, element)
+        except (OSError, ValueError, KeyError):
+            stored = None
         if not facts.get("bytes_per_pass"):
-            try:
-                facts["bytes_per_pass"] = pass_bytes(model, float(settings["kv_bytes_per_element"]))
-            except (OSError, ValueError, KeyError):
-                facts["bytes_per_pass"] = None
+            facts["bytes_per_pass"] = stored
             source = "model files" if facts["bytes_per_pass"] else None
+        # protocol headroom.fixed_decode: the model files' bytes per pass and KV per token at the protocol's KV
+        # precision (the stored ceiling's is BF16), whatever the engine reports.
+        kv = (ceiling or {}).get("kv_bytes_per_token") or 0
+        model_pass = ({"bytes_per_pass": stored, "kv_bytes_per_token": kv / 2 * element}
+                      if stored and ceiling else None)
         draft_source = "engine" if info.get("draft_bytes_per_step") else None
         if facts.get("speculative") and not facts.get("draft_bytes_per_step"):
             # A drafting engine that reports none: the checkpoint's own draft layers and the head they read.
@@ -454,13 +561,43 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             draft_source = "model files" if facts["draft_bytes_per_step"] else None
         # Each format's best probed rate, cuBLASLt's GEMM or the raw tensor cores' (crit_eval.limits.ceiling.best_rates).
         rates, rate_sources = best_rates(device)
+        # The model's memory tiers on the device at the required context (protocol headroom.tiers): the weights its
+        # placement leaves off the device, which an engine that declares no host bytes is priced by.
+        try:
+            where = placement(model, device, settings.get("vram_headroom_bytes", GIB),
+                              float(machine_settings().get("ram_headroom_gib", 2.0)) * GIB, settings, required) \
+                if device and required else None
+        except (OSError, ValueError, KeyError, TypeError):
+            where = None
+        tiers = derive_tiers(where, ceiling)
         result["headroom"] = headroom.summarize(facts, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
                                                 ceiling=ceiling, tflops=rates or None, steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
                                                 context=result["context"], context_settings=settings,
                                                 decode_speed=decode_speed, decode_name=decode_name,
                                                 host_rates={"link": link_gbs(device),
-                                                            "memory": ((device or {}).get("host_memory_gbs") or {}).get("read")})
+                                                            "memory": ((device or {}).get("host_memory_gbs") or {}).get("read")},
+                                                model_pass=model_pass, tiers=tiers)
+        # An engine whose weights cannot all be on the device: priced by the placement's tiers when it declares no host
+        # bytes, and asked for them only when Eval cannot place the model.
+        try:
+            split = weight_split(model, model_config(model))
+        except (OSError, ValueError, KeyError):
+            split = None
+        undeclared = headroom.undeclared_host_bytes(
+            info, split and split["resident"] + split["experts"], (device or {}).get("memory_total_bytes"))
+        if undeclared and tiers:
+            off = result["headroom"]["host_pass"] or {}
+            result["headroom"]["warnings"].append(
+                f"pass floor priced by the placement's tiers ({tiers['scenario']}): {(off.get('link') or 0) + (off.get('cpu') or 0):,.0f} "
+                f"bytes per pass from host memory at a {off.get('hit_rate', 0):.0%} expert cache hit rate "
+                f"({off.get('hit_rate_source')}); the engine's host_bytes_per_pass would price its own path")
+            log("headroom: " + result["headroom"]["warnings"][-1])
+        elif undeclared:
+            result["headroom"]["missing"].append(undeclared)
+            result["headroom"]["warnings"].append("pass floor priced as if every weight were on the device: "
+                                                  + undeclared.split(": ", 1)[1])
+            log("headroom: " + result["headroom"]["warnings"][-1])
         # Bytes per pass from the engine, or from the stored model when it reports none (crit_eval.limits.context.pass_bytes).
         result["headroom"]["bytes_per_pass_source"] = source
         result["headroom"]["draft_bytes_per_step_source"] = draft_source
@@ -471,8 +608,20 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                                     [baseline] if baseline else [])
         for warning in result["headroom"]["warnings"]:
             log("headroom: " + warning)
+    result["jitter"] = jitter_record(settings.get("jitter"), result.get("heldout"), result.get("context"))
+    # protocol tracks: what Eval can check of the closed track (the card declares the rest).
+    try:
+        own = draft_step_bytes(model)
+    except (OSError, ValueError, KeyError):
+        own = None
+    result["track"] = {"closed": closed_track(result, result.get("engine") or {}, own,
+                                              float(protocol["tracks"]["draft_tolerance"]))}
     result["timing"] = times.record()
     log(f"timing: {times.summary()}; total {result['timing']['total_seconds']:.0f} s")
+    written = journal.active()
+    if written is not None:
+        written.end("completed")
+        result["journal"] = written.summary(portable_path)
     result["status"] = status.build(result, protocol, baseline)
     result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     write_json(out, result)
@@ -480,10 +629,11 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
 
 
 def _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required, settings, exactness,
-            disturbed, reference_scores, reference_spread, reference_allowance, memory, times, baseline, staged):
+            disturbed, reference_scores, reference_spread, memory, times, baseline, staged,
+            concurrency=None):
     """The parts of a staged run on its engine (protocol stages): stage 1, then the highest stage that fits the
     budget at the rates the engine measured (with the certification's request at the requirement when certified),
-    and the request history again. Returns what the run does after the engine closed: {"lower": whether stage 3
+    the request history again, and the concurrency part, each level while it fits (concurrency(fits)). Returns what the run does after the engine closed: {"lower": whether stage 3
     measures the lower context, "lower_seconds", "lower_reason" when it does not, "fits": the budget check}."""
     rule, certify, budget = protocol["stages"], staged["certify"], staged["budget_seconds"]
     record = result["stages"] = {"budget_seconds": budget, "cap": staged["stage"], "certify": certify, "reached": 1,
@@ -491,7 +641,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
     result["context"]["certified"] = certify
 
     def elapsed():
-        return time.perf_counter() - times.started
+        return journal.clock() - times.started
 
     def fits(name, seconds):
         """Whether a part expected to take `seconds` still fits the budget; one that does not is skipped and named."""
@@ -591,7 +741,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             with times.part("quality"):
                 result["quality"] = run_quality(engine, info, with_quality(prepared, first), protocol, log,
                                                 reference_scores, result["requirements"]["quality_budget"],
-                                                reference_spread, reference_allowance)
+                                                reference_spread, mode=headroom.quality_mode(result))
             if result["quality"].get("status") == "scored":
                 result["quality"]["skipped"].update({**over, **{name: "a stage 2 set" for name in later}})
         else:
@@ -636,15 +786,13 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
     if stage >= 2:
         repeat = short_cases(prepared, info, rule)
         if "speed" in parts and repeat and fits("speed", cost(2, "speed")):
+            # The stage 1 request warmed the engine for the repetitions: it stays as their warmup, compared with the
+            # first of them (protocol speed.extra_repetition).
+            rows = dict(result["speed"]["cases"])
             with times.part("speed"):
                 again = run_speed(engine, info, with_speed(prepared, repeat), protocol, 0, int(rule["repetitions"]),
-                                  log, continuations, disturbed)
-            rows = dict(result["speed"]["cases"])
-            for case_id, row in again["cases"].items():
-                if row["status"] == "measured":
-                    # The stage 1 request warmed the engine for the repetitions: it stays as their warmup.
-                    first = [{**s, "warmup": True} for s in rows[case_id].get("samples", [])]
-                    rows[case_id] = {**row, "samples": first + row["samples"]}
+                                  log, continuations, disturbed, warmed=rows)
+            rows.update({case_id: row for case_id, row in again["cases"].items() if row["status"] == "measured"})
             result["speed"] = speed_summary(rows, protocol, 0, int(rule["repetitions"]), text)
         if "followup" in parts and fits("followup", cost(2, "followup")):
             with times.part("followup"):
@@ -652,7 +800,8 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         if later and (result.get("quality") or {}).get("status") == "scored" and fits("quality", cost(2, "quality")):
             with times.part("quality"):
                 more = run_quality(engine, info, with_quality(prepared, later), protocol, log, reference_scores,
-                                   result["requirements"]["quality_budget"], reference_spread, reference_allowance)
+                                   result["requirements"]["quality_budget"], reference_spread,
+                                   mode=headroom.quality_mode(result))
             result["quality"] = merge_quality(result["quality"], more)
             stopped = result["quality"].get("stopped_early")
         curve_seconds = (cost(2, "context") or 0.0) + (cost("certify", "context") or 0.0) if found else None
@@ -667,14 +816,14 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
                     if long_reply.get("reply"):
                         more = run_honesty(engine, info, prepared, protocol, log, {}, texts=False,
                                            extra=[(f"curve@{long_reply['point']}", long_reply["prompt_ids"],
-                                                   long_reply["reply"])])
+                                                   long_reply["reply"])], mode=headroom.quality_mode(result))
                         result["quality"] = merge_honesty(result["quality"], more)
                     else:
                         result["quality"]["honesty"]["long_reply"] = {"status": "unmeasured", **long_reply}
             if certify:
                 result["context"]["interpolated"] = interpolated_curve(result["context"]["points"], required,
                                                                        settings)
-            memory["after_curve"] = host.device_memory()
+            memory["after_curve"] = host.device_memory(indices=(memory.get("after_load") or {}).get("indices"))
             with times.part("retrieval"):
                 result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log, asked)
     elif "followup" in parts:
@@ -694,7 +843,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
                     prepared, info, rule)), result["speed"], log, exactness, engine=engine, info=info)
         if heldout and fits("heldout", cost(3, "heldout")):
             with times.part("heldout"):
-                result["heldout"] = run_heldout(engine, info, prepared, protocol, log)
+                result["heldout"] = run_heldout(engine, info, prepared, protocol, log, settings["jitter"])
         elif "heldout" in parts:
             result["heldout"] = {"status": "skipped", "reason": "the held-out prompts are decoded only against a "
                                  "baseline that measured them: their generality gate needs one"}
@@ -725,12 +874,21 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         for case_id, row in result["history"]["cases"].items():
             log(f"history {case_id}: " + (f"identical after {', '.join(between) or 'nothing else'}" if row["identical"]
                                           else f"differs at token {row['first_difference']}"))
+    if headroom.quality_mode(result) == "as_quantized" and not stopped:
+        # protocol forks: each recorded output difference judged on this engine before it closes
+        judge_forks(result, engine, prepared, protocol, log)
+    if concurrency is not None and not stopped:
+        concurrency(fits)
     if required:
         result["context"]["creep"] = creep(result, required)
         projected = result["context"]["creep"]
         if projected and projected.get("decode_tps_at_requirement"):
             log(f"context: decode projected at {required:,} tokens {projected['decode_tps_at_requirement']:.1f} tok/s "
                 f"(fitted up to {projected['measured_up_to']:,} tokens over {projected['contexts']} contexts)")
-    return {"lower": lower and stage >= 3 and not stopped,
-            "lower_seconds": cost(3, "lower_context") + load if found else None, "fits": fits,
-            "lower_reason": not_run(3)["reason"] if lower else "a served engine cannot be opened at a lower context"}
+    # protocol stages certify: the lower-context gate opens a second engine, which only the candidate that will ship
+    # pays for.
+    return {"lower": lower and certify and stage >= 3 and not stopped,
+            "lower_seconds": cost("certify", "lower_context") + load if found else None, "fits": fits,
+            "lower_reason": ("a served engine cannot be opened at a lower context" if not lower else
+                             not_run(3)["reason"] if stage < 3 or stopped else
+                             "the lower-context gate runs on a certified run (crit eval run --certify)")}

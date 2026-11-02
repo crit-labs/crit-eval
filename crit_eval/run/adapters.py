@@ -7,6 +7,7 @@ import types
 from pathlib import Path
 
 from .. import CONTRACT, portable_path
+from . import journal
 
 
 _ADAPTER_FOLDERS = set()   # folders of the adapters loaded in this process
@@ -58,14 +59,20 @@ def open_engine(module, model, config, speculative, context_tokens=None, exact_p
     context = {"contract": CONTRACT, "model": str(model), "config": dict(config), "speculative": speculative}
     if context_tokens:
         context["context_tokens"] = int(context_tokens)
-    engine = module.create_eval_engine(context)
-    if exact_prompts and hasattr(engine, "exact_prompts"):
-        engine.exact_prompts = True
-    info = engine.info()
-    for key in ("name", "configuration", "max_context"):
-        if key not in info:
-            raise SystemExit(f"engine.info() is missing {key!r}")
-    return engine, info
+
+    def opener(context):
+        engine = module.create_eval_engine(context)
+        if exact_prompts and hasattr(engine, "exact_prompts"):
+            engine.exact_prompts = True
+        info = engine.info()
+        for key in ("name", "configuration", "max_context"):
+            if key not in info:
+                raise SystemExit(f"engine.info() is missing {key!r}")
+        return engine, info
+    # In a journaled round (crit_eval.run.journal) the engine's requests go through the journal, and an engine whose
+    # requests the resumed journal holds loads only for the ones left.
+    written = journal.active()
+    return opener(context) if written is None else written.open(opener, context, {**context, "exact_prompts": exact_prompts})
 
 
 def file_sha256(path):

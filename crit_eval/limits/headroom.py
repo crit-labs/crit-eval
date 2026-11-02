@@ -64,6 +64,7 @@ crit-eval does not judge or classify speed. Noise is the spread of each score ac
 repetitions.
 """
 from . import ceiling as model_ceiling
+from . import tiers as memory_tiers
 from ..reports import metrics
 
 
@@ -74,6 +75,13 @@ def decode_suite(result):
     if sampled.get("status") == "measured" and sampled.get("decode_score"):
         return "sampled", sampled
     return "greedy", result.get("speed") or {}
+
+
+def tiered_ceiling(result):
+    """The result's model arithmetic (ceiling) with its memory tiers on the device (headroom.tiers), which the prompt
+    floors price the weights off the device by (protocol headroom.tiers)."""
+    ceiling, tiers = result.get("ceiling"), (result.get("headroom") or {}).get("tiers")
+    return {**ceiling, "tiers": tiers} if ceiling and tiers else ceiling
 
 
 def pass_floor_ms(bytes_per_pass, bandwidth_gbs, host=None):
@@ -104,6 +112,23 @@ def host_pass(info, host_rates):
     rates = host_rates or {}
     return {"link": found.get("link") or 0, "cpu": found.get("cpu") or 0, "link_gbs": rates.get("link"),
             "memory_gbs": rates.get("memory")}
+
+
+def undeclared_host_bytes(info, weight_bytes, device_bytes):
+    """What a result says when its engine must read weights from host memory but declares no host_bytes_per_pass: the
+    model's weights (weight_bytes, gathered tables and the vision tower left out) exceed the device's memory
+    (device_bytes), so its pass floor, priced as if every byte came from device memory, is one the engine cannot reach
+    and its fractions of it understate where it stands. None when it declares them, or when the weights fit."""
+    found = info.get("host_bytes_per_pass")
+    if isinstance(found, dict) and (found.get("link") or found.get("cpu")):
+        return None
+    if not weight_bytes or not device_bytes or weight_bytes <= device_bytes:
+        return None
+    return (f"the engine's host_bytes_per_pass: the model's weights ({weight_bytes / 1e9:.1f} GB) exceed the device's "
+            f"memory ({device_bytes / 1e9:.1f} GB), so a pass reads some from host memory, yet every byte is priced at "
+            "the device's bandwidth (all on device). Declare host_bytes_per_pass ({\"link\": bytes copied over the host "
+            "link, \"cpu\": bytes the CPU computes from}) for a floor priced by source; fixed_decode keeps the "
+            "all-on-device fraction")
 
 
 def tokens_by_width(accepted, width, drafted=None):
@@ -214,11 +239,14 @@ def spread(values):
 
 def noise(speed, prefill_cases=()):
     """Run-to-run spread of the decode, TTFT, end-to-end and prefill scores across measured repetitions (the
-    prefill score over prefill_cases)."""
+    prefill score over prefill_cases), over the cases measured more than once: a case measured once has no spread
+    (protocol speed.noise). repeated_cases and cases say how many cases that leaves."""
     cases = {cid: c for cid, c in (speed or {}).get("cases", {}).items() if c.get("status") == "measured"}
     reps = {cid: [s for s in c.get("samples", []) if not s.get("warmup")] for cid, c in cases.items()}
-    if not reps or min(len(r) for r in reps.values()) < 2:
-        return {"decode": None, "ttft": None, "end_to_end": None, "prefill": None}
+    basis = {"cases": len(reps), "repeated_cases": sum(len(r) >= 2 for r in reps.values())}
+    reps = {cid: r for cid, r in reps.items() if len(r) >= 2}
+    if not reps:
+        return {"decode": None, "ttft": None, "end_to_end": None, "prefill": None, **basis}
     count = min(len(r) for r in reps.values())
     decode, ttft, e2e, prefill = [], [], [], []
     for i in range(count):
@@ -230,14 +258,17 @@ def noise(speed, prefill_cases=()):
         prefill.append(metrics.geometric_mean([reps[cid][i]["prefill_tps"] for cid in prefill_cases
                                                if cid in reps and reps[cid][i].get("prefill_tps")]))
     return {"decode": spread(decode), "ttft": spread(ttft), "end_to_end": spread(e2e),
-            "prefill": spread(prefill) if all(cid in reps for cid in prefill_cases) and prefill_cases else None}
+            "prefill": spread(prefill) if all(cid in reps for cid in prefill_cases) and prefill_cases else None,
+            **basis}
 
 
 def _noises(speed, decode_speed, prefill_cases):
     """Each KPI's run-to-run spread. The long-context curve runs once per point, so its decode and first token take
-    the device's spread from the speed suite's repetitions: the greedy decode's and the prefill's."""
-    greedy = noise(speed, prefill_cases)
-    return {**greedy, "decode": noise(decode_speed)["decode"], "end_to_end": noise(decode_speed)["end_to_end"],
+    the device's spread from the speed suite's repetitions: the greedy decode's and the prefill's. repeated_cases and
+    cases count the greedy suite's, decode_repeated_cases and decode_cases the decode suite's."""
+    greedy, decoded = noise(speed, prefill_cases), noise(decode_speed)
+    return {**greedy, "decode": decoded["decode"], "end_to_end": decoded["end_to_end"],
+            "decode_repeated_cases": decoded["repeated_cases"], "decode_cases": decoded["cases"],
             "context_decode": greedy["decode"], "context_ttft": greedy["prefill"]}
 
 
@@ -316,7 +347,7 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
     prompt_activations; which of them quality evidence shows passing or rules out, and the reachable ceiling: the
     fastest shown to pass. evidence: earlier results of the same model (a baseline) whose quality judged their own
     declared activations, beside this result's. None when the model stores no quantized matrices."""
-    ceiling = result.get("ceiling")
+    ceiling = tiered_ceiling(result)
     formats = model_ceiling.quantized_formats(ceiling)
     speed, info = result.get("speed") or {}, result.get("engine") or {}
     if not formats or not rates:
@@ -416,7 +447,7 @@ def mode_limits(result):
     rates = (room.get("rates") or {}).get("tflops")
     floors = []
     for row in points:
-        floor, _ = model_ceiling.ttft_floor_ms(result.get("ceiling"), rates, room.get("bandwidth_gbs") or
+        floor, _ = model_ceiling.ttft_floor_ms(tiered_ceiling(result), rates, room.get("bandwidth_gbs") or
                                                result.get("bandwidth_gbs"), row["prompt_tokens"],
                                                (result.get("engine") or {}).get("bytes_per_pass"), shares)
         if floor:
@@ -517,7 +548,7 @@ def prefill_terms(result, trace, rates, prefill_cases):
     its own activations' rate where that is slower than the stored format's, all else as the trace measured, on the
     prefill score, stated only when the trace holds every prefill-scored case (untraced names the ones it lacks). None
     without a trace or the arithmetic."""
-    ceiling = result.get("ceiling")
+    ceiling = tiered_ceiling(result)
     measured = {cid: c for cid, c in (result.get("speed") or {}).get("cases", {}).items() if c.get("status") == "measured"}
     if not trace or not ceiling or not rates:
         return None
@@ -633,7 +664,7 @@ def price_prompts(result, rates, sources, prefill_cases, evidence=()):
     and their gaps in place of the old ones. The run prices them so; `crit eval status --device/--data` prices a
     result again with a newer probe or with the arithmetic of the data it was measured on."""
     room = dict(result.get("headroom") or {})
-    info, speed, ceiling = result.get("engine") or {}, result.get("speed") or {}, result.get("ceiling")
+    info, speed, ceiling = result.get("engine") or {}, result.get("speed") or {}, tiered_ceiling(result)
     bandwidth_gbs = room.get("bandwidth_gbs") or result.get("bandwidth_gbs")
     tflops = rates or None
     prefill = prefill_summary(speed, ceiling, tflops, prefill_cases)
@@ -655,20 +686,59 @@ def price_prompts(result, rates, sources, prefill_cases, evidence=()):
     return room
 
 
+def fixed_decode(decode_speed, model_pass, bandwidth_gbs, decode_name="greedy"):
+    """protocol headroom.fixed_decode: each case's decode tok/s over one token per pass at the model files' bytes
+    (model_pass: {"bytes_per_pass", "kv_bytes_per_token"} from the stored model at the protocol's KV precision, never
+    the engine's report) read at the probed bandwidth, and the cases' geometric mean. Above 1 with speculation. None
+    without the model files' bytes or a bandwidth."""
+    if not model_pass or not model_pass.get("bytes_per_pass") or model_pass.get("kv_bytes_per_token") is None \
+            or not bandwidth_gbs:
+        return None
+    cases = {}
+    for case_id, case in (decode_speed or {}).get("cases", {}).items():
+        if case.get("status") != "measured" or not case.get("decode_tps"):
+            continue
+        read = model_pass["bytes_per_pass"] + model_pass["kv_bytes_per_token"] * _context(case)
+        at_floor = bandwidth_gbs * 1e9 / read
+        cases[case_id] = {"decode_tps": case["decode_tps"], "tps_at_floor": at_floor,
+                          "fraction": case["decode_tps"] / at_floor}
+    return {"suite": decode_name, "bytes_per_pass": model_pass["bytes_per_pass"],
+            "kv_bytes_per_token": model_pass["kv_bytes_per_token"], "bandwidth_gbs": bandwidth_gbs,
+            "fraction": metrics.geometric_mean([row["fraction"] for row in cases.values()]), "cases": cases}
+
+
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
               prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy",
-              host_rates=None):
+              host_rates=None, model_pass=None, tiers=None):
     """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
     in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s; ceiling:
     the prepared model arithmetic (ceiling.model_ceiling); tflops: GEMM rates by format; steps:
     ordinary step ms by case; prefill_cases: case ids in the prefill score; context: the result's
     context section (the requirement and the measured curve); context_settings: the protocol's;
     decode_speed: the suite the decode terms describe (decode_suite), named decode_name; speed by default; host_rates:
-    the probe's host rates ({"link", "memory"} GB/s) that price an engine's declared host_bytes_per_pass (host_pass)."""
+    the probe's host rates ({"link", "memory"} GB/s) that price an engine's declared host_bytes_per_pass (host_pass);
+    model_pass: the model files' bytes per pass and KV bytes per token, the fixed denominator (fixed_decode); tiers: the
+    model's memory tiers on the device (crit_eval.limits.tiers.derive), which price an engine that declares no host
+    bytes, each case at its own expert cache hit rate, and the prompts' floors (protocol headroom.tiers)."""
     decode_speed = decode_speed or speed
     width = info.get("draft_width")
+    probed_gbs = bandwidth_gbs   # the fixed denominator takes the probe's, never an engine's
     bandwidth_gbs = bandwidth_gbs or info.get("bandwidth_gbs")
-    host = host_pass(info, host_rates)
+    declared = host_pass(info, host_rates)
+    samples = [s for c in (decode_speed or {}).get("cases", {}).values() if c.get("status") == "measured"
+               for s in c.get("samples", []) if not s.get("warmup")]
+    engine_rate = memory_tiers.hit_rate(samples)
+    if tiers:
+        tiers = {**tiers, "engine_hit_rate": engine_rate}
+        ceiling = {**(ceiling or {}), "tiers": tiers} if ceiling else ceiling
+
+    def priced(rows=()):
+        """A pass's host bytes: the engine's declaration, else the tiers at the hit rate `rows` report (the run's)."""
+        if declared:
+            return declared
+        rate = memory_tiers.hit_rate([s for r in rows for s in r.get("samples", []) if not s.get("warmup")])
+        return memory_tiers.decode_host(tiers, engine_rate if rate is None else rate)
+    host = priced()
     floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs, host)
     draft_floor = pass_floor_ms(info.get("draft_bytes_per_step"), bandwidth_gbs)
     kv_per_token = info.get("kv_bytes_per_token") or (ceiling or {}).get("kv_bytes_per_token") or 0
@@ -686,7 +756,10 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         if width and case.get("tokens_per_round"):
             row["saturation"] = case["tokens_per_round"] / (width + 1)
         if floor:
-            row["pass_floor_ms"] = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * _context(case), bandwidth_gbs, host)
+            row["pass_floor_ms"] = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * _context(case), bandwidth_gbs,
+                                                 priced([case]))
+            if not declared and tiers:
+                row["expert_hit_rate"] = priced([case])["hit_rate"]
             if case.get("round_ms"):
                 row["round_over_pass_floor"] = case["round_ms"] / row["pass_floor_ms"]
         measured_samples = [s for s in case.get("samples", []) if not s.get("warmup")]
@@ -728,7 +801,8 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
 
     efficiency = floor / step_ms if floor and step_ms else None
     if host and (not host["memory_gbs"] or (host["link"] and not host["link_gbs"])):
-        missing.append("host rates for host_bytes_per_pass (re-run crit eval probe)")
+        missing.append("host rates for host_bytes_per_pass (re-run crit eval probe)" if declared else
+                       "host rates for the weights off the device (re-run crit eval probe)")
     if efficiency is None:
         lacking = [name for name, value in (("bytes_per_pass from the adapter", info.get("bytes_per_pass")),
                                             ("device bandwidth (--device)", bandwidth_gbs),
@@ -802,7 +876,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     long_context = None
     if (context or {}).get("points"):
         long_context = context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token,
-                                       context_settings or {}, host)
+                                       context_settings or {}, host, priced)
         gaps += long_context.pop("gaps")
         missing += [m for m in long_context["missing"] if m not in missing]
         if long_context["decode"]["fraction_of_ceiling"] is not None:
@@ -812,27 +886,34 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     return {
         "decode_suite": decode_name, "draft_width": width, "bytes_per_pass": info.get("bytes_per_pass"), "bandwidth_gbs": bandwidth_gbs,
         "host_pass": host,
+        # The model's memory tiers on the device (protocol headroom.tiers), and the run's expert cache hit rate.
+        "tiers": tiers,
         "kv_bytes_per_token": kv_per_token or None,
         "pass_floor_ms": floor, "step_ms": step_ms, "pass_efficiency": efficiency,
         "projection": projection, "cases": cases, "prefill": prefill, "ttft": ttft, "gaps": gaps,
         "end_to_end": end_to_end, "noise": _noises(speed, decode_speed, prefill_cases), "context": long_context,
+        # Decode over one token per pass at the model files' bytes, whatever the engine reports (reported, not judged).
+        "fixed_decode": fixed_decode(decode_speed, model_pass, probed_gbs, decode_name),
         "missing": missing, "warnings": warnings,
     }
 
 
-def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token, settings, host=None):
+def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, kv_per_token, settings, host=None,
+                    priced=None):
     """Decode and time to first token over the long-context curve against their floors, and the gaps:
     rounds at their floor, the KV cache at the protocol's precision (with everything else as measured)
-    and the first token at its floor."""
+    and the first token at its floor. priced(rows): a pass's host bytes at the hit rate rows report (summarize's),
+    so each point's floor prices its own expert cache hits; the first-token floors take the ceiling's tiers."""
     width = info.get("draft_width") or 0
     points, missing, gaps = {}, [], []
     for key, point in sorted(context["points"].items(), key=lambda item: item[1]["context"]):
         if point.get("status") != "measured":
             continue
-        row = {k: point.get(k) for k in ("context", "prompt_tokens", "output_tokens", "decode_tps", "ttft_ms",
-                                          "prefill_tps", "tokens_per_round", "round_ms")}
+        row = {k: point.get(k) for k in ("context", "filled_context", "prompt_tokens", "output_tokens", "decode_tps",
+                                          "ttft_ms", "prefill_tps", "tokens_per_round", "round_ms")}
         reading = point["prompt_tokens"] + point["output_tokens"] / 2
-        pass_floor = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * reading, bandwidth_gbs, host) if info.get(
+        point_host = priced([point]) if priced else host
+        pass_floor = pass_floor_ms(info["bytes_per_pass"] + kv_per_token * reading, bandwidth_gbs, point_host) if info.get(
             "bytes_per_pass") else None
         if pass_floor is not None and (not width or draft_floor is not None):
             row["round_floor_ms"] = pass_floor + width * (draft_floor or 0.0)

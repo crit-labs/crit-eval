@@ -127,18 +127,23 @@ def check_template(prepared, model, data, chat_template=None):
 # A Hugging Face hub cache path: models--ORG--NAME/snapshots/REVISION.
 HUB_CACHE = re.compile(r"models--([^/]+)--([^/]+)/snapshots/([0-9a-f]{7,64})")
 REVISION = re.compile(r"[0-9a-f]{40}")
+# A checkpoint in crit pull's engine store: models/<org>--<repository>@<revision>.
+STORE_FOLDER = re.compile(r"([A-Za-z0-9_.-]+?)--([A-Za-z0-9_.-]+)@([0-9a-f]{40})")
 
 
 def model_description(model):
     """What a result names its model by, beside model_sha256: its name, the Hugging Face repository and revision
-    when the path shows them (a hub cache, or a folder named by its commit), its format, architecture and
-    quantization. No path is stored. None where the model cannot be read."""
+    when the path shows them (a hub cache, crit pull's engine store, or a folder named by its commit), its format,
+    architecture and quantization. No path is stored. None where the model cannot be read."""
     from ..limits.schemes import quantization_of
     try:
         path = Path(model).resolve()
         found = HUB_CACHE.search(path.as_posix())
         if found:
             name, repository, revision = found[2], f"{found[1]}/{found[2]}", found[3]
+        elif STORE_FOLDER.fullmatch(path.name):
+            stored = STORE_FOLDER.fullmatch(path.name)
+            name, repository, revision = stored[2], f"{stored[1]}/{stored[2]}", stored[3]
         elif REVISION.fullmatch(path.name):
             name, repository, revision = path.parent.name, None, path.name
         else:
@@ -264,6 +269,20 @@ def speed_case(model, case):
 
 def heldout_messages(prompt):
     return [{"role": "user", "content": prompt["content"]}]
+
+
+def heldout_prompts(model, prompts, output_tokens):
+    """The held-out prompts, and the frame every one renders in: the template's head and tail around a user message
+    (document_frame). Each prompt holds its user text's tokens (content_ids) when head + them + tail is its prompt, so
+    a run can cut the text to a drawn length (protocol jitter); a prompt that does not split so keeps its ids alone."""
+    head, tail = document_frame(model, [{"role": "user", "content": SENTINEL}])
+    rows = []
+    for p in prompts:
+        ids, content = prompt_ids(model, heldout_messages(p)), piece_ids(model, p["content"])
+        rows.append({"id": p["id"], "language": p["language"], "kind": p["kind"], "prompt_ids": ids,
+                     "messages": heldout_messages(p), "output_tokens": output_tokens,
+                     **({"content_ids": content} if head + content + tail == ids else {})})
+    return {"head_ids": head, "tail_ids": tail, "messages": [{"role": "user", "content": SENTINEL}]}, rows
 
 
 def api_messages(messages):
@@ -509,11 +528,11 @@ def prepare(model, data, speed_tokens=None, sampling=None, chat_template=None):
         # Arithmetic and KV bytes per token for the prefill and long-context decode floors.
         "ceiling": model_ceiling(model),
     }
-    # Held-out prompts: outside the speed suite, never a tuning target (protocol "heldout").
+    # Held-out prompts: outside the speed suite, never a tuning target (protocol "heldout"), each with its user text's
+    # tokens inside the template's frame, which a run cuts to its drawn length (protocol jitter).
     heldout = json.loads((SUITE_DIR / "heldout.json").read_text(encoding="utf-8"))
-    prepared["heldout"] = [{"id": p["id"], "language": p["language"], "kind": p["kind"],
-                            "prompt_ids": prompt_ids(text, heldout_messages(p)), "messages": heldout_messages(p),
-                            "output_tokens": protocol["heldout"]["output_tokens"]} for p in heldout["prompts"]]
+    prepared["heldout_frame"], prepared["heldout"] = heldout_prompts(text, heldout["prompts"],
+                                                                     protocol["heldout"]["output_tokens"])
     prepared["retrieval"] = retrieval_pieces(text, long, filler)
     followup = json.loads((SUITE_DIR / "followup.json").read_text(encoding="utf-8"))
     prepared["followup"] = followup_prompts(text, followup, filler, protocol["followup"]["prompt_tokens"])

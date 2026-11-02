@@ -4,10 +4,21 @@ import os
 import re
 from pathlib import Path
 
+try:
+    from crit_core import registry as _registry
+except ImportError:   # a crit-core before its registry holds these architectures' rules and templates itself
+    _registry = None
+if _registry is not None:
+    # crit-core holds no model family's rules or templates: those of the architectures the reference reads come from
+    # here, imported when it first derives a lone GGUF's config.json or looks for a model's missing chat template
+    # (installed, the entry points name them too).
+    _registry.register("gguf_config", "crit_eval.architectures.gguf_config:CONFIG_RULES")
+    _registry.register("chat_templates", "crit_eval.architectures:CHAT_TEMPLATES")
+
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.4.1"
+__version__ = "0.5.0"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.

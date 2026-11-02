@@ -1,5 +1,5 @@
-"""DeepSeek V4 GGUFs (architecture "deepseek4"): the config.json their metadata derives (crit_core.model.gguf_deepseek4)
-and the reference's layout (crit_eval.architectures.gguf_deepseek4).
+"""DeepSeek V4 GGUFs (architecture "deepseek4"): the config.json their metadata derives and the reference's layout
+(crit_eval.architectures.gguf_deepseek4).
 
 The conformance test writes a tiny checkpoint in DeepSeek's own format (FP8 matrices with E8M0 block scales, FP4
 routed experts with E8M0 scales per 32 values, BF16 and F32 tensors, hash-routing tables), converts it with GGUF's
@@ -22,6 +22,7 @@ for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import GgufError, inspect_gguf_model  # noqa: E402
 from crit_core.model.gguf import TensorInfo  # noqa: E402
 from crit_core.model.gguf_files import derive_config  # noqa: E402
+import crit_eval  # noqa: E402,F401   (gives crit-core the architectures' config rules)
 from gguf_writer import ARRAY, FLOAT32, INT32, gguf_bytes  # noqa: E402
 
 

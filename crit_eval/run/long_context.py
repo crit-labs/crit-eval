@@ -5,6 +5,7 @@ from .deadline import Hung
 from ..limits.context import (curve_points, curve_prompt, lower_context, max_context, retrieval_points,
                               retrieval_prompt, token_text)
 from .adapters import open_engine
+from .jitter import curve_point
 from .speed import run_speed
 from .timing import Disturbed, _summary, timed_generate
 
@@ -39,11 +40,14 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
     facts and then a summary of the archive (curve_prompt): the point times that reply, the engine's own, and judges
     retrieval on it, so a long prompt is prefilled once for both. A request the engine cannot serve is recorded as
     failed. With reply_logprobs, the first point's request asks a served engine for that many alternatives per reply
-    token, so its reply serves the honesty check's long reply (protocol quality.honesty long_reply). Returns (points,
+    token, so its reply serves the honesty check's long reply (protocol quality.honesty long_reply). With settings'
+    jitter ({"seed", "fraction"}, protocol jitter) a point below the requirement fills its drawn share of the point
+    instead (filled_context), the requirement itself exactly. Returns (points,
     the decode text, the retrieval verdict of every point the curve served or failed, the long reply: {"point",
     "prompt_ids", "reply"} or {"point", "reason"} when there is none)."""
     pieces, rule = prepared["retrieval"], settings["retrieval"]
     n = int(settings["output_tokens"])
+    jitter = settings.get("jitter")
     points, asked = {}, {}
     curve = curve_points(required, settings)
     long_reply = {"point": curve[0] if curve else None, "reason": "the curve's first point was not measured"}
@@ -53,7 +57,8 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
                                   "reason": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
             log(f"context {point:,}: skipped (max_context {info['max_context']:,})")
             continue
-        prompt = curve_prompt(pieces, point - n, rule["positions"])
+        filled = curve_point(point, required, jitter)
+        prompt = curve_prompt(pieces, filled - n, rule["positions"])
         if prompt is None:
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"no room for the curve's prompt before {n} output tokens"}
@@ -86,10 +91,11 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
             log(f"context {point:,}: failed ({error})")
             continue
         summary = _summary(samples)
-        points[str(point)] = {"status": "measured", "context": point, "prompt_tokens": len(prompt), "output_tokens": n,
-                              **summary, "samples": samples}
+        points[str(point)] = {"status": "measured", "context": point, "filled_context": filled,
+                              "prompt_tokens": len(prompt), "output_tokens": n, **summary, "samples": samples}
         asked[point] = {**judged_retrieval(tokens, prepared, prompt, point), "ttft_ms": summary["ttft_ms"]}
-        log(f"context {point:,}: decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
+        log(f"context {point:,}" + (f" (filled {filled:,})" if filled != point else "")
+            + f": decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}; retrieval "
             + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in asked[point]["found"].items()))
     return points, dict(CONTEXT_TEXT), asked, long_reply

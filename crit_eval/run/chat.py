@@ -31,18 +31,20 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
 
 from .. import EVAL_DIR, load_json
 from .deadline import Hung, RequestDeadline
+from .outcomes import validate_completion
 from ..quality.prepare import GREEDY_REQUEST, prepared_template, token_ids, with_document
 
 # The engine facts crit serve publishes for crit-eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
-# request decode plainly.
+# request decode plainly. prompt_cache false: the engine keeps no prompt cache (protocol followup).
 FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-         "draft_ms", "kv_bytes_per_token", "prompt_activations")
+         "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
 PLAIN_CAPABILITY = "chat-plain-v1"
 
 
@@ -65,6 +67,9 @@ class Server:
         self.frames = [(retrieval["head_ids"], retrieval["tail_ids"], retrieval["messages"], None)] if retrieval else []
         if retrieval and retrieval.get("curve_tail_ids"):   # the long-context curve's request after the same archive
             self.frames.append((retrieval["head_ids"], retrieval["curve_tail_ids"], retrieval["curve_messages"], None))
+        held = prepared.get("heldout_frame")
+        if held:   # a held-out prompt cut to its drawn length (protocol jitter): its user text alone in the template
+            self.frames.append((held["head_ids"], held["tail_ids"], held["messages"], None))
         # The longest tail first: frames that share a head and end alike are told apart by their whole tail.
         self.frames.sort(key=lambda frame: -len(frame[1]))
 
@@ -276,7 +281,7 @@ class ChatEngine:
             body.update(logprobs=True, top_logprobs=int(logprobs))
         if plain:
             body["crit"] = {"decode": "plain"}   # one token per target pass (chat-plain-v1)
-        pieces, usage, finish, telemetry, entries = [], None, None, None, []
+        pieces, usage, finish, telemetry, entries, calls = [], None, None, None, [], {}
         started = time.monotonic()
         first = last = None
         for event in self.server.events("/chat/completions", body, self.deadline.seconds(len(prompt), max_new_tokens)):
@@ -290,6 +295,12 @@ class ChatEngine:
             for choice in event.get("choices") or []:
                 finish = choice.get("finish_reason") or finish
                 entries += ((choice.get("logprobs") or {}).get("content") or []) if logprobs else []
+                # Tool calls the server parsed itself, by index: their names and arguments as streamed (speed.tool_calls).
+                for call in (choice.get("delta") or {}).get("tool_calls") or []:
+                    slot = calls.setdefault(call.get("index", 0), {"name": "", "arguments": ""})
+                    function = call.get("function") or {}
+                    slot["name"] += function.get("name") or ""
+                    slot["arguments"] += function.get("arguments") or ""
                 piece = reply_text(choice.get("delta") or {})
                 if piece:
                     last = time.monotonic()
@@ -312,6 +323,8 @@ class ChatEngine:
         out = {"tokens": token_ids(self.text, "".join(pieces)), "rounds": rounds,
                "served": {"prompt_tokens": usage["prompt_tokens"], "output_tokens": usage["completion_tokens"],
                           "finish_reason": finish, "cached_tokens": cached_tokens(usage)}}
+        if calls:
+            out["tool_calls"] = [calls[index] for index in sorted(calls)]
         # Draft telemetry crit serve passes on: drafts accepted per round, verify and draft milliseconds.
         accepted = (telemetry or {}).get("accepted")
         if isinstance(accepted, list) and all(type(a) is int for a in accepted):
@@ -321,6 +334,8 @@ class ChatEngine:
                 out["drafted"] = drafted
         out.update({key: telemetry[key] for key in ("verify_ms", "draft_ms", "prefill_ms")
                     if isinstance((telemetry or {}).get(key), (int, float))})
+        # The decode's routed expert reads and those its device cache served (protocol headroom.tiers).
+        out.update({key: telemetry[key] for key in ("expert_reads", "expert_hits") if type((telemetry or {}).get(key)) is int})
         # crit serve's ttft_ms is the engine's own time to its first token: the client's beyond it is HTTP and serving.
         if isinstance((telemetry or {}).get("ttft_ms"), (int, float)):
             out["first_token_ms"] = telemetry["ttft_ms"]
@@ -460,6 +475,103 @@ class ChatEngine:
                 raise RuntimeError(f"{self.server.url} returned other than {top_k} alternatives per {part} token")
             rows[part] = [{"logprob": float(row[1]), "top": [[int(t), float(v)] for t, v in row[2]]} for row in found]
         return rows
+
+    def loads(self):
+        """How many times the server's resident host has loaded an engine (crit serve's /health engine_loads), or None
+        from a server that reports none: the closed track's one load for the run (protocol tracks)."""
+        status = (self.server.get("/health", self.deadline.seconds(0)) or {}).get("engine") or {}
+        value = status.get("engine_loads") if isinstance(status, dict) else None
+        return value if type(value) is int else None
+
+    def capacity(self):
+        """The requests the server runs at once: crit serve's max_concurrent_requests on the model's card, read again
+        now (a concurrent package's engine declares it as it loads); None from a server that reports none."""
+        cards = self.server.get("/models", self.deadline.seconds(0)).get("data") or []
+        value = next((m for m in cards if m.get("id") == self.model), {}).get("max_concurrent_requests")
+        return value if type(value) is int and value >= 1 else None
+
+    def cohort(self, clients, max_new_tokens):
+        """One closed-loop level of the concurrency part (protocol concurrency.loop): clients[c] is client c's prompts,
+        each sent greedy when the client's previous reply has ended, every client starting at once. {"seconds": the
+        level's wall interval, "requests": per request its client, index, prompt_tokens, the seconds from the level's
+        start when it was sent, its first and last reply text arrived and its reply was read (started, first, last,
+        finished), the usage's completion_tokens, finish_reason and cached_tokens, the stream's validation errors
+        (crit_eval.run.outcomes.validate_completion, plus cached prompt tokens) and the reply's tokens}. A request
+        waits for each streamed event as long as the engine's earlier requests say it should, times the clients (a
+        server that runs them one at a time); one past that raises Hung."""
+        start, rows, failures = threading.Event(), [], []
+        epoch = [0.0]
+
+        def client(index, prompts):
+            start.wait()
+            for position, prompt in enumerate(prompts):
+                try:
+                    rows.append({"client": index, "index": position,
+                                 **self._streamed(list(prompt), max_new_tokens, len(clients), epoch[0])})
+                except BaseException as error:   # Hung or a transport failure: the level stops with it
+                    failures.append(error)
+                    return
+        threads = [threading.Thread(target=client, args=(c, prompts), name=f"crit-eval-client-{c}", daemon=True)
+                   for c, prompts in enumerate(clients)]
+        for thread in threads:
+            thread.start()
+        epoch[0] = time.perf_counter()
+        start.set()
+        for thread in threads:
+            thread.join()
+        seconds = time.perf_counter() - epoch[0]
+        if failures:
+            raise failures[0]
+        rows.sort(key=lambda row: (row["client"], row["index"]))
+        return {"seconds": seconds, "requests": rows}
+
+    def _streamed(self, prompt, max_new_tokens, clients, epoch):
+        """One greedy request of a cohort, read raw so the stream itself is validated (cohort)."""
+        messages, tools = self.messages(prompt)
+        body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens, "stream": True,
+                "stream_options": {"include_usage": True}, **({"tools": tools} if tools else {}),
+                **self.applied(GREEDY_REQUEST)}
+        timeout = self.deadline.seconds(len(prompt), max_new_tokens) * max(1, clients)
+        request = urllib.request.Request(self.server.url + "/chat/completions", data=json.dumps(body).encode(),
+                                         headers=self.server.headers)
+        lines, pieces, usage, first, last = [], [], {}, None, None
+        started = time.perf_counter() - epoch
+        try:
+            with _bounded(timeout, "/chat/completions"), self.server.opener.open(request, timeout=timeout) as response:
+                status = response.status
+                for line in response:
+                    lines.append(line)
+                    data = line.strip()
+                    if not data.startswith(b"data:") or data[5:].strip() in (b"", b"[DONE]"):
+                        continue
+                    event = json.loads(data[5:])
+                    usage = event.get("usage") or usage
+                    for choice in event.get("choices") or []:
+                        piece = reply_text(choice.get("delta") or {})
+                        if piece:
+                            last = time.perf_counter() - epoch
+                            first = last if first is None else first
+                            pieces.append(piece)
+        except urllib.error.HTTPError as error:
+            status, lines = error.code, [error.read()]
+        except Hung:
+            raise
+        except (OSError, ValueError) as error:
+            # The connection failed or a frame did not parse: the request failed, the level goes on.
+            finished = time.perf_counter() - epoch
+            return {"prompt_tokens": len(prompt), "started": started, "first": first, "last": last,
+                    "finished": finished, "completion_tokens": None, "finish_reason": None, "cached_tokens": 0,
+                    "errors": [f"Transport failed: {type(error).__name__}: {error}"[:500]],
+                    "tokens": token_ids(self.text, "".join(pieces))}
+        finished = time.perf_counter() - epoch
+        outcome = validate_completion(status, lines)
+        errors = list(outcome.errors)
+        if cached_tokens(usage):
+            errors.append(f"{self.server.url} served {cached_tokens(usage)} prompt tokens from its cache")
+        return {"prompt_tokens": len(prompt), "started": started, "first": first, "last": last, "finished": finished,
+                "completion_tokens": outcome.completion_tokens, "finish_reason": outcome.finish_reason,
+                "cached_tokens": cached_tokens(usage), "errors": errors,
+                "tokens": token_ids(self.text, "".join(pieces))}
 
     def close(self):
         pass

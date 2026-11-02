@@ -4,8 +4,8 @@ The eight files beside this notice are unmodified copies of the test fixtures of
 encoder (`encoding_dsv4.py`, with `test_encoding_dsv4.py` and `tests/`, which DeepSeek publishes with the DeepSeek V4
 checkpoints in place of a chat template). `test_output_N.txt` is what `encode_messages` renders for
 `test_input_N.json`: cases 1 to 3 in thinking mode (case 1 with the input's `tools` on its first message), case 4 in
-chat mode. `tests/test_core_shipped_templates.py` checks that crit's port,
-`core/python/crit_core/text/templates/deepseek-v4.jinja`, renders them exactly.
+chat mode. `tests/test_eval_deepseek4_template.py` checks that crit's port,
+`crit_eval/architectures/templates/deepseek-v4.jinja`, renders them exactly.
 
 | File | sha256 |
 | --- | --- |

@@ -156,17 +156,30 @@ def gpus():
     return result
 
 
-def device_memory(index=None):
+def device_memory(index=None, indices=None):
     """Free, used and total memory of the GPU the engine runs on, in bytes, as nvidia-smi sees the whole device (other
     processes' use included): `index`, else the one CUDA_VISIBLE_DEVICES names first when it names one by number, else
-    GPU 0. None where nvidia-smi is missing or fails."""
+    GPU 0. With `indices` (an engine on several GPUs), their sums, and each one's under "devices". None where
+    nvidia-smi is missing or fails."""
     binary = _nvidia_smi()
     rows = _query(binary, ["index", "memory.free", "memory.used", "memory.total"]) if binary else None
     if rows is None:
         return None
+    if indices:
+        found = [device_memory_row(rows, i) for i in indices]
+        if any(row is None for row in found):
+            return None
+        sums = {key: (None if any(row[key] is None for row in found) else sum(row[key] for row in found))
+                for key in ("free_bytes", "used_bytes", "total_bytes")}
+        return {"indices": list(indices), **sums, "devices": found}
     if index is None:
         first = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")[0].strip()
         index = int(first) if first.isdigit() else 0
+    return device_memory_row(rows, index)
+
+
+def device_memory_row(rows, index):
+    """nvidia-smi's row of GPU `index` as {"index", "free_bytes", "used_bytes", "total_bytes"}, or None."""
     for row in rows:
         if _int(row[0]) == index:
             free, used, total = (_int(v) for v in row[1:])

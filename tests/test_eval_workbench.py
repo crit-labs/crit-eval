@@ -43,6 +43,31 @@ class WorkbenchTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, "holds no compiled kernel"):
             workbench.profile(self.folder)
 
+    def test_a_kernel_declared_not_repeatable_is_judged_within_tolerance(self):
+        import importlib.util
+        import torch
+        spec = importlib.util.spec_from_file_location("crit_wb_harness", workbench.HARNESS)
+        harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(harness)
+        noise = torch.Generator().manual_seed(0)
+
+        class Kernel:   # an atomics-style kernel: every call rounds a little differently
+            def inputs(self, shape, columns, seed):
+                return {"x": torch.ones(columns, shape[0], dtype=torch.float64)}
+
+            def reference(self, data):
+                return data["x"].sum(dim=1)
+
+            def candidate(self, data):
+                return (data["x"].sum(dim=1) * (1 + 1e-6 * torch.rand(1, generator=noise, dtype=torch.float64))).float()
+
+        base = {"name": "k", "columns": [1], "tolerance": 1e-3}
+        self.assertFalse(harness.check(Kernel(), base, [(0, [8])])["passed"])
+        found = harness.check(Kernel(), {**base, "repeatable": False}, [(0, [8])])
+        self.assertTrue(found["passed"])
+        self.assertFalse(found["rows"][0]["repeatable"])
+        self.assertLess(found["rows"][0]["repeat_relative_error"], 1e-3)
+
     def test_the_harness_ships_with_the_package(self):
         text = workbench.HARNESS.read_text(encoding="utf-8")
         for part in ("def check(", "def bench(", "copies_for", "repeatable", "column_invariant"):

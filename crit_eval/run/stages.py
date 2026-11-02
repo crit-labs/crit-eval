@@ -86,7 +86,8 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
     stage adds over the one before it, and under "certify" the request at the requirement. settings: the staged
     context settings (staged_settings). sampled, exactness, heldout and lower: whether those parts can run on this
     engine (an engine without sampling has no sampled suite, a served one no lower context, a run without a
-    baseline no held-out prompts)."""
+    baseline no held-out prompts). The lower context's requests are a certified run's (under "certify"), after
+    stage 3."""
     rule = protocol["stages"]
     held = held_cases(prepared, info)
     each = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in held]
@@ -102,7 +103,7 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
     repeated = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in short_cases(prepared, info, rule)]
     out[2]["speed"] = repeated * int(rule["repetitions"])
     turns, n = prepared.get("followup") or [], int(protocol["followup"]["output_tokens"])
-    if turns and len(turns[-1]["prompt_ids"]) + n <= info["max_context"]:
+    if turns and len(turns[-1]["prompt_ids"]) + n <= info["max_context"] and info.get("prompt_cache") is not False:
         out[2]["followup"] = [(len(t["prompt_ids"]), n, 0, False) for t in turns]
         out[3]["followup_again"] = list(out[2]["followup"])
     out[2]["quality"] = quality(quality_sets(prepared, short, above=True))
@@ -128,8 +129,8 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
         out[3]["heldout"] = [(len(p["prompt_ids"]), p["output_tokens"], 0, False) for p in prepared.get("heldout") or []
                              if len(p["prompt_ids"]) + p["output_tokens"] <= info["max_context"]
                              for _ in range(int(protocol["heldout"]["repetitions"]))]
-    if lower:
-        out[3]["lower_context"] = list(each)
+    if lower and certify:
+        out["certify"]["lower_context"] = list(each)
     return {stage: {part: rows for part, rows in parts.items() if rows} for stage, parts in out.items()}
 
 
@@ -156,8 +157,9 @@ def observations(engine, result, protocol):
 
 def choose(planned, found, elapsed, budget, tokens_per_round=None, load_seconds=0.0, reserved=0.0):
     """(stage, {stage: expected seconds it adds}) the highest stage whose added requests fit the budget after
-    `elapsed` seconds, `reserved` seconds kept for what every run ends with (the request history again); stage 3's
-    lower context opens an engine of its own, load_seconds more. Stage 1 when no rate is known."""
+    `elapsed` seconds, `reserved` seconds kept for what every run ends with (the request history again); a lower
+    context planned in stage 3 opens an engine of its own, load_seconds more (only a certified run,
+    which has no budget, plans one). Stage 1 when no rate is known."""
     if found is None:
         return 1, {}
     costs = {}

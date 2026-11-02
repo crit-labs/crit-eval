@@ -1,7 +1,7 @@
 """Speed and quality metrics. Pure Python so results can be computed on any host.
 
 Quality has two forms: `text_quality` compares an engine's scores of a fixed text with the reference's, position
-by position (top-k on both sides plus a lumped tail, a lower bound on KL), and `log_softmax`, `kl_divergence`,
+by position (a lower bound on KL from the top-k on both sides), and `log_softmax`, `kl_divergence`,
 `Summary` and `compare` compare full logit rows when an engine can supply them (FP64; probe/logprob_compare.cu is
 the device reference).
 """
@@ -79,26 +79,42 @@ def speed_sample(prompt_tokens, n, started, first, last, rounds):
 
 
 def partial_kl(reference_ids, reference_logprobs, engine):
-    """KL(reference || engine) over the tokens in both top-k lists plus one lumped bucket for the rest.
+    """A lower bound on KL(reference || engine) from both sides' top-k lists.
 
     reference_ids and reference_logprobs: the reference's top-k; engine: {token id: log-probability} of the
-    engine's top-k. Each token in both is its own bucket and everything else one more, holding each
-    distribution's remaining mass. By the log-sum inequality this is a lower bound on the full-vocabulary KL,
-    and it is exact when the rest is negligible.
+    engine's top-k. Each token in both lists is its own bucket, so is each reference token the engine's list leaves
+    out, and everything else is one more bucket holding each distribution's remaining mass. By the log-sum inequality
+    the KL over those buckets is at most the full-vocabulary KL. A token the engine's full list leaves out has at most
+    the probability of its last entry, so its engine probability is unknown only within [0, that value]: the bound is
+    the bucket KL at its smallest over those unknowns. Without that cap (an engine list shorter than the reference's)
+    the left-out tokens join the rest, which reads 0 when the two lists share no token, however far apart they are.
+    The bound is exact when the rest is negligible.
     """
-    kl = 0.0
-    p_sum = q_sum = 0.0
+    kl = p_sum = q_sum = 0.0
+    missing = []   # reference probabilities of the tokens the engine's list leaves out
     for token, lp in zip(reference_ids, reference_logprobs):
+        p_sum += math.exp(lp)
         lq = engine.get(token)
         if lq is None:
+            missing.append(math.exp(lp))
             continue
-        p = math.exp(lp)
-        p_sum += p
         q_sum += math.exp(lq)
-        kl += p * (lp - lq)
-    p_tail, q_tail = max(0.0, 1.0 - p_sum), max(0.0, 1.0 - q_sum)
-    if p_tail > 1e-12:
-        kl += p_tail * (math.log(p_tail) - math.log(max(q_tail, 1e-30)))
+        kl += math.exp(lp) * (lp - lq)
+    p_rest = max(0.0, 1.0 - p_sum)
+    q_left = max(0.0, 1.0 - q_sum)   # the engine's mass outside the shared tokens
+    cap = math.exp(min(engine.values())) if engine and len(engine) >= len(reference_ids) else math.inf
+    # The minimum over each left-out token's engine probability q_v in [0, cap] (convex): the largest are held at cap,
+    # the others take q_v = lam * p_v and the rest lam * p_rest, lam spreading the engine's mass left over.
+    missing.sort(reverse=True)
+    for held in range(len(missing) + 1):
+        free = sum(missing[held:]) + p_rest
+        left = q_left - held * cap if held else q_left
+        lam = max(left, 1e-30) / free if free > 0 else math.inf
+        if all(lam * p >= cap for p in missing[:held]) and (held == len(missing) or lam * missing[held] <= cap):
+            break
+    kl += sum(p * (math.log(p) - math.log(cap)) for p in missing[:held] if p > 0)
+    if free > 1e-12:
+        kl -= free * math.log(lam)
     return max(0.0, kl)
 
 
@@ -183,8 +199,8 @@ def text_quality(reference_rows, engine_rows):
 
     reference_rows: per position {"logprob": the reference's log-probability of the text's token, "top_ids",
     "top_logprobs"}; engine_rows: per position {"logprob", "top": [[id, logprob], ...]}. Neither chose the token,
-    so top-1 agreement is the share of positions where both rank the same token first. KL is partial_kl's: the
-    top-k on both sides plus a lumped tail.
+    so top-1 agreement is the share of positions where both rank the same token first. KL is partial_kl's lower bound
+    from the top-k on both sides.
     """
     if len(reference_rows) != len(engine_rows) or not engine_rows:
         raise ValueError(f"the reference scored {len(reference_rows)} positions, the engine {len(engine_rows)}")

@@ -41,13 +41,20 @@ class HostLoad:
 
     def start(self):
         self.wall, self.host, self.own = time.perf_counter(), _host_busy_seconds(), _own_seconds()
+        self.replays = _replays()
         return self
 
     def cores(self):
         host = _host_busy_seconds()
-        if host is None or self.host is None:
-            return None
+        if host is None or self.host is None or _replays() != self.replays:
+            return None   # requests a resumed round's journal answered: the host's load then is not theirs
         wall = time.perf_counter() - self.wall
         if wall <= 0:
             return None
         return max(0.0, (host - self.host) - (_own_seconds() - self.own)) / wall
+
+
+def _replays():
+    from .journal import active
+    written = active()
+    return written.replays if written is not None else 0

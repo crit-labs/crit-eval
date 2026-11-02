@@ -16,9 +16,12 @@ import unittest
 from unittest.mock import Mock, mock_open, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+# The protocol this checkout measures with: fixtures of current results carry it.
+CURRENT_PROTOCOL = json.loads((ROOT / "crit_eval/protocol.json").read_text(encoding="utf-8"))["protocol"]
 sys.path.insert(0, str(ROOT))
 from crit_core.model import inspect_safetensors  # noqa: E402
-from crit_eval.run import ab, adapters, host, hostload, long_context, pin, quality_checks, runner, speed, timing
+from crit_eval.run import (ab, adapters, host, hostload, long_context, pin, quality_checks, runner, speed, timing,
+                           tool_calls)
 from crit_eval.limits import ceiling, context, headroom, probe
 from crit_eval.reports import metrics, compare as report
 from crit_eval.quality import prepare
@@ -48,7 +51,7 @@ FACTS = 2000  # retrieval fact ids in the fixture start here; the mock's facts_f
 
 def fixture(directory):
     prepared = {
-        "protocol": "crit-eval-v0.4.0", "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
+        "protocol": CURRENT_PROTOCOL, "suite_sha256": SUITE, "model": {"sha256": "model"}, "stop_ids": [999],
         "sampling": {"temperature": 1.0, "top_p": 0.95, "top_k": 8}, "sampling_source": "generation_config",
         "valid_vocab": 1000,
         "speed": [{"id": "short", "kind": "prose", "prompt_ids": [1, 2, 3], "output_tokens": 12},
@@ -75,9 +78,33 @@ class MetricTests(unittest.TestCase):
         both = metrics.partial_kl([0, 1, 2], p[:3], dict(enumerate(q[:3])))
         self.assertGreater(both, 0.0)
         self.assertLessEqual(both, full + 1e-12)
-        # A reference token outside the engine's top-k goes into the lumped rest: still a lower bound, and lower.
-        missing = metrics.partial_kl([0, 1, 2], p[:3], {0: q[0], 2: q[2], 4: q[4]})
-        self.assertLessEqual(missing, both + 1e-12)
+        # The engine's top 3 leaves out the reference's second token: still a lower bound.
+        r = softmax_logprobs([1.5, -1.0, 0.1, -0.5, 0.5])
+        missing = metrics.partial_kl([0, 1, 2], p[:3], {0: r[0], 4: r[4], 2: r[2]})
+        self.assertGreater(missing, 0.0)
+        self.assertLessEqual(missing, sum(math.exp(a) * (a - b) for a, b in zip(p, r)) + 1e-12)
+
+    def test_partial_kl_does_not_collapse_when_the_lists_share_no_token(self):
+        # Lumping every left-out token into one rest bucket read 0 here; each left-out token is held to at most the
+        # engine's last listed probability instead.
+        p = softmax_logprobs([6.0, 2.0, 1.0] + [-4.0] * 7)
+        q = softmax_logprobs([-4.0] * 7 + [6.0, 2.0, 1.0])
+        full = sum(math.exp(a) * (a - b) for a, b in zip(p, q))
+        bound = metrics.partial_kl([0, 1, 2], p[:3], {7: q[7], 8: q[8], 9: q[9]})
+        self.assertGreater(bound, 0.4 * full)   # 4.9 of 9.9 nats
+        self.assertLessEqual(bound, full + 1e-12)
+        # An engine list shorter than the reference's caps nothing: the left-out tokens join the rest as before.
+        self.assertAlmostEqual(metrics.partial_kl([0, 1, 2], p[:3], {7: q[7], 8: q[8]}), 0.0, places=12)
+
+    def test_partial_kl_stays_a_lower_bound_of_full_kl(self):
+        import random
+        rng = random.Random(3)
+        for _ in range(500):
+            p = softmax_logprobs([rng.gauss(0, 3) for _ in range(12)])
+            q = softmax_logprobs([a + rng.gauss(0, rng.choice((0.1, 1.0, 5.0))) for a in p])
+            top = lambda row: sorted(range(len(row)), key=lambda i: -row[i])[:4]
+            bound = metrics.partial_kl(top(p), [p[i] for i in top(p)], {i: q[i] for i in top(q)})
+            self.assertLessEqual(bound, sum(math.exp(a) * (a - b) for a, b in zip(p, q)) + 1e-9)
 
     def test_text_quality_by_position_buckets_shows_drift_where_it_starts(self):
         # Neither side chose the fixed text: top-1 agreement compares the two first-ranked tokens. Drift that starts
@@ -419,8 +446,8 @@ class PrepareTests(unittest.TestCase):
                     self.assertTrue((ROOT / "crit_eval/suite" / message["content_file"]).is_file())
 
 
-# Every protocol id with the protocol and suite it names. Append only: a change to crit_eval/protocol.json or crit_eval/suite
-# gets a new id, the next series if it can move a score and the next patch otherwise (docs/README.md).
+# Every released protocol id with the protocol and suite it names. Append only, at a release: versions come with
+# crit-eval's releases, and between releases a change stays under the coming release's id (docs/README.md).
 PROTOCOLS = {
     "crit-eval-v4": "345143e9b1a3c33f08efd20512d66afe438b2e30a07b6c4e67cf7ad3a58bc461",
     "crit-eval-v4.1": "90b938a9641178a19c14e3b505491757c844a442bcbcb86ccad1d7415a5cc0af",  # served engines
@@ -455,6 +482,9 @@ class ModelDescriptionTests(unittest.TestCase):
                     (Path(directory) / "hub/models--acme--Tiny-7B-NVFP4/snapshots" / revision, "Tiny-7B-NVFP4",
                      "acme/Tiny-7B-NVFP4", revision),
                     (Path(directory) / "Tiny-7B-NVFP4" / revision, "Tiny-7B-NVFP4", None, revision),
+                    # crit pull's engine store
+                    (Path(directory) / "engines/models" / f"acme--Tiny-7B-NVFP4@{revision}", "Tiny-7B-NVFP4",
+                     "acme/Tiny-7B-NVFP4", revision),
                     (Path(directory) / "tiny", "tiny", None, None)):
                 folder.mkdir(parents=True)
                 (folder / "config.json").write_text(json.dumps({
@@ -473,11 +503,11 @@ class ProtocolVersionTests(unittest.TestCase):
     def test_the_protocol_id_names_one_protocol_and_suite(self):
         current = json.loads((ROOT / "crit_eval/protocol.json").read_text(encoding="utf-8"))["protocol"]
         fingerprint = protocol_fingerprint()
-        self.assertEqual(PROTOCOLS.get(current), fingerprint,
-                         f"crit_eval/protocol.json or crit_eval/suite changed under {current}: give the protocol a new id "
-                         f"(the next series if a score can move, else the next patch) and add it to PROTOCOLS "
-                         f"with {fingerprint}")
-        self.assertEqual(max(PROTOCOLS, key=protocol_version), current)  # versions only go up
+        if current in PROTOCOLS:   # a released protocol never changes
+            self.assertEqual(PROTOCOLS[current], fingerprint,
+                             f"crit_eval/protocol.json or crit_eval/suite changed under the released {current}")
+        else:   # the coming release's id, above every released one; the release names it and pins it here
+            self.assertGreater(protocol_version(current), protocol_version(max(PROTOCOLS, key=protocol_version)))
 
     def test_the_suite_has_one_identity_on_every_platform(self):
         class WindowsOrder(type(Path())):  # sorts as a Windows path does, without case
@@ -660,6 +690,50 @@ class CeilingTests(unittest.TestCase):
         self.assertIsNone(older["mma_tflops"])
         self.assertEqual(ceiling.best_rates(older), ({"bf16": 185.0}, {"bf16": "cuBLASLt GEMM"}))
         self.assertEqual(ceiling.best_rates(None), ({}, {}))
+
+    def test_formats_without_matrix_units_are_priced_at_the_bf16_rate(self):
+        # An RTX 3090 (8.6) has no FP8 or FP4 MMA, an RTX 4090 (8.9) no FP4; cuBLASLt GEMM rates alone.
+        ampere = probe.combine([{"device": "gpu", "compute_capability": "8.6", "cuda_runtime": 13010,
+                                 "bandwidth_gbs": 1, "tflops": {"bf16": 71.0}}])
+        self.assertEqual((ampere["backend"], ampere["arch"], ampere["runtime_version"]), ("cuda", "sm_86", 13010))
+        self.assertEqual(ampere["unsupported_formats"], ["fp8", "nvfp4", "fp4_fp8"])
+        rates, sources = ceiling.best_rates(ampere)
+        self.assertEqual(rates, {"bf16": 71.0, "fp8": 71.0, "nvfp4": 71.0, "fp4_fp8": 71.0})
+        self.assertEqual(sources["nvfp4"], ceiling.WIDENED)
+        ada = {"compute_capability": "8.9", "tflops": {"bf16": 165.0, "fp8": 330.0}}
+        self.assertEqual(ceiling.best_rates(ada)[0], {"bf16": 165.0, "fp8": 330.0, "nvfp4": 165.0, "fp4_fp8": 165.0})
+        self.assertEqual(probe.identity({"compute_capability": "12.0"})[1], "sm_120a")
+        # A probe without a compute capability (or an older file missing a rate) leaves the format unpriced.
+        self.assertEqual(ceiling.best_rates({"tflops": {"bf16": 185.0}})[0], {"bf16": 185.0})
+        # A HIP probe names its own identity and unsupported formats; its GEMM rates are hipBLASLt's.
+        mi300 = probe.combine([{"backend": "hip", "device": "AMD Instinct MI300X", "arch": "gfx942",
+                                "runtime_version": 60443483, "fp8_encoding": "e4m3fnuz",
+                                "unsupported_formats": ["nvfp4", "fp4_fp8"], "bandwidth_gbs": 4000.0,
+                                "tflops": {"bf16": 650.0, "fp8": 1300.0}, "mma_tflops": {}}])
+        self.assertEqual((mi300["backend"], mi300["arch"], mi300["fp8_encoding"]), ("hip", "gfx942", "e4m3fnuz"))
+        self.assertNotIn("compute_capability", mi300)
+        rates, sources = ceiling.best_rates(mi300)
+        self.assertEqual(rates, {"bf16": 650.0, "fp8": 1300.0, "nvfp4": 650.0, "fp4_fp8": 650.0})
+        self.assertEqual((sources["fp8"], sources["nvfp4"]), ("hipBLASLt GEMM", ceiling.WIDENED))
+        floor, missing = ceiling.prefill_floor_ms({"matmul_flops_per_token": {"nvfp4": 1e9}, "attention_flops_per_pair": 0},
+                                                  rates, 1000)
+        self.assertEqual(missing, [])
+        self.assertAlmostEqual(floor["matmul_ms"], 1000 * 1e9 / 650e12 * 1000)
+
+    def test_the_probe_picks_its_backend_and_hip_files_are_judged_by_the_hip_source(self):
+        with patch.object(probe.shutil, "which", side_effect=lambda name: "/opt/rocm/bin/hipcc" if name == "hipcc" else None):
+            self.assertEqual(probe.choose_backend(), "hip")
+            self.assertEqual(probe.choose_backend("cuda"), "cuda")
+            self.assertEqual(probe.choose_backend(nvcc="/usr/local/cuda/bin/nvcc"), "cuda")
+        with patch.object(probe.shutil, "which", return_value=None):
+            self.assertEqual(probe.choose_backend(), "cuda")   # nothing found: nvcc's error names what to install
+        with self.assertRaises(SystemExit):
+            probe.choose_backend("metal")
+        hip = {key: {"x": 1.0} for key in probe.MEASURED if key != "mma_tflops"} | {
+            "backend": "hip", "probe_sha256": hashlib.sha256(probe.SOURCES["hip"].read_bytes()).hexdigest()}
+        self.assertEqual(probe.outdated(hip), [])   # no raw matrix rates is not outdated on HIP
+        self.assertIn("measured by another probe source",
+                      probe.outdated(hip | {"probe_sha256": hashlib.sha256(probe.SOURCE.read_bytes()).hexdigest()}))
 
     def test_the_probe_builds_for_the_devices_own_architecture(self):
         answers = {"12.0\n": ["-gencode", "arch=compute_120a,code=sm_120a"],
@@ -850,7 +924,7 @@ class ActivationCeilingTests(unittest.TestCase):
         scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
         quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
             "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
-        return {"protocol": "crit-eval-v0.4.0", "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
+        return {"protocol": CURRENT_PROTOCOL, "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
                 "engine": {"prompt_activations": declared}, "quality": quality,
                 "headroom": {"gaps": [], "missing": []}}
 
@@ -993,8 +1067,8 @@ class ActivationCeilingTests(unittest.TestCase):
         prefill = found["as_quantized"]["kpis"]["prefill"]
         self.assertEqual(prefill["ceiling_activations"], "stored")
         self.assertAlmostEqual(prefill["ceiling"], floor(400e12, 800e12))
-        self.assertIn("quality mode as_quantized: quality judged against the checkpoint's exact activations with each "
-                      "set's budget widened by its own activation quantization's drift",
+        self.assertIn("quality mode as_quantized: quality judged against the checkpoint's exact activations with the "
+                      "mode's own budget",
                       status.render(found["as_quantized"]))
 
 
@@ -1110,6 +1184,8 @@ class HeldoutTests(unittest.TestCase):
         self.assertGreaterEqual(len({p["language"] for p in held["prompts"]}), 8)
         self.assertFalse(texts & {p["content"] for p in held["prompts"]})
         self.assertIn("heldout", protocol)
+        # 64 tokens once: their acceptance gives the score the gate judges.
+        self.assertEqual((protocol["heldout"]["output_tokens"], protocol["heldout"]["repetitions"]), (64, 1))
 
     def test_mock_engine_decodes_the_held_out_prompts(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1150,7 +1226,8 @@ class HeldoutTests(unittest.TestCase):
 
 
 class RepetitionTests(unittest.TestCase):
-    """protocol speed.extra_repetition: two measured repetitions, a third only when they disagree."""
+    """protocol speed.extra_repetition: one measured repetition, a second when it disagrees with its warmup and a
+    third when those two disagree; with more repetitions asked for, one more only when they disagree."""
 
     def sample(self, decode, ttft):
         return {"decode_tps": decode, "ttft_ms": ttft, "warmup": False}
@@ -1164,23 +1241,274 @@ class RepetitionTests(unittest.TestCase):
         # A warmup is no measured repetition.
         self.assertFalse(timing.disagree(agree + [{"decode_tps": 10.0, "ttft_ms": 900.0, "warmup": True}],
                                          [[1], [1]], 0.05))
+        # A single repetition is compared with the warmup before it.
+        warm = {"decode_tps": 120.0, "ttft_ms": 50.0, "warmup": True}
+        self.assertTrue(timing.disagree([warm, self.sample(100.0, 50.0)], [[1], [1]], 0.05))
+        self.assertFalse(timing.disagree([{**warm, "decode_tps": 101.0}, self.sample(100.0, 50.0)], [[1], [1]], 0.05))
+        self.assertFalse(timing.disagree([self.sample(100.0, 50.0)], [[1]], 0.05))   # nothing to compare with
 
-    def test_a_third_repetition_runs_only_after_two_that_disagree(self):
+    def run_case(self, speeds, repetitions, outputs=None, warmups=1, warmed=None, disturbed_spread=None, reply=256):
+        """One speed case served at `speeds` (decode tok/s per request), each reply `reply` tokens long as the server
+        counted them; returns (requests made, the measured case)."""
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
-        for speeds, runs in (([100.0, 101.0, 0.0], 3), ([100.0, 120.0, 110.0], 4)):
-            with self.subTest(speeds=speeds):
-                queue = [self.sample(100.0, 50.0)] + [self.sample(s, 50.0) for s in speeds]
-                calls = []
+        queue = [self.sample(s, 50.0) for s in speeds]
+        tokens = list(outputs or [[7] * 4] * len(speeds))
+        calls = []
 
-                def timed(engine, prompt, n):
-                    calls.append(n)
-                    return [7] * n, dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
-                                         round_ms=None)
-                with patch.object(speed, "timed_generate", timed):
-                    measured = speed.run_speed(None, {"max_context": 64}, prepared, protocol, 1, 2, lambda m: None)
-                self.assertEqual(len(calls), runs)   # the warmup, two repetitions and a third only on disagreement
-                self.assertEqual(len([s for s in measured["cases"]["a"]["samples"] if not s["warmup"]]), runs - 1)
+        def timed(engine, prompt, n):
+            calls.append(n)
+            return tokens.pop(0), dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
+                                       round_ms=None, output_tokens=reply)
+        with patch.object(speed, "timed_generate", timed):
+            measured = speed.run_speed(None, {"max_context": 64}, prepared, protocol, warmups, repetitions,
+                                       lambda m: None, disturbed_spread=disturbed_spread, warmed=warmed)
+        return len(calls), measured["cases"]["a"]
+
+    def test_one_repetition_by_default_and_more_only_on_disagreement(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        self.assertEqual((protocol["speed"]["warmup_runs"], protocol["speed"]["repetitions"]), (1, 1))
+        # warmup and repetition agree: one repetition; they disagree: a second; those two disagree: a third. (Apart by
+        # more than speed.steady_state's tolerance, the repetition would be one more warmup instead.)
+        for speeds, runs in (([100.0, 101.0, 0.0, 0.0], 2), ([108.0, 100.0, 101.0, 0.0], 3),
+                             ([108.0, 100.0, 107.0, 104.0], 4)):
+            with self.subTest(speeds=speeds):
+                calls, case = self.run_case(speeds, 1)
+                self.assertEqual(calls, runs)
+                self.assertEqual(len([s for s in case["samples"] if not s["warmup"]]), runs - 1)
+        # Two repetitions asked for (--repetitions 2): a third only when they disagree, as before.
+        for speeds, runs in (([100.0, 100.0, 101.0, 0.0], 3), ([100.0, 100.0, 120.0, 110.0], 4)):
+            with self.subTest(speeds=speeds):
+                self.assertEqual(self.run_case(speeds, 2)[0], runs)
+
+    def test_a_drifting_case_warms_up_until_two_requests_agree(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        self.assertEqual(protocol["speed"]["steady_state"]["tolerance"], 0.1)
+        self.assertEqual(protocol["speed"]["steady_state"]["max_warmup_runs"], 4)
+        self.assertEqual(protocol["speed"]["steady_state"]["max_warmup_tokens"], 1024)
+        self.assertEqual(protocol["speed"]["steady_state"]["max_warmup_requests"], 16)
+        # An engine that speeds up as it adapts to the case: 60, 80 and 96 tok/s are warmups, each apart from the one
+        # before by more than 10%; 100 agrees with 96 and is the measured repetition, within 5% of it, so no more run.
+        calls, case = self.run_case([60.0, 80.0, 96.0, 100.0, 0.0], 1, disturbed_spread=0.25)
+        self.assertEqual(calls, 4)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, True, True, False])
+        self.assertEqual(case["decode_tps"], 100.0)
+        self.assertEqual(case["steady_state"], {"warmup_runs": 3, "added": 2, "steady": True, "drift": 0.6667,
+                                                "measure": "decode_tps"})
+        # A steady engine: no warmup added and the drift is its first repetition's over the warmup.
+        calls, case = self.run_case([100.0, 101.0], 1)
+        self.assertEqual((calls, case["steady_state"]["added"], case["steady_state"]["steady"]), (2, 0, True))
+        self.assertAlmostEqual(case["steady_state"]["drift"], 0.01)
+
+    def test_a_case_still_drifting_after_the_bound_is_judged_as_before(self):
+        # Four warmups at most: 130 tok/s is measured although it disagrees with 110, and the repetitions after it
+        # spread past the disturbed limit.
+        with self.assertRaises(timing.Disturbed):
+            self.run_case([50.0, 70.0, 90.0, 110.0, 130.0, 150.0, 170.0], 1, disturbed_spread=0.25)
+        calls, case = self.run_case([50.0, 70.0, 90.0, 110.0, 130.0, 150.0, 170.0], 1)
+        self.assertEqual(calls, 7)
+        self.assertEqual(case["steady_state"]["warmup_runs"], 4)
+        self.assertEqual(case["steady_state"]["added"], 3)
+        self.assertFalse(case["steady_state"]["steady"])
+        # A case's first request has nothing before it, and a request after a measured one is a repetition.
+        calls, case = self.run_case([50.0, 100.0, 101.0], 2, warmups=0)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [False, False, False])
+        self.assertIsNone(case["steady_state"]["steady"])
+
+    def test_a_short_reply_warms_up_by_the_tokens_it_decodes(self):
+        # A 44-token reply from an engine adapting per decode window, still speeding up after four warmups. Four warmups of 44 tokens decode 176 of the 1,024, so it warms on until two requests agree:
+        # 103 agrees with 100 and is measured.
+        speeds = [30.0, 40.0, 55.0, 77.0, 100.0, 103.0]
+        calls, case = self.run_case(speeds, 1, reply=44)
+        self.assertEqual(calls, 6)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True] * 5 + [False])
+        self.assertEqual((case["steady_state"]["added"], case["steady_state"]["steady"]), (4, True))
+        self.assertEqual(case["decode_tps"], 103.0)
+        # At 256 tokens a reply four warmups decode the 1,024: the fifth request is measured, as before 0.7.4.
+        calls, case = self.run_case(speeds + [0.0, 0.0], 1, reply=256)
+        self.assertEqual([s["warmup"] for s in case["samples"]][:5], [True] * 4 + [False])
+        self.assertFalse(case["steady_state"]["steady"])
+        # A reply that never settles stops warming after 16 requests and is judged as before.
+        calls, case = self.run_case([10.0 * 1.2 ** i for i in range(19)], 1, reply=4)
+        self.assertEqual(case["steady_state"]["warmup_runs"], 16)
+        self.assertFalse(case["steady_state"]["steady"])
+
+    def test_each_suite_records_its_fresh_decode(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        self.assertIn("fresh_decode", protocol["speed"])
+        calls, case = self.run_case([60.0, 80.0, 96.0, 100.0, 0.0], 1)
+        cases = {"a": case, "b": {**case, "decode_tps": 25.0, "samples": [dict(case["samples"][0], decode_tps=40.0)]}}
+        summary = speed.speed_summary(cases, protocol, 1, 1, "own")
+        self.assertAlmostEqual(summary["fresh_decode_score"], (60.0 * 40.0) ** 0.5)
+        self.assertAlmostEqual(summary["decode_score"], (100.0 * 25.0) ** 0.5)
+        cases["b"]["samples"] = [{"decode_tps": None, "warmup": False}]
+        self.assertIsNone(speed.speed_summary(cases, protocol, 1, 1, "own")["fresh_decode_score"])
+
+    def test_a_decode_above_its_ceiling_names_the_assumptions_the_engine_did_not_report(self):
+        from crit_eval.reports import status as report_status
+        decode = {"ceiling": 50.9, "fraction_of_ceiling": 1.88, "ceiling_basis": "one token per pass",
+                  "host_pass": {"hit_rate": 0.29, "hit_rate_source": "even routing"}}
+        found = report_status._above_ceiling(decode)
+        self.assertIn("even routing's 29% hit rate", found)
+        self.assertIn("one token per model pass", found)
+        self.assertIsNone(report_status._above_ceiling({**decode, "fraction_of_ceiling": 0.9}))
+        self.assertIsNone(report_status._above_ceiling({**decode, "ceiling_basis": None,
+                                                         "host_pass": {"hit_rate": 0.8, "hit_rate_source": "engine"}}))
+
+    def test_repetitions_of_different_replies_are_not_a_disturbance(self):
+        # A greedy reply that alternates between two texts, one of them slow (72-75 against 113-126 tok/s). Repetitions of the same reply agree, so the round goes on; the case records how its replies spread.
+        one, two = [1] * 4, [2] * 4
+        calls, case = self.run_case([113.0, 72.0, 126.0, 75.0], 3, outputs=[one, two, one, two], warmups=0,
+                                    disturbed_spread=0.25)
+        self.assertEqual(calls, 4)   # the outputs disagree: the extra repetition runs
+        self.assertFalse(case["repeatable"])
+        self.assertEqual(case["output_varies"]["replies"], 2)
+        self.assertAlmostEqual(case["output_varies"]["spread"], (126.0 - 72.0) / 94.0)
+        # The same reply varying past the limit is still a disturbed device.
+        with self.assertRaises(timing.Disturbed):
+            self.run_case([113.0, 72.0, 126.0, 75.0], 3, outputs=[one, one, two, two], warmups=0, disturbed_spread=0.25)
+        # Every reply different: nothing to compare, not disturbed.
+        calls, case = self.run_case([113.0, 72.0, 126.0, 75.0], 3, outputs=[[i] * 4 for i in range(4)], warmups=0,
+                                    disturbed_spread=0.25)
+        self.assertEqual(case["output_varies"]["replies"], 4)
+        # One reply throughout: no output_varies.
+        self.assertIsNone(self.run_case([100.0, 101.0], 1)[1]["output_varies"])
+
+    def test_the_warmups_output_counts_for_the_repeatable_gate(self):
+        calls, case = self.run_case([100.0, 100.0, 100.0, 100.0], 1, outputs=[[1] * 4, [2] * 4, [2] * 4, [2] * 4])
+        self.assertEqual(calls, 4)   # a different output disagrees with every repetition: all three run
+        self.assertFalse(case["repeatable"])
+        self.assertEqual(case["tokens"], [2] * 4)   # the case's output is its first measured repetition's
+
+    def test_an_earlier_request_stands_as_the_warmup(self):
+        # A staged run's stage 2: stage 1's request is the warmup its one repetition is compared with.
+        earlier = {"a": {"samples": [{**self.sample(100.0, 50.0), "request_ms": 200.0}], "tokens": [7] * 4}}
+        calls, case = self.run_case([101.0, 0.0, 0.0], 1, warmups=0, warmed=earlier)
+        self.assertEqual(calls, 1)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, False])
+        calls, case = self.run_case([130.0, 129.0, 0.0], 1, warmups=0, warmed=earlier)
+        self.assertEqual(calls, 2)
+
+    def test_noise_comes_from_the_cases_measured_more_than_once(self):
+        def case(*speeds):
+            return {"status": "measured", "samples": [{"decode_tps": s, "ttft_ms": 10.0, "output_tokens": 4,
+                                                       "request_ms": 100.0, "warmup": False} for s in speeds]}
+        once = headroom.noise({"cases": {"a": case(100.0), "b": case(50.0)}})
+        self.assertEqual((once["decode"], once["repeated_cases"], once["cases"]), (None, 0, 2))
+        some = headroom.noise({"cases": {"a": case(100.0, 110.0), "b": case(50.0)}})
+        self.assertAlmostEqual(some["decode"], 10.0 / 105.0)
+        self.assertEqual((some["repeated_cases"], some["cases"]), (1, 2))
+        self.assertEqual(status._spread_text(None, 0, 2), "; run-to-run spread unmeasured (every case measured once)")
+        self.assertIn("over the 1 of 2 cases measured more than once", status._spread_text(0.1, 1, 2))
+
+
+class StallTests(unittest.TestCase):
+    """protocol speed.stalls: gaps between streamed chunks after the first token, reported per speed case."""
+
+    def test_chunk_gaps_after_the_first_token(self):
+        found = timing.chunk_gaps([1.0, 1.01, 1.02, 1.12, 1.13])
+        self.assertEqual(found["chunks"], 5)
+        self.assertAlmostEqual(found["max_ms"], 100.0)
+        self.assertAlmostEqual(found["p99_ms"], 100.0)
+        self.assertIsNone(timing.chunk_gaps([1.0, 1.5]))   # a reply in two pieces shows no stall
+        samples = [{"warmup": True, "chunk_gaps": {"chunks": 9, "max_ms": 900.0, "p99_ms": 900.0}},
+                   {"warmup": False, "chunk_gaps": {"chunks": 5, "max_ms": 100.0, "p99_ms": 40.0}},
+                   {"warmup": False, "chunk_gaps": {"chunks": 6, "max_ms": 60.0, "p99_ms": 50.0}}]
+        self.assertEqual(timing.stalls(samples, 10.0), {"max_gap_ms": 100.0, "p99_gap_ms": 50.0, "chunks": 5,
+                                                        "max_gap_rounds": 10.0, "p99_gap_rounds": 5.0})
+        self.assertIsNone(timing.stalls([{"warmup": False, "chunk_gaps": None}], 10.0))
+
+    def test_a_speed_case_reports_its_longest_gap_and_status_shows_it(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 12}]}
+
+        class Engine:
+            """Two tokens per chunk (a speculative round) every 20 ms, and one stall of 120 ms."""
+            def generate(self, prompt, n, on_tokens):
+                for i in range(0, n, 2):
+                    time.sleep(0.12 if i == 6 else 0.02)
+                    on_tokens([5, 5])
+                return {"tokens": [5] * n, "rounds": n // 2}
+        found = speed.run_speed(Engine(), {"max_context": 64}, prepared, protocol, 0, 1, lambda m: None)
+        stalled = found["cases"]["a"]["stalls"]
+        self.assertGreaterEqual(stalled["max_gap_ms"], 110.0)
+        self.assertGreater(stalled["max_gap_rounds"], 2.0)   # the stall stands out from the rounds around it
+        self.assertEqual(stalled["chunks"], 6)
+        current = status.build({**MEASURED, "speed": found}, protocol)
+        self.assertEqual(current["kpis"]["stalls"]["cases"]["a"], stalled)
+        self.assertIn("stalls   longest / p99 gap between streamed chunks after the first token: a ",
+                      status.render(current))
+
+        class Whole:
+            def generate(self, prompt, n, on_tokens):
+                on_tokens([5] * n)
+                return {"tokens": [5] * n, "rounds": n}
+        whole = speed.run_speed(Whole(), {"max_context": 64}, prepared, protocol, 0, 1, lambda m: None)
+        self.assertIsNone(whole["cases"]["a"]["stalls"])
+        self.assertEqual(status.build({**MEASURED, "speed": whole}, protocol)["kpis"]["stalls"],
+                         {"cases": {}, "unmeasured": ["a"]})
+
+
+class ToolCallTests(unittest.TestCase):
+    """protocol speed.tool_calls: the agent cases' tool calls up to the first end token, valid, invalid or truncated."""
+    TOOLS = {t["function"]["name"]: t["function"]
+             for t in json.loads((ROOT / "crit_eval/suite/agent/tools.json").read_text(encoding="utf-8"))}
+
+    def test_the_format_comes_from_the_rendered_prompt(self):
+        self.assertEqual(tool_calls.template_format("# Tools\n<tool_call>\n<function=example_function_name>\n"), "xml")
+        self.assertEqual(tool_calls.template_format('<tool_call>\n{"name": <function-name>, "arguments": ...}'), "json")
+        self.assertIsNone(tool_calls.template_format("[TOOL_CALLS] read_file"))
+        self.assertIsNone(tool_calls.template_format("no tools here"))
+
+    def test_xml_calls_are_valid_invalid_or_truncated(self):
+        good = "<tool_call>\n<function=edit_file>\n<parameter=path>\na.py\n</parameter>\n<parameter=old_text>\nx = 1\n" \
+               "</parameter>\n<parameter=new_text>\nx = 2\n\n</parameter>\n</function>\n</tool_call>"
+        timed = "<tool_call>\n<function=run_command>\n<parameter=command>\nls\n</parameter>\n<parameter=timeout_seconds>" \
+                "\n{}\n</parameter>\n</function>\n</tool_call>"
+        unknown = "<tool_call>\n<function=delete_file>\n<parameter=path>\na.py\n</parameter>\n</function>\n</tool_call>"
+        missing = "<tool_call>\n<function=read_file>\n</function>\n</tool_call>"
+        cut = "<tool_call>\n<function=read_file>\n<parameter=path>\na."
+        found = tool_calls.count("Let me edit.\n" + good + "\n" + timed.format(30) + timed.format("soon") + unknown
+                                 + missing + cut, "xml", self.TOOLS, finished=False)
+        self.assertEqual((found["valid"], found["invalid"], found["truncated"]), (2, 3, 1))
+        self.assertEqual([c["state"] for c in found["calls"]],
+                         ["valid", "valid", "invalid", "invalid", "invalid", "truncated"])
+        self.assertIn("timeout_seconds", found["calls"][2]["reason"])
+        self.assertIn("names no defined tool", found["calls"][3]["reason"])
+        self.assertIn("required argument 'path'", found["calls"][4]["reason"])
+        # An unclosed call before the end token is invalid, not truncated.
+        self.assertEqual(tool_calls.count(cut, "xml", self.TOOLS, finished=True)["invalid"], 1)
+
+    def test_json_calls_and_the_calls_a_server_parsed(self):
+        text = ('<tool_call>\n{"name": "grep", "arguments": {"pattern": "def run", "path": "eval"}}\n</tool_call>'
+                '<tool_call>\n{"name": "grep", "arguments": {"pattern": 3}}\n</tool_call><tool_call>{"name": ')
+        found = tool_calls.count(text, "json", self.TOOLS, finished=False,
+                                 served=[{"name": "read_file", "arguments": '{"path": "a.py"}'}])
+        self.assertEqual((found["valid"], found["invalid"], found["truncated"]), (2, 1, 1))
+        served = tool_calls.count("", "json", self.TOOLS, finished=False,
+                                  served=[{"name": "read_file", "arguments": '{"path": "a.'}])
+        self.assertEqual(served["truncated"], 1)   # the server's call cut by the output limit
+
+    def test_a_speed_case_counts_its_calls_up_to_the_first_end_token(self):
+        # Token strings that spell the prompt's format and a reply: one valid call, the end token, then more output.
+        pieces = ["<tool_call>", "\n", "<function=read_file>", "<parameter=path>", "a.py", "</parameter>",
+                  "</function>", "</tool_call>", "<|im_end|>", "x"]
+        strings = pieces + [None] * 10
+        prepared = {"stop_ids": [8], "retrieval": {"token_text": strings}}
+        case = {"kind": "tool-call", "prompt_ids": [0, 1, 2], "tools": [{"type": "function",
+                                                                         "function": self.TOOLS["read_file"]}]}
+        reply = [0, 1, 2, 1, 3, 1, 4, 1, 5, 1, 6, 1, 7, 8, 0, 9]
+        found = tool_calls.case_tool_calls(case, reply, {}, prepared)
+        self.assertEqual((found["status"], found["format"], found["valid"], found["invalid"], found["truncated"]),
+                         ("measured", "xml", 1, 0, 0))   # the unclosed call after the end token is not read
+        self.assertIsNone(tool_calls.case_tool_calls({**case, "kind": "prose"}, reply, {}, prepared))
+        self.assertEqual(tool_calls.case_tool_calls(case, reply, {}, {"stop_ids": []})["status"], "unmeasured")
+        current = status.build({**MEASURED, "speed": {"cases": {"tool-call": {
+            "status": "measured", "kind": "tool-call", "tool_calls": found, "samples": []}}}}, runner.load_json(
+            runner.EVAL_DIR / "protocol.json"))
+        self.assertEqual(current["kpis"]["tool_calls"]["valid"], 1)
+        self.assertIn("tools    tool calls up to the first end token (xml format): tool-call 1 valid, 0 invalid, "
+                      "0 truncated", status.render(current))
 
 
 class SampledSpeedTests(unittest.TestCase):
@@ -1447,11 +1775,40 @@ class SampledSpeedTests(unittest.TestCase):
         quiet = Engine()
         found = speed.run_sampled_speed(quiet, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
                                          disturbed_spread=0.25)
-        self.assertEqual(quiet.seeds, [0, 1, 2, 3])   # the warmup, then every seed, and no extra repetition
+        self.assertEqual(quiet.seeds, [0, 1])   # the warmup, then the one seed, and no extra repetition
+        self.assertIsNone(found["cases"]["a"]["decode_se"])
+        # Repetitions past the protocol's seed (--repetitions 2, 3) take the next seeds.
+        second = Engine()
+        found = speed.run_sampled_speed(second, {"max_context": 1000}, prepared, protocol, 1, 2, lambda m: None,
+                                        disturbed_spread=0.25)
+        self.assertEqual(second.seeds, [0, 1, 2])
         decode = [s["decode_tps"] for s in found["cases"]["a"]["samples"] if not s["warmup"]]
         self.assertGreater(max(decode) / min(decode), 1.5)   # far past the disturbed spread, from the text alone
+        # An engine whose passes speed up over its first requests (a cache adapting): the first seed is asked again
+        # until its time per pass agrees with the request's before it.
+        class Warming(Engine):
+            def generate_sampled(self, prompt, n, on_tokens, sampling, logprobs=None):
+                self.slow = len(self.seeds) < 2
+                pause = (0.06, 0.04)[len(self.seeds)] if len(self.seeds) < 2 else 0.02
+                self.seeds.append(sampling["seed"])
+                for i in range(0, n, 2):
+                    time.sleep(pause)
+                    on_tokens([5] * min(2, n - i))
+                return {"tokens": [5] * n, "rounds": -(-(n - 1) // 2)}
+        warming = Warming()
+        found = speed.run_sampled_speed(warming, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+                                         disturbed_spread=0.25)
+        self.assertEqual(warming.seeds, [0, 1, 1, 1])
+        steady = found["cases"]["a"]["steady_state"]
+        self.assertEqual((steady["warmup_runs"], steady["added"], steady["steady"], steady["measure"]),
+                         (3, 2, True, "round_ms"))
+        self.assertLess(steady["drift"], -0.5)   # its passes took less than half as long once it settled
+        # A third repetition (--repetitions 3) takes the next seed.
+        third = Engine()
+        speed.run_sampled_speed(third, {"max_context": 1000}, prepared, protocol, 1, 3, lambda m: None)
+        self.assertEqual(third.seeds, [0, 1, 2, 3])
         with self.assertRaisesRegex(timing.Disturbed, "time per target pass"):
-            speed.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, None,
+            speed.run_sampled_speed(Engine(slow=True), {"max_context": 1000}, prepared, protocol, 1, 3,
                                      lambda m: None, disturbed_spread=0.25)
 
         # An adaptive engine: 15 ms plain steps and 26 ms rounds of 7 drafts, mixed by each seed's acceptance. Its
@@ -1492,7 +1849,7 @@ class SampledSpeedTests(unittest.TestCase):
                     on_tokens([5, 5])
                 return {"tokens": [5] * 6, "rounds": 3,
                         "served": {"prompt_tokens": 2, "output_tokens": 6, "finish_reason": "tool_calls"}}
-        found = speed.run_sampled_speed(Served(), {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
+        found = speed.run_sampled_speed(Served(), {"max_context": 1000}, prepared, protocol, 1, 3, lambda m: None,
                                          disturbed_spread=0.25)
         self.assertEqual(found["status"], "measured")   # judged on the two full-length replies alone
 
@@ -1517,27 +1874,36 @@ class SampledSpeedTests(unittest.TestCase):
         fixed = Engine()
         found = speed.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None)
         case = found["cases"]["a"]
-        self.assertEqual((fixed.seeds, case["repetitions"], found["adaptive"]), ([0, 1, 2, 3], 3, None))
+        self.assertEqual((fixed.seeds, case["repetitions"], found["adaptive"]), ([0, 1], 1, None))
+        self.assertEqual((case["decode_se"], case["repetitions_for_target"]), (None, None))   # one seed, no spread
+        text = status.render(status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0},
+                                           "speed": {"cases": {}}}, protocol))
+        self.assertIn("standard error unmeasured (each case measured at one seed)", text)
+        fixed = Engine()
+        found = speed.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, 2, lambda m: None)
+        case = found["cases"]["a"]
+        self.assertEqual((fixed.seeds, case["repetitions"]), ([0, 1, 2], 2))
         self.assertGreater(case["decode_se"], rule["target_se"])
         error, deviation = metrics.case_error([s["decode_tps"] for s in case["samples"] if not s["warmup"]])
         self.assertEqual(case["repetitions_for_target"], math.ceil((deviation / rule["target_se"]) ** 2))
-        # On request: further seeds until the error reaches the target, here the cap, since seed 2 stays an outlier.
+        # On request: further seeds until the error reaches the target, here the cap, since seed 2 stays an outlier;
+        # the one seed's case goes on to seed 2 first, its error unmeasured until then.
         adaptive = Engine()
         found = speed.run_sampled_speed(adaptive, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None,
                                          adaptive=True)
-        self.assertEqual(adaptive.seeds, [0, 1, 2, 3] + list(range(4, rule["max_repetitions"] + 1)))
+        self.assertEqual(adaptive.seeds, [0, 1, 2] + list(range(3, rule["max_repetitions"] + 1)))
         self.assertEqual(found["cases"]["a"]["repetitions"], rule["max_repetitions"])
         self.assertEqual(found["adaptive"], {"target_se": rule["target_se"], "max_repetitions": rule["max_repetitions"]})
         even = Engine(uneven=False)
         speed.run_sampled_speed(even, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None, adaptive=True)
-        self.assertEqual(even.seeds, [0, 1, 2, 3])   # already within the target
+        self.assertEqual(even.seeds, [0, 1, 2])   # within the target once a second seed gives it an error
         current = status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0}, "speed": {"cases": {}}},
                                protocol)
         text = status.render(current)
         self.assertIn(f"repeated until each case's error reached {rule['target_se']:.0%} or {rule['max_repetitions']} "
                       "repetitions; largest case errors a ", text)
 
-    def test_runs_repeat_sampled_cases_adaptively_unless_told_not_to(self):
+    def test_runs_repeat_sampled_cases_adaptively_only_on_request(self):
         from crit_eval import cli
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
@@ -1548,19 +1914,19 @@ class SampledSpeedTests(unittest.TestCase):
                 seen.setdefault("adaptive", []).append(adaptive)
                 return {"status": "unsupported", "reason": "fixture"}
             with patch.object(runner, "run_sampled_speed", sampled):
-                for options in ({}, {"adaptive_sampled": False}, {"repetitions": 2}):
+                for options in ({}, {"adaptive_sampled": True}, {"adaptive_sampled": True, "repetitions": 2}):
                     run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 128}, parts=("speed",),
                                warmups=0, log=lambda message: None, **options)
-        # The default, the opt-out, and a fixed repetition count, which is never extended.
-        self.assertEqual(seen["adaptive"], [True, False, False])
+        # The default (one seed), the opt-in, and a fixed repetition count, which is never extended.
+        self.assertEqual(seen["adaptive"], [False, True, False])
         parsed = {}
         with patch.object(cli, "_command", lambda args: parsed.update(vars(args)) or 0):
             cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o"])
-            self.assertTrue(parsed["adaptive_sampled"])
-            cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--no-adaptive-sampled"])
             self.assertFalse(parsed["adaptive_sampled"])
+            cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--adaptive-sampled"])
+            self.assertTrue(parsed["adaptive_sampled"])
         # A sampled decode repeated adaptively compares only with one repeated the same way.
-        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": "crit-eval-v0.4.0",
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": CURRENT_PROTOCOL,
                "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
                                  "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
         before = copy.deepcopy(now)
@@ -2095,12 +2461,13 @@ class ContextTests(unittest.TestCase):
             shapes = {**SHAPES, **{f"model.layers.0.mlp.experts.{i}.up_proj.weight": (128, 64) for i in range(1, 4)}}
             model = safetensors_model(directory, shapes, {**DENSE, "num_experts": 4, "num_experts_per_tok": 1})
             expert, ram = 128 * 64 * 2, 2 * context.GIB
+            settings = {**self.settings, "reserve_gib": 0}   # no reserve to lend: the cache gets what the KV cache leaves
             # The KV cache of 8,192 tokens and one of the four experts fit the device; three experts stay off it.
             rates = {"bandwidth_gbs": 1000, "host_memory_gbs": {"read": 50},
                      "host_to_device_gbs": {"pinned": {"1048576": 10, "268435456": 25}}}
-            device = {**rates, "memory_free_bytes": self.overhead + RESIDENT + 32 * 8192 + expert,
+            device = {**rates, "memory_free_bytes": context.GIB + RESIDENT + 32 * 8192 + expert,
                       "host_memory_total_bytes": ram + 10 ** 9}
-            found = context.placement(model, device, context.GIB, ram, self.settings, 8192)
+            found = context.placement(model, device, context.GIB, ram, settings, 8192)
             self.assertEqual((found["scenario"], found["number"]), ("sparse_device_host", 2))
             self.assertEqual((found["bytes"]["experts_on_device"], found["bytes"]["experts_off_device"]), (expert, 3 * expert))
             self.assertEqual(found["lookup_tables"], {"bytes": 1000 * 64 * 2, "tier": "host"})
@@ -2111,27 +2478,57 @@ class ContextTests(unittest.TestCase):
             self.assertAlmostEqual(floors["device"], (RESIDENT + expert) / 1e9)
             self.assertAlmostEqual(floors["link"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 25e6))
             self.assertAlmostEqual(floors["cpu"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 50e6))
+            # Split between the CPU and the link, the misses still read host memory at 50 GB/s at most, not 75.
+            self.assertAlmostEqual(floors["split"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 50e6))
+            self.assertIn("together at most its 50 GB/s read", context.render_placement(found))
+            self.assertIn("even routing is the pessimistic case", context.render_placement(found))
+            self.assertEqual(found["expert_cache_bytes"], expert)
             self.assertIn("misses computed on the CPU", context.render_placement(found))
+            self.assertTrue(found["host_holds_every_expert"])
+            self.assertNotIn("static split", context.render_placement(found))
             # Host memory that holds the experts but not the tables puts the tables on disk; less, the experts too.
             device["host_memory_total_bytes"] = ram + 3 * expert
-            found = context.placement(model, device, context.GIB, ram, self.settings, 8192)
+            found = context.placement(model, device, context.GIB, ram, settings, 8192)
             self.assertEqual((found["scenario"], found["lookup_tables"]["tier"]), ("sparse_device_host", "disk"))
             self.assertIn("no read-ahead", context.render_placement(found))
+            # It holds the three experts off the device, not all four: a cache over host experts would not fit.
+            self.assertFalse(found["host_holds_every_expert"])
+            self.assertIn("static split", context.render_placement(found))
             device["host_memory_total_bytes"] = ram + expert
-            self.assertEqual(context.placement(model, device, context.GIB, ram, self.settings, 8192)["scenario"],
+            self.assertEqual(context.placement(model, device, context.GIB, ram, settings, 8192)["scenario"],
                              "sparse_device_host_disk")
             # Every expert and the tables on the device; then weights read every pass that do not fit it.
             roomy = {**device, "memory_free_bytes": device["memory_free_bytes"] + 3 * expert + 1000 * 64 * 2}
-            found = context.placement(model, roomy, context.GIB, ram, self.settings, 8192)
+            found = context.placement(model, roomy, context.GIB, ram, settings, 8192)
             self.assertEqual((found["scenario"], found["number"], found["lookup_tables"]["tier"]), ("fits_device", 1, "device"))
             self.assertEqual(found["missed_expert_bytes_per_token"], 0)
             self.assertNotIn("link", found["plain_pass_floor_ms"])
-            tight = {**device, "memory_free_bytes": self.overhead + RESIDENT - 1, "host_memory_total_bytes": ram + 10 ** 9}
-            found = context.placement(model, tight, context.GIB, ram, self.settings, 8192)
+            tight = {**device, "memory_free_bytes": context.GIB + RESIDENT - 1, "host_memory_total_bytes": ram + 10 ** 9}
+            found = context.placement(model, tight, context.GIB, ram, settings, 8192)
             self.assertEqual((found["scenario"], found["number"]), ("dense_device_host", 5))
             tight["host_memory_total_bytes"] = ram + RESIDENT
-            self.assertEqual(context.placement(model, tight, context.GIB, ram, self.settings, 8192)["scenario"], "beyond_host")
-            self.assertIsNone(context.placement(model, {}, context.GIB, ram, self.settings, 8192))
+            self.assertEqual(context.placement(model, tight, context.GIB, ram, settings, 8192)["scenario"], "beyond_host")
+            self.assertIsNone(context.placement(model, {}, context.GIB, ram, settings, 8192))
+
+    def test_the_expert_cache_gets_the_reserve_prompt_buffers_borrow_from_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shapes = {**SHAPES, **{f"model.layers.0.mlp.experts.{i}.up_proj.weight": (128, 64) for i in range(1, 4)}}
+            model = safetensors_model(directory, shapes, {**DENSE, "num_experts": 4, "num_experts_per_tok": 1})
+            expert, ram = 128 * 64 * 2, 2 * context.GIB
+            # A reserve of one expert: the KV cache leaves one expert's room, the cache holds two.
+            settings = {**self.settings, "reserve_gib": expert / context.GIB}
+            device = {"bandwidth_gbs": 1000, "memory_free_bytes": context.GIB + expert + RESIDENT + 32 * 8192 + expert,
+                      "host_memory_total_bytes": ram + 10 ** 9}
+            found = context.placement(model, device, context.GIB, ram, settings, 8192)
+            self.assertEqual(found["scenario"], "sparse_device_host")
+            self.assertEqual((found["expert_cache_bytes"], found["bytes"]["experts_off_device"]), (2 * expert, 2 * expert))
+            self.assertEqual(found["missed_expert_bytes_per_token"], 2 * expert // 4)
+            self.assertIn("no fixed prompt workspace", context.render_placement(found))
+            # Every expert fits next to the KV cache without the reserve: the device keeps them, no cache to lend from.
+            device["memory_free_bytes"] += 3 * expert
+            found = context.placement(model, device, context.GIB, ram, settings, 8192)
+            self.assertEqual((found["scenario"], found["expert_cache_bytes"]), ("fits_device", None))
+            self.assertNotIn("no fixed prompt workspace", context.render_placement(found))
 
     def test_a_pass_reads_the_resident_weights_and_the_routed_experts_share(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2144,6 +2541,39 @@ class ContextTests(unittest.TestCase):
             (model / "config.json").write_text(json.dumps(DENSE))   # no routing known: experts are not counted
             self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT)
             self.assertIsNone(context.pass_bytes(Path(directory) / "missing", 1.0))
+
+    def test_the_fixed_decode_fraction_divides_by_the_model_files_bytes_whatever_the_engine_reports(self):
+        # protocol headroom.fixed_decode: decode over one token per pass at the model files' bytes and the case's KV.
+        speed_ = {"cases": {"a": {"status": "measured", "decode_tps": 600.0, "prompt_tokens": 100, "output_tokens": 200},
+                            "b": {"status": "skipped"}}}
+        found = headroom.fixed_decode(speed_, {"bytes_per_pass": 1e6, "kv_bytes_per_token": 1000.0}, 1.0)
+        at_floor = 1e9 / (1e6 + 1000.0 * 200)   # 100 prompt tokens and half the 200 output tokens
+        self.assertAlmostEqual(found["cases"]["a"]["tps_at_floor"], at_floor)
+        self.assertAlmostEqual(found["fraction"], 600.0 / at_floor)
+        self.assertEqual(list(found["cases"]), ["a"])
+        self.assertIsNone(headroom.fixed_decode(speed_, None, 1.0))
+        self.assertIsNone(headroom.fixed_decode(speed_, {"bytes_per_pass": 1e6, "kv_bytes_per_token": 0.0}, None))
+        with tempfile.TemporaryDirectory() as directory:
+            (Path(directory) / "model").mkdir()
+            model = safetensors_model(Path(directory) / "model", SHAPES, DENSE)
+            data = Path(directory) / "data"
+            data.mkdir()
+            fixture(data)
+            # An engine that reports a tenth of the bytes moves its own pass floor, not the fixed denominator.
+            result = run_full(MOCK, model, data, data / "result.json", {"max_context": 128, "bytes_per_pass": 100},
+                              parts=("speed",), warmups=0, repetitions=1, log=lambda message: None, bandwidth_gbs=1.0)
+            stored, kv = context.pass_bytes(model, 1.0), ceiling.model_ceiling(model)["kv_bytes_per_token"] / 2
+        fixed = result["headroom"]["fixed_decode"]
+        # The protocol's FP8 KV: the stored ceiling's is BF16.
+        self.assertEqual((fixed["bytes_per_pass"], fixed["kv_bytes_per_token"]), (stored, kv))
+        for case_id, row in fixed["cases"].items():
+            case = headroom.decode_suite(result)[1]["cases"][case_id]   # the headline decode's, here the sampled suite
+            read = fixed["bytes_per_pass"] + kv * (case["prompt_tokens"] + case["output_tokens"] / 2)
+            self.assertAlmostEqual(row["fraction"], case["decode_tps"] * read / 1e9)
+        self.assertEqual(result["headroom"]["bytes_per_pass"], 100)
+        decode = status.headline_decode(result["status"]["kpis"])
+        self.assertAlmostEqual(decode["fixed_fraction"], fixed["fraction"])
+        self.assertIn("of one token per pass at the model files'", status.render(result["status"]))
 
     def test_a_draft_step_reads_the_draft_layers_their_experts_share_and_the_head(self):
         mtp = {"mtp.fc.weight": (64, 128), "mtp.layers.0.self_attn.q_proj.weight": (64, 64),
@@ -2279,7 +2709,7 @@ class ContextTests(unittest.TestCase):
                          {"index": 0, "free_bytes": 1_000_000_000, "used_bytes": 31_000_000_000,
                           "total_bytes": 32_000_000_000}])
         with tempfile.TemporaryDirectory() as directory, patch.object(runner.host, "device_memory",
-                                                                     side_effect=lambda: next(readings)):
+                                                                     side_effect=lambda indices=None: next(readings)):
             data = Path(directory)
             fixture(data)
             result = run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 1 << 20},
@@ -2334,6 +2764,21 @@ class ContextTests(unittest.TestCase):
         self.assertEqual(required["engine_max_context"], 4096)
         self.assertEqual(list(required["points"]), ["4096"])
         self.assertEqual(required["lower"]["context"], 1024)
+
+    def test_an_engine_whose_weights_exceed_the_device_is_asked_for_its_host_bytes(self):
+        found = headroom.undeclared_host_bytes({}, 40e9, 32e9)
+        self.assertIn("model's weights (40.0 GB) exceed the device's memory (32.0 GB)", found)
+        self.assertIsNone(headroom.undeclared_host_bytes({"host_bytes_per_pass": {"cpu": 1e9}}, 40e9, 32e9))
+        self.assertIsNone(headroom.undeclared_host_bytes({}, 20e9, 32e9))
+        self.assertIsNone(headroom.undeclared_host_bytes({}, 40e9, None))   # no probe: unknown, no claim
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryDirectory() as folder:
+            model = safetensors_model(folder, SHAPES, {**DENSE, "max_position_embeddings": 4096})
+            device = {"device": "fixture gpu", "memory_free_bytes": self.overhead + RESIDENT + 32 * 100000,
+                      "memory_total_bytes": RESIDENT // 2}
+            result = self.run_mock(directory, None, model=model, device=device)
+        self.assertTrue(any("host_bytes_per_pass" in m for m in result["headroom"]["missing"]))
+        self.assertTrue(any(w.startswith("pass floor priced as if every weight were on the device")
+                            for w in result["headroom"]["warnings"]))
 
     def test_probe_keeps_the_least_free_device_memory(self):
         samples = [{"device": "gpu", "bandwidth_gbs": 100, "tflops": {}, "memory_total_bytes": 32 << 30,
@@ -2434,6 +2879,30 @@ class QualityTests(unittest.TestCase):
         more["failures"], more["passed"] = ["curve@32768: differs"], False
         self.assertFalse(quality_checks.merge_honesty({"honesty": found, "sets": {}}, more)["passed"])
 
+    def test_as_quantized_honesty_bounds_paths_that_round_apart(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        texts = [{"id": "tides", "set": "conversations", "prompt_ids": [1, 2, 3]}]
+
+        def engine(shift):
+            class Engine:
+                def reply(self, prompt, n, top_k):
+                    return {"tokens": [5, 6], "logprobs": [-0.5, -0.7], "top": [[[5, -0.5]], [[6, -0.7]]]}
+
+                def score(self, prompt, continuation, top_k, prompt_rows=True):
+                    return {"continuation": [{"logprob": -0.5 - shift, "top": [[5, -0.5 - shift]]},
+                                             {"logprob": -0.7, "top": [[6, -0.7]]}]}
+            return Engine()
+
+        def check(shift, mode):
+            return quality_checks.run_honesty(engine(shift), {}, {"quality": texts}, protocol, lambda m: None, {},
+                                              mode=mode)
+        self.assertFalse(check(0.05, "preserve")["passed"])          # 5e-2 > 1e-3
+        rounded = check(0.05, "as_quantized")
+        self.assertEqual((rounded["passed"], rounded["tolerance"], rounded["mean_tolerance"]), (True, 2.0, 0.1))
+        self.assertAlmostEqual(rounded["replies"][0]["mean_abs_logprob_diff"], 0.025)
+        self.assertFalse(check(0.4, "as_quantized")["passed"])       # mean 0.2 over the bound
+        self.assertFalse(check(2.5, "as_quantized")["passed"])       # one position past 2 nats
+
     def lp(self, token):
         return self.LP[self.TOP.index(token)] if token in self.TOP else self.LP[3]
 
@@ -2476,13 +2945,13 @@ class QualityTests(unittest.TestCase):
             return {"tokens": tokens, "logprobs": [r["logprob"] for r in rows], "top": [r["top"] for r in rows]}
 
     def measure(self, engine, thresholds=None, max_context=10_000, honesty_sets=("conversations", "long-600"),
-                spread=None, allowance=None):
+                spread=None):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         protocol["quality"]["honesty"] = dict(protocol["quality"]["honesty"], sets=list(honesty_sets))
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
         quality = quality_checks.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
-                                     lambda message: None, self.reference(texts), thresholds, spread, allowance)
+                                     lambda message: None, self.reference(texts), thresholds, spread)
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
                   "protocol": protocol["protocol"], "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
         return result, status.build(result, protocol)
@@ -2512,6 +2981,7 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(quality["passed"])
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("served replies scored alike", self.gate(current)["detail"])
+        self.assertNotIn("how many tokens its decode step holds", self.gate(current)["detail"])
 
     def test_a_sets_share_of_the_budget_carries_its_spread_over_its_positions(self):
         ref = {"logprob": -1.0, "top_ids": [7, 8], "top_logprobs": [math.log(0.6), math.log(0.3)]}
@@ -2656,37 +3126,19 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("judged against the reference's own spread: long-600/prompt", self.gate(current)["detail"])
 
-    def test_as_quantized_widens_a_set_to_margin_times_the_checkpoints_own_quantization_drift(self):
-        # protocol quality.allowance: the exact scores, each set's limits raised to margin times how far the
-        # checkpoint run with its own activation quantization lands from them; a set it does not exceed keeps its
-        # limits, and the prompt positions keep no perplexity limit.
+    def test_as_quantized_judges_every_set_by_its_own_budget(self):
+        # protocol quality.mode_thresholds: a drift preserve's budget fails passes as_quantized's, whatever the
+        # checkpoint's own quantization drift (the allowance is reported by the reference, not judged).
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
-        margin = protocol["quality"]["allowance"]["margin"]
-        engine = self.Engine(self, drift_from=520, shift=0.6)
-        failing = self.measure(engine)[0]["quality"]["sets"]["long-600/served"]
+        failing = self.measure(self.Engine(self, drift_from=520, shift=0.6))[0]["quality"]["sets"]["long-600/served"]
         self.assertFalse(failing["passed"])
-        self.assertLess(failing["kld_mean"], protocol["quality"]["allowance"]["cap"]["kld_mean_max"])
-        own = {name: {"kld_mean": failing["kld_mean"] / margin * 1.01, "kld_p99": failing["kld_p99"] / margin * 1.01,
-                      "ppl_ratio": 1 + (failing["ppl_ratio"] - 1) / margin * 1.01}
-               for name in ("long-600/served", "long-600/prompt")}
-        own["conversations/served"] = {"kld_mean": 1e-4, "kld_p99": 1e-3, "ppl_ratio": 1.0001}
-        own["conversations/prompt"] = {"kld_mean": 10.0, "kld_p99": 100.0, "ppl_ratio": 9.0}   # a format carried badly
-        result, current = self.measure(self.Engine(self, drift_from=520, shift=0.6), allowance=own)
+        budget = quality_checks.quality_thresholds(protocol, mode="as_quantized")
+        result, current = self.measure(self.Engine(self, drift_from=520, shift=0.6), thresholds=budget)
         sets = result["quality"]["sets"]
-        self.assertTrue(sets["long-600/served"]["passed"] and sets["long-600/prompt"]["passed"])
-        self.assertIn("kld_mean_max", sets["long-600/served"]["allowance_raised"])
-        self.assertAlmostEqual(sets["long-600/served"]["limits"]["kld_mean_max"], margin * own["long-600/served"]["kld_mean"])
-        self.assertEqual(sets["long-600/served"]["allowance"], own["long-600/served"])
-        self.assertNotIn("ppl_ratio_max", sets["long-600/prompt"]["allowance_raised"])
-        self.assertNotIn("allowance_raised", sets["conversations/served"])   # below the budget: limits as they are
-        # The raise stops at the cap (protocol quality.allowance.cap), however far the checkpoint itself drifts.
-        cap = protocol["quality"]["allowance"]["cap"]
-        self.assertEqual(sets["conversations/prompt"]["limits"],
-                         {"kld_mean_max": cap["kld_mean_max"], "kld_p99_max": cap["kld_p99_max"]})
+        self.assertTrue(all(s["passed"] for s in sets.values()))
+        self.assertEqual(sets["long-600/served"]["limits"], budget)
+        self.assertNotIn("allowance_raised", sets["long-600/served"])
         self.assertEqual(self.gate(current)["state"], "pass")
-        self.assertIn("judged with the checkpoint's own quantization drift as allowance: conversations/prompt "
-                      "(kld_mean <= 0.4, kld_p99 <= 4), long-600/prompt",
-                      self.gate(current)["detail"])
 
     def test_drift_in_the_prefill_alone_fails_the_prompt_positions(self):
         # A prefill that drifts while decode does not: every reply's first token comes from that arithmetic.
@@ -2745,6 +3197,8 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(all(s["passed"] for s in result["quality"]["sets"].values()))   # the fixed texts score fine
         self.assertFalse(result["quality"]["passed"])
         self.assertIn("differ from the served ones", self.gate(current)["detail"])
+        # The gate names the usual cause, a token's arithmetic depending on its decode step's width.
+        self.assertIn("how many tokens its decode step holds", self.gate(current)["detail"])
         self.assertEqual(self.gate(current)["state"], "fail")
 
     def test_the_runs_budget_judges_the_sets(self):
