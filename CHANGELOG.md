@@ -9,6 +9,15 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.3] - 2026-11-02
+
+### Fixed
+
+- A served engine's request deadline is replayed as it observed each request: a call line keeps what the deadline
+  observed (`observed`), and a resumed round gives exactly that back. Before, replay rebuilt it from the token
+  arrivals, which the engine times a little otherwise, so the stages' first estimate could read other rates and a
+  resumed round leave the journal early.
+
 ## [0.5.2] - 2026-11-02
 
 ### Fixed
@@ -595,7 +604,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...HEAD
+[0.5.3]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/crit-labs/crit-eval/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/crit-labs/crit-eval/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/crit-labs/crit-eval/compare/v0.4.1...v0.5.0

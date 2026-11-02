@@ -209,6 +209,42 @@ class JournalTests(unittest.TestCase):
         self.assertIsNone(written.diverged)
         self.assertEqual(written.counts["replayed_calls"], 5)
 
+    def test_a_served_engine_the_journal_answers_keeps_the_deadline_it_observed(self):
+        import random
+        from crit_eval import EVAL_DIR, load_json
+        from crit_eval.run.deadline import RequestDeadline
+        rule = load_json(EVAL_DIR / "protocol.json")["requests"]["timeout"]
+
+        class Served(Engine):
+            def __init__(self):
+                super().__init__()
+                self.deadline = RequestDeadline(rule)
+
+            def info(self):
+                return {**super().info(), "served": True}
+
+            def generate(self, prompt, n, on_tokens):
+                out = super().generate(prompt, n, on_tokens)
+                # The engine times a request its own way, never quite as the token arrivals do.
+                self.deadline.observe(len(prompt), random.uniform(0.01, 0.02), n, random.uniform(0.01, 0.02))
+                return out
+
+        def served(context):
+            engine = Served()
+            return engine, engine.info()
+
+        def measure(path, resume=None):
+            with journal.Journal(path, IDENTITY, resume=resume, log=lambda m: None) as written:
+                engine, _ = written.open(served, {})
+                for prompt, n in REQUESTS:
+                    engine.generate(prompt, n, lambda tokens: None)
+                return engine, vars(engine.deadline)
+        with tempfile.TemporaryDirectory() as folder:
+            first, observed = measure(Path(folder) / "a.journal.jsonl")
+            again, replayed = measure(Path(folder) / "b.journal.jsonl", resume=Path(folder) / "a.journal.jsonl")
+        self.assertIsNone(again.real)
+        self.assertEqual(replayed, observed)
+
     def test_a_round_interrupted_in_its_curve_resumes_with_the_speed_it_measured(self):
         from unittest.mock import patch
         from crit_eval.run import runner

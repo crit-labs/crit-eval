@@ -13,7 +13,8 @@ so the disturbed case is measured again rather than read back.
 
 Lines (protocol journal): `round` (the round's identity, what it resumes), `open` (an engine: its context, info,
 methods and load time), `mark` (a part starts), `call` (a request: method, inputs digest, delivered tokens with
-their offsets, seconds, result, or the error a request raised, raised again on replay); each of these three carries the clock readings taken since the line before it
+their offsets, seconds, result and what a served engine's request deadline observed of it, or the error a request
+raised, raised again on replay); each of these three carries the clock readings taken since the line before it
 (`clock`), `load` (an engine the round opened only for its live requests), `diverged` (where
 replay stopped early), `end` (the round's outcome). Replayed lines carry `replayed: true`, so each journal is
 complete on its own and a resumed round can be resumed again."""
@@ -290,6 +291,8 @@ class Journal:
         line = {"event": "call", "engine": engine.index, "engine_key": engine.key, "method": method,
                 "inputs_sha256": inputs_sha, "prompt_tokens": len(args[0]) if args and isinstance(args[0], list)
                 and not any(isinstance(t, list) for t in args[0]) else None, "deliveries": deliveries}
+        deadline = getattr(real, "deadline", None)
+        seen = [len(getattr(deadline, name, ())) for name in ("prefills", "decodes")]
         try:
             result = getattr(real, method)(*live_args, **live_kwargs)
         except Exception as error:
@@ -300,6 +303,10 @@ class Journal:
             self._record(line)
             raise
         line["seconds"] = round(time.perf_counter() - started, 6)
+        if hasattr(deadline, "observe"):
+            # What the engine's request deadline observed of this request, given back to it as it was on replay.
+            line["observed"] = {name: _plain(getattr(deadline, name)[count:])
+                                for name, count in zip(("prefills", "decodes"), seen)}
         try:
             line["result"] = _plain(result)
         except TypeError as error:
@@ -404,6 +411,10 @@ def _observe(engine, rows):
     for row in rows:
         if row.get("error"):
             continue    # a request that raised observed nothing
+        if "observed" in row:
+            deadline.prefills.extend(tuple(pair) for pair in row["observed"]["prefills"])
+            deadline.decodes.extend(tuple(pair) for pair in row["observed"]["decodes"])
+            continue
         prompt = row.get("prompt_tokens") or 0
         if row["deliveries"]:
             first, last = row["deliveries"][0][0], row["deliveries"][-1][0]
