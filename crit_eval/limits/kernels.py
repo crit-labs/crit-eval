@@ -1,7 +1,8 @@
 """Where the GPU time goes, kernel by kernel: `crit eval kernels --adapter FILE --model DIR --data DIR --out FILE`.
 
-Runs the speed cases in a child process with a CUPTI injection library (probe/kernel_trace.cpp), so every kernel
-the engine launches is recorded, CUDA-graph nodes included, with no change to the engine. Each case first runs a
+Runs the speed cases in a child process with a CUPTI injection library (probe/kernel_trace.cpp), or on ROCm
+(--backend hip) a rocprofiler-sdk tool library (probe/kernel_trace_rocm.cpp), so every kernel the engine launches is
+recorded, CUDA- or HIP-graph nodes included, with no change to the engine. Each case first runs a
 warmup on another prompt of the same length (the case's prompt rotated by half), so graphs and workspaces for that
 length exist, then its prefill as a request of one output token on a fresh prompt: the case's prompt with its first
 token changed to one no earlier request of the trace began with, so no prefix cache can serve any of it (cases share
@@ -13,7 +14,7 @@ device's SMs; a kernel with fewer blocks than SMs leaves part of the GPU idle). 
 starts before the previous one ends (programmatic dependent launch, or another stream) is charged only from that
 end, so a kernel waiting on its predecessor is not charged the wait; `span_ms` keeps the raw durations. When the adapter declares
 `kernel_work` estimates, it also shows achieved TFLOPS and GB/s against the device ceilings from `crit eval probe`.
-Linux only; needs a CUDA toolkit with CUPTI.
+Linux only; needs a CUDA toolkit with CUPTI, or ROCm with rocprofiler-sdk.
 """
 import argparse
 import json
@@ -32,6 +33,10 @@ from .ceiling import best_rates
 from ..quality.prepare import PREPARED
 
 SOURCE = EVAL_DIR / "probe" / "kernel_trace.cpp"
+# The tracer source of each backend, the variable its runtime loads the tracer from and the tracer's clock.
+SOURCES = {"cuda": SOURCE, "hip": EVAL_DIR / "probe" / "kernel_trace_rocm.cpp"}
+LOADERS = {"cuda": "CUDA_INJECTION64_PATH", "hip": "ROCP_TOOL_LIBRARIES"}
+CLOCKS = {"cuda": "cupti", "hip": "rocprofiler"}
 TOP = 12
 
 
@@ -57,8 +62,31 @@ def find_toolkit(explicit_nvcc=None):
     raise SystemExit("no CUDA toolkit with CUPTI found (looked for include/cupti.h and libcupti.so); pass --nvcc")
 
 
+def find_rocm(explicit_hipcc=None):
+    """hipcc plus the rocprofiler-sdk include and library directories of the same ROCm."""
+    roots = [Path(explicit_hipcc).resolve().parents[1]] if explicit_hipcc else []
+    which = shutil.which("hipcc")
+    if which:
+        roots.append(Path(which).resolve().parents[1])
+    roots += [Path(root) for root in (os.environ.get("ROCM_PATH"), "/opt/rocm") if root]
+    roots += sorted(Path("/opt").glob("rocm-*"), reverse=True)
+    for root in roots:
+        hipcc, inc, lib = root / "bin" / "hipcc", root / "include", root / "lib"
+        if hipcc.is_file() and (inc / "rocprofiler-sdk" / "rocprofiler.h").is_file() and any(lib.glob("librocprofiler-sdk.so*")):
+            return {"backend": "hip", "compiler": str(hipcc), "include": str(inc), "lib": str(lib)}
+    raise SystemExit("no ROCm with rocprofiler-sdk found (looked for include/rocprofiler-sdk/rocprofiler.h and "
+                     "librocprofiler-sdk.so); pass --hipcc")
+
+
 def build(toolkit, directory):
     library = Path(directory) / "libcrit_kernel_trace.so"
+    if toolkit.get("backend") == "hip":
+        command = [toolkit["compiler"], "-O2", "-std=c++17", "-shared", "-fPIC", "-o", str(library), str(SOURCES["hip"]),
+                   "-I", toolkit["include"], "-L", toolkit["lib"], "-lrocprofiler-sdk", "-Wl,-rpath," + toolkit["lib"]]
+        done = subprocess.run(command, capture_output=True, text=True)
+        if done.returncode != 0:
+            raise SystemExit("building the ROCm kernel tracer failed:\n" + done.stderr[-4000:])
+        return library
     command = [toolkit["nvcc"], "-O2", "-std=c++17", "-shared", "-Xcompiler", "-fPIC", "-o", str(library), str(SOURCE),
                "-I", toolkit["include"], "-L", toolkit["lib"], "-lcupti", "-lcuda",
                "-Xlinker", "-rpath", "-Xlinker", toolkit["lib"]]
@@ -92,13 +120,14 @@ def tracer_clock():
     carry) when the injection library exports crit_ktrace_timestamp, else the host's realtime clock, which read_traces
     converts kernel times to through the trace's clock pairs."""
     import ctypes
+    backend = os.environ.get("CRIT_KTRACE_BACKEND", "cuda")
     try:
-        library = ctypes.CDLL(os.environ["CUDA_INJECTION64_PATH"])
+        library = ctypes.CDLL(os.environ[LOADERS.get(backend, LOADERS["cuda"])])
         now = library.crit_ktrace_timestamp
     except (KeyError, OSError, AttributeError):
         return time.time_ns, "realtime"
     now.restype, now.argtypes = ctypes.c_ulonglong, []
-    return now, "cupti"
+    return now, CLOCKS.get(backend, "cupti")
 
 
 def _timed(engine, ids, n, now=time.time_ns):
@@ -155,7 +184,7 @@ def _child(spec):
 
 def read_traces(directory, clock="realtime"):
     """Kernels from every traced process: (start_ns, end_ns, blocks, threads, name), on the host realtime clock, or as
-    recorded with clock "cupti" (phase marks taken on the tracer's clock, tracer_clock)."""
+    recorded with clock "cupti" or "rocprofiler" (phase marks taken on the tracer's clock, tracer_clock)."""
     kernels, device = [], {"sms": None, "name": None}
     for path in sorted(Path(directory).glob("trace-*.txt")):
         clocks, rows = [], []
@@ -171,8 +200,8 @@ def read_traces(directory, clock="realtime"):
                 parts = line.split(" ", 4)
                 if len(parts) == 5:
                     rows.append((int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), parts[4]))
-        if rows and (clocks or clock == "cupti"):
-            offset = 0 if clock == "cupti" else round(statistics.mean(clocks))
+        if rows and (clocks or clock != "realtime"):
+            offset = 0 if clock != "realtime" else round(statistics.mean(clocks))
             kernels += [(s + offset, e + offset, b, t, n) for s, e, b, t, n in rows]
     kernels.sort()
     return kernels, device
@@ -407,11 +436,14 @@ def render(result, top=TOP):
 
 
 def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=None, log=print, context_tokens=None,
-          work=None):
-    """work: kernel_work rules ahead of the adapter's own (crit eval kernels --work)."""
+          work=None, backend="cuda", hipcc=None):
+    """work: kernel_work rules ahead of the adapter's own (crit eval kernels --work). backend: cuda (CUPTI) or hip
+    (rocprofiler-sdk)."""
     if not sys.platform.startswith("linux"):
-        raise SystemExit("crit eval kernels needs Linux (CUPTI injection); on Windows run it under WSL")
-    toolkit = find_toolkit(nvcc)
+        raise SystemExit("crit eval kernels needs Linux (CUPTI or rocprofiler injection); on Windows run it under WSL")
+    if backend not in SOURCES:
+        raise SystemExit(f"--backend is one of {', '.join(SOURCES)}")
+    toolkit = find_toolkit(nvcc) if backend == "cuda" else find_rocm(hipcc)
     with tempfile.TemporaryDirectory() as directory:
         library = build(toolkit, directory)
         spec = {"adapter": str(Path(adapter).resolve()), "model": str(model), "data": str(Path(data).resolve()),
@@ -419,9 +451,10 @@ def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=
         import crit_core
         # The child imports crit_eval and crit_core from where this process does.
         paths = [str(EVAL_DIR.parent), str(Path(crit_core.__file__).resolve().parents[1]), os.environ.get("PYTHONPATH")]
-        env = dict(os.environ, CUDA_INJECTION64_PATH=str(library), CRIT_KTRACE_DIR=directory,
-                   PYTHONPATH=os.pathsep.join(filter(None, paths)))
-        log(f"tracing kernels with {library.name} ({toolkit['nvcc']})")
+        env = dict(os.environ, CRIT_KTRACE_DIR=directory, CRIT_KTRACE_BACKEND=backend,
+                   PYTHONPATH=os.pathsep.join(filter(None, paths)), **{LOADERS[backend]: str(library)})
+        compiler = toolkit.get("nvcc") or toolkit["compiler"]
+        log(f"tracing kernels with {library.name} ({compiler})")
         done = subprocess.run([sys.executable, "-B", "-m", "crit_eval.limits.kernels", "--child", json.dumps(spec)], env=env)
         if done.returncode != 0:
             raise SystemExit(f"traced engine process failed ({done.returncode})")
@@ -430,8 +463,9 @@ def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=
             marks["info"]["kernel_work"] = list(work) + list(marks["info"].get("kernel_work") or [])
         kernels, device_info = read_traces(directory, marks.get("clock", "realtime"))
     if not kernels:
-        raise SystemExit("no kernels were recorded: the engine may not run on CUDA, or CUPTI could not attach")
-    result = {"contract": CONTRACT, "kind": "kernels", "engine": marks["info"], "toolkit": portable_path(toolkit["nvcc"]),
+        raise SystemExit(f"no kernels were recorded: the engine may not run on {backend}, or the tracer could not attach")
+    result = {"contract": CONTRACT, "kind": "kernels", "engine": marks["info"], "toolkit": portable_path(compiler),
+              **({"backend": backend} if backend != "cuda" else {}),
               **analyze(kernels, device_info, marks, device)}
     write_json(out, result)
     return result

@@ -47,7 +47,8 @@ import math
 
 from crit_core.model.schemes import (PRIMARY, RECOGNISERS, UNREAD, SchemeError, quantization_of,  # noqa: F401
                                      refuse_unread, stored)
-from crit_core.model.schemes import ct_group as _ct_group, ct_weight_args as _ct_args, mlx_settings as _mlx
+from crit_core.model.schemes import (CSF_EXCEPTIONS, CSF_FIXED, csf_scale_shape, ct_group as _ct_group,
+                                     ct_weight_args as _ct_args, fp8_block as _fp8_block, mlx_settings as _mlx)
 from crit_core.model.schemes import gptq_bits as _gptq_bits, quant_method as _method
 
 E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0]
@@ -146,12 +147,33 @@ def _fp8_decode(checkpoint, base, device):
         return weight * scale.reshape(-1)[0]
     if scale.shape[-2:] == (rows, 1):
         return weight * scale
-    # Block scales: one per block of block_size elements (weight_block_size, or compressed-tensors'
-    # block_structure), the edge blocks cut short.
-    quantization = checkpoint.quantization
-    block = quantization.get("weight_block_size") or _ct_args(quantization, base).get("block_structure") or (FP8_BLOCK,) * 2
+    # Block scales: one per block (crit_core's fp8_block: weight_block_size, compressed-tensors' block_structure,
+    # else the block the scales' grid gives, such as modelopt MXFP8's one scale per 32 inputs of a row), the edge
+    # blocks cut short.
+    block = _fp8_block(checkpoint.quantization, base, (rows, cols), scale.shape)
+    if block is None:
+        raise SchemeError(f"{base}: FP8 scales of shape {list(scale.shape)} fit no block of [{rows}, {cols}]")
     expanded = scale.repeat_interleave(int(block[0]), -2).repeat_interleave(int(block[1]), -1)
     return weight * expanded[..., :rows, :cols]
+
+
+def csf_scales(checkpoint, base, device):
+    """The E4M3 [rows, groups] scales of a ModelOpt NVFP4 matrix stored CSF-compressed (crit_core's csf_scale_shape):
+    each row's base byte plus its 4-bit code, then the exceptions' bytes at their positions."""
+    import torch
+    fixed = checkpoint.raw(base + CSF_FIXED).to(device)
+    rows, groups = csf_scale_shape(tuple(fixed.shape))
+    bases = fixed[:, :16].reshape(rows, 1).to(torch.int16)
+    codes = fixed[:, 16:].reshape(rows, groups // 2)
+    nibbles = torch.stack((codes & 0x0F, codes >> 4), dim=-1).reshape(rows, groups).to(torch.int16)
+    out = (bases + nibbles).reshape(-1)
+    if checkpoint.has(base + CSF_EXCEPTIONS):
+        words = checkpoint.raw(base + CSF_EXCEPTIONS).to(device).reshape(-1).to(torch.int64) & 0xFFFFFFFF
+        positions = words & 0xFFFFFF
+        if positions.numel() and int(positions.max()) >= rows * groups:
+            raise SchemeError(f"{base}{CSF_EXCEPTIONS}: a position past the {rows} x {groups} scales")
+        out[positions] = (words >> 24).to(torch.int16)
+    return out.to(torch.uint8).view(torch.float8_e4m3fn).reshape(rows, groups)
 
 
 def _nvfp4_decode(checkpoint, base, device):
@@ -162,7 +184,8 @@ def _nvfp4_decode(checkpoint, base, device):
         scale = scale / checkpoint.raw(base + ".weight_global_scale").to(device).float()
     else:
         packed = checkpoint.raw(base + ".weight").to(device)
-        scale = checkpoint.raw(base + ".weight_scale").to(device).float()
+        scale = (checkpoint.raw(base + ".weight_scale").to(device) if checkpoint.has(base + ".weight_scale")
+                 else csf_scales(checkpoint, base, device)).float()
         scale = scale * checkpoint.raw(base + ".weight_scale_2").to(device).float()
     table = torch.tensor(E2M1, dtype=torch.float32, device=device)
     low, high = packed & 0x0F, packed >> 4

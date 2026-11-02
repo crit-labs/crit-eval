@@ -48,6 +48,9 @@ Results report facts; crit-eval does not classify or rank. The builder reasons f
 - **Gaps:** what each term (model pass, draft steps, verify pass, draft width, drafter acceptance,
   prefill at its stored-format and at its reachable ceiling, TTFT) would give at its floor, with a
   kernel trace (`status --kernels`) each prefill term too, plus missing inputs that hide a limit.
+- **Concurrency**, reported: a served engine that runs several requests at once gets closed-loop levels of 1 to 64
+  clients with each level's aggregate tokens per second against its batched ceiling, its first tokens, its
+  per-request decode and whether its replies equal the serial ones ([concurrency](MEASUREMENTS.md#concurrency)).
 
 ## Package layout
 
@@ -68,13 +71,13 @@ separately:
 
 | Command | Does | Needs |
 | --- | --- | --- |
-| `probe` | Device ceilings: free memory, copy bandwidth, GEMM and raw tensor-core TFLOPS per format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine |
+| `probe` | Device ceilings: free memory, copy bandwidth, GEMM and raw tensor-core TFLOPS per format | CUDA toolkit (`nvcc`, cuBLASLt) on the target machine, or on ROCm `--backend hip` with `hipcc` and hipBLASLt |
 | `context` | The max context the engine must serve | the probe result, `config.json`, safetensors or GGUF headers |
 | `prepare --model M --data D` | Freeze the suite as token ids, with arithmetic per token; `--chat-template FILE` for a model without a [chat template](#chat-templates) of its own | `tokenizers`, `jinja2` |
 | `reference --model M --data D` | Score the quality texts once on the checkpoint `D` was prepared from and store the scores in `D` | `torch`, `transformers`, `safetensors` (`gguf` for a GGUF), a GPU |
 | `pin` | Pin the decode text (once per data directory) | the engine's dependencies |
 | `run` | Evaluate an engine | Python standard library and the engine's dependencies |
-| `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI |
+| `kernels` | Rank kernels by GPU time per phase | Linux, a CUDA toolkit with CUPTI, or ROCm with rocprofiler-sdk (`--backend hip`) |
 
 Use one data directory per model so every engine gets the same prompts. Data prepared for an
 earlier protocol series does not run: prepare it again into a new directory and pin it
@@ -89,7 +92,8 @@ holds it ([SERVING.md](https://github.com/crit-labs/crit/blob/main/docs/SERVING.
 Prompts render with the model's own chat template, thinking off. A model that carries none renders
 with the one crit ships for its family, by `config.json` `model_type`: DeepSeek V4 (`deepseek_v4`)
 publishes a Python encoder instead, and crit's port of it
-([deepseek-v4.jinja](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/text/templates/deepseek-v4.jinja)) renders exactly
+([deepseek-v4.jinja](../crit_eval/architectures/templates/deepseek-v4.jinja), given to Core's text layer
+through its registry when `crit_eval` is imported) renders exactly
 what the encoder does, on its golden tests and on every prompt of the suite. Any other model without
 one takes `--chat-template FILE` at `prepare`, and at `run` and `fetch` when they prepare or fetch
 its data; a model with its own refuses one. `prepared.json` records the template as `chat_template`:
@@ -107,7 +111,8 @@ with `load_model_text(model, chat_template=SOURCE)`.
 folder holding one of them. Nothing else is needed. GGUF's converter writes the model's
 description into the GGUF's metadata, and Core derives the files the rest of crit reads from it
 ([crit_core.model](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/model/README.md#gguf)): `config.json` from the
-architecture's shape and RoPE keys, `tokenizer.json` and `tokenizer_config.json` from the
+architecture's shape and RoPE keys, by the config rules crit-eval gives Core for each architecture
+([gguf_config.py](../crit_eval/architectures/gguf_config.py)), `tokenizer.json` and `tokenizer_config.json` from the
 vocabulary, merges and special tokens, the chat templates from `tokenizer.chat_template`, and
 `generation_config.json` from the end-of-generation tokens and any `general.sampling.*` defaults.
 crit runs no GGUF runtime for any of it; `reference` needs the `gguf` Python package to decode
@@ -269,7 +274,15 @@ weights and whatever host-side weights the adapter keeps in the process
 reads the loaded engine's `engine_facts` (whether it speculates, its draft width and the bytes a
 pass and a draft step read, [Serving](https://github.com/crit-labs/crit/blob/main/docs/SERVING.md#engine-facts-and-plain-decoding)) and each
 reply's drafts accepted per round, so a served candidate gets the same decode limits as an
-adapter's, and checks exactness on the same engine through plain decoding (`chat-plain-v1`).
+adapter's (any server may stream the same `crit_telemetry` object on an event of its reply: `accepted`, drafts
+accepted per round, and `expert_reads` and `expert_hits`, its device expert cache's reads and hits; without them a
+speculating engine is priced as one token per pass and an offloading one at even routing, and `status` says so when
+its decode lands above that ceiling), and checks exactness on the same engine through plain decoding (`chat-plain-v1`).
+
+A server whose model card reports `max_concurrent_requests` above 1 (crit serve's, for a package declaring
+`chat-concurrent-v1`) also gets the [concurrency](MEASUREMENTS.md#concurrency) part after every other one: closed-loop
+clients sending the speed and held-out prompts at once. It is reported, not judged, and changes no single-stream
+figure.
 
 Quality needs the engine's own scores of the fixed texts, from the paths it serves with: `POST
 /v1/crit/score` on `crit serve` for packages declaring `chat-score-v1`
@@ -299,8 +312,8 @@ required context.
 | Stage | Adds | What it gives |
 |---|---|---|
 | 1 | each speed case once; quality on every set up to 2,048 tokens with the honesty check; the request history on the shortest speed case | decode, prefill and time to first token with its floor (`speed.ttft_floor_ms`, the shortest prompt's); the quality gate; the history gate; the memory the required context needs against what the load left free (`context.fit`); decode projected to the required context from every context measured (`context.creep`) |
-| 2 | the speed cases under 8,192 prompt tokens twice more; the follow-up turns; the longer quality sets and any stage 1 had no room for; the long-context curve's first point (32,768 tokens) and retrieval below it | the repetitions' spread; prompt-cache KPIs; long-text quality and the honesty check's long reply; long-context time to first token, decode and retrieval |
-| 3 | the sampled suite at two seeds after a warmup that serves the sampling check; exactness on the two shortest cases; the held-out prompts when a baseline measured them; the follow-up turns again; the speed cases once at the lower context | sampled decode and the sampling gate; exactness; the generality gate; the prompt-cache gate; the lower-context gate |
+| 2 | the speed cases under 8,192 prompt tokens once more, compared with their stage 1 request (a second and third time when they disagree); the follow-up turns; the longer quality sets and any stage 1 had no room for; the long-context curve's first point (32,768 tokens) and retrieval below it | the repetitions' spread; prompt-cache KPIs; long-text quality and the honesty check's long reply; long-context time to first token, decode and retrieval |
+| 3 | the sampled suite at one seed after a warmup that serves the sampling check; exactness on the two shortest cases; the held-out prompts when a baseline measured them; the follow-up turns again | sampled decode and the sampling gate; exactness; the generality gate; the prompt-cache gate |
 
 Stage 1 runs on every engine, but not blindly: after its first speed case it prices each further case and quality set
 at the rates measured so far, and leaves out one that would pass the budget (`over_budget`; a speed case left out
@@ -311,14 +324,51 @@ After stage 1 the run prices the next stages' requests at the rates the engine m
 ([estimate](../crit_eval/run/estimate.py)) and goes on to the highest that fits what is left of the budget; a part
 that would still pass it is skipped and named in `stages.skipped`. `--stage 1|2|3` caps how far a run goes.
 
-No stage serves the required context itself. The curve stops at its first point, retrieval at the points below
-it, and the capacity gate is unmeasured. `--certify`, for the candidate that will ship, runs stage 3 whatever the
-budget and one request at the requirement (the curve's last point, retrieval on its reply), which the capacity
-gate needs. An engine that serves the requirement serves every context below it, so the curve's middle points are
+After the request history's closing request a run measures the [concurrency](MEASUREMENTS.md#concurrency) part on a
+server that runs several requests at once, each level while it fits what is left of the budget (priced from the
+level before it); it changes no stage's choice.
+
+No stage serves the required context itself or opens a second engine. The curve stops at its first point,
+retrieval at the points below it, and the capacity and lower-context gates are unmeasured. `--certify`, for the
+candidate that will ship, runs stage 3 whatever the budget, one request at the requirement (the curve's last point,
+retrieval on its reply), which the capacity gate needs, and after the engine closes the speed cases once on an
+engine opened at the lower context, which the lower-context gate needs (stage 3 ran it in crit-eval 0.4). An engine that serves the requirement serves every context below it, so the curve's middle points are
 not measured.
 
 `--stage full` runs every part at the protocol's warmups and repetitions, as before stages; `--warmups` and
 `--repetitions` apply to it alone. A profile (`--profile hub`) fixes its own parts and has no stages.
+
+## Journal and resume
+
+A run journals its round beside its result: `--out R.json` writes `R.journal.jsonl`
+([journal.py](../crit_eval/run/journal.py)), one line per engine it opens, part it starts and request it serves
+(the method, a digest of its inputs, the tokens each streamed chunk delivered with its offset, the seconds and the
+result), each synced to disk the moment it completes, and a last line with how the round ended. A round that stops
+before its result (interrupted, crashed, a disturbed device, a hung engine, a failure) writes what it measured to
+`R.json`, marked `aborted` with its reason, and loses none of what its journal holds: a killed process leaves every
+line it completed.
+
+`--resume R.journal.jsonl` goes on from there in a new round (`--out` another result). It runs the suite from its
+first part, and while its requests are the journal's, in the same order with the same inputs, the journal answers
+them: their tokens are delivered again and the round's clock gives back the readings the earlier round took, in the
+order it took them, so every sample, gate, stage decision and budget check is made again from the same measurements,
+to the bit, and the budget counts the journal's seconds. An
+engine whose requests the journal holds is never loaded; one with requests left loads at its first live request
+(it must answer `info()` with the same name, max context and speculation), and its request deadline learns the
+journal's requests first. From the first request the journal does not hold, the round measures live; when the round
+takes another path than the journal's (a request with other inputs), the rest is live and the result says where
+(`journal.diverged`). A round that stopped on a disturbed device answers only up to the start of the part it stopped
+in, so the disturbed case is measured again. Host load (`host_other_cpu_cores`) is unmeasured over requests the
+journal answered.
+
+The journal answers only a round of the same identity: protocol and crit-eval version, model and suite, adapter
+bytes or server, configuration, parts, warmups and repetitions, stages and budget, required context, quality and
+exactness terms, and the caller's own (crit's run, candidate and package); `--resume` refuses another round's
+journal and names what differs. The resumed round's journal holds every line it answered (marked `replayed`), so it
+can be resumed in turn. The result records the journal (`journal`: its file, what it resumed and how that ended,
+requests answered and live, `diverged`). The request history and the follow-up comparison read a resumed round's
+first requests from the journal and its last from the engine loaded after it, so they also compare two loads of the
+same engine. `crit eval journal R.journal.jsonl` says how far a round got; `--no-journal` writes none.
 
 ## Protocol versions
 
@@ -327,15 +377,15 @@ Every prepared data directory and result records the protocol it ran under, `pro
 version 0.1.0, the protocol crit-eval was released with (until then `crit-eval-v8`, whose data is prepared again:
 adaptive sampled repetitions move the sampled decode score; the reference scores carry over, since their identity is
 the model, the texts and the reference version, not the protocol). Scores compare
-within one series: one minor version before 1.0 (0.1.x), one major version from 1.0 on. A change
-that can move a score starts the next series: the speed, held-out, quality or long-context cases
-and their prompts, output lengths, warmups and repetitions, aggregation, the quality thresholds or
-scoring rules, and any harness change that measures differently. Any other change to the protocol
-(wording, a reported-only field, a diagnostic) takes the next patch version. `compare` warns when
-results come from different series. Data prepared under one series runs under each of its versions
-as long as it froze the suite crit-eval ships; otherwise `run` and `ab` ask to prepare it again. A test
-pins every version to its protocol and suite, so an edit to either fails until it has a new
-version. A baseline compares only with results of its prepared data, suite and series. The ids
+within one series: one minor version before 1.0 (0.1.x), one major version from 1.0 on. Versions come with
+crit-eval's releases only, and the release names them: between releases every change to the protocol or the suite
+stays under the protocol id of the coming release, and nothing in a change picks a version. A change that can move a
+score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
+repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
+is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results
+come from different series. Data prepared under one series runs under each of its versions as long as it froze the
+suite crit-eval ships; otherwise `run` and `ab` ask to prepare it again. A test pins every released version to its
+protocol and suite, so a released protocol cannot change. A baseline compares only with results of its prepared data, suite and series. The ids
 before crit-eval's own releases (`crit-eval-v4` to `crit-eval-v8`) each form a series of their own
 major version.
 
@@ -357,7 +407,8 @@ with each score:
   reference` has stored the reference scores in the data directory.
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
   in plain-greedy equality against `--baseline` (status notes it) and any difference between
-  repeated identical requests are bugs until a root cause is shown ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)).
+  repeated identical requests are bugs until a root cause is shown ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)),
+  except, in quality mode `as_quantized`, a difference that parts at a near-tie ([forks](MEASUREMENTS.md#forks-in-quality-mode-as_quantized)).
   `requirements` records the drift budget and exactness mode used.
 - A result names what it measured and with what: `crit_eval_version`, `model` (its name, the Hugging
   Face repository and revision when the path shows them, format, architectures and quantization;
@@ -375,7 +426,11 @@ with each score:
 
 A round stops early when a speed case's measured decode speeds spread by more than the protocol's
 `disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
-The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.
+The spread is taken over the repetitions measured once the case reached steady state: requests whose speed still
+moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16
+(protocol `speed.steady_state`,
+[measurements](MEASUREMENTS.md)), and the case records them and the drift as `steady_state`. Repetitions that decoded different replies are
+compared only with repetitions of the same reply (`speed.output_varies`). The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.
 Measure again when the device is quiet; `--keep-disturbed` finishes the round anyway. Requests
 shorter than 100 ms are not judged, since timer jitter dominates them. Each speed case records
 `host_other_cpu_cores`, the CPU cores other processes kept busy while it ran (host busy time minus
@@ -416,7 +471,10 @@ crit eval workbench profile FOLDER [--python PY] [--ncu NCU]
 - **check** compares `candidate()` with `reference()` (FP64) on every shape and column count of kernel.json: the
   largest error relative to the reference's largest value within the tolerance, the same bits on two more calls
   (atomics, races and reads past a buffer fail it), and with `column_invariant` each column computed alone equal bit
-  for bit to the same column in the multi-column call, the property greedy speculation needs. Result: FOLDER/check.json;
+  for bit to the same column in the multi-column call, the property greedy speculation needs. A kernel declared
+  `"repeatable": false` in kernel.json (atomics, or a split the workload chooses, for an engine in quality mode
+  `as_quantized`, where near-tie output differences pass) has its repeats judged against the reference within the
+  tolerance instead of bit for bit (`repeat_relative_error`). Result: FOLDER/check.json;
   the command fails when any row does.
 - **bench** times `candidate()` and `yardstick()` with CUDA events after a quarter second of warm-up, cycling through
   enough input copies to exceed three times the L2 so weights come from memory, and reports the floor of each call

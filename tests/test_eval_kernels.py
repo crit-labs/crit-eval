@@ -37,6 +37,7 @@ class KernelTraceTest(unittest.TestCase):
             self.assertEqual(device, {"sms": 170, "name": "Test GPU"})
             self.assertEqual(found[0][0], 15_000)  # converted to the realtime clock
             self.assertEqual(kernels.read_traces(directory, "cupti")[0][0][0], 10_000)  # marks on the tracer's clock
+            self.assertEqual(kernels.read_traces(directory, "rocprofiler")[0][0][0], 10_000)  # the ROCm tracer's clock
             result = kernels.analyze(found, device, marks, {"tflops": {"fp8": 2000.0}, "bandwidth_gbs": 4000.0})
         prefill, decode = result["phases"]["prefill"], result["phases"]["decode"]
         self.assertEqual([r["kernel"] for r in prefill["kernels"]], ["gemm_kernel", "scan_kernel"])
@@ -170,6 +171,19 @@ class KernelTraceTest(unittest.TestCase):
     def test_internal_linkage_prefix(self):
         self.assertEqual(kernels._mangled("__nv_static_54__110d7f6d_27_f_cu_1f652c57_6886__ZN2ns1kEv"), "_ZN2ns1kEv")
         self.assertEqual(kernels._mangled("_ZN2ns1kEv"), "_ZN2ns1kEv")
+
+    def test_the_rocm_tracer_is_loaded_through_rocprofiler(self):
+        self.assertTrue(kernels.SOURCES["hip"].is_file())
+        # The child finds the tracer's clock through the variable the backend's runtime loads it from.
+        with patch.dict(kernels.os.environ, {"CRIT_KTRACE_BACKEND": "hip", "ROCP_TOOL_LIBRARIES": "/no/such/library.so"}):
+            self.assertEqual(kernels.tracer_clock()[1], "realtime")   # no library: the host's clock
+        with patch.object(kernels.sys, "platform", "linux"), patch.object(kernels, "find_rocm",
+                                                                         side_effect=SystemExit("no ROCm")) as found:
+            with self.assertRaises(SystemExit):
+                kernels.trace("a.py", "m", "d", "o", backend="hip", hipcc="/opt/rocm/bin/hipcc")
+            found.assert_called_once_with("/opt/rocm/bin/hipcc")
+        with patch.object(kernels.sys, "platform", "linux"), self.assertRaises(SystemExit):
+            kernels.trace("a.py", "m", "d", "o", backend="metal")
 
 
 if __name__ == "__main__":

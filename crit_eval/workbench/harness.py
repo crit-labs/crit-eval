@@ -53,8 +53,15 @@ def check(kernel, spec, shapes):
                                               for c, a in enumerate(alone))
                 row["passed"] = row["passed"] and row["column_invariant"]
             # Determinism: the same inputs again give the same bits (catches atomics, races and reads past a buffer).
-            row["repeatable"] = all(torch.equal(kernel.candidate(data), found) for _ in range(2))
-            row["passed"] = row["passed"] and row["repeatable"]
+            # A kernel declared repeatable false (kernel.json; atomics or a split chosen by the workload, for engines
+            # in quality mode as_quantized) has each repeat judged against the reference within tolerance instead.
+            again = [kernel.candidate(data) for _ in range(2)]
+            row["repeatable"] = all(torch.equal(a, found) for a in again)
+            if spec.get("repeatable", True):
+                row["passed"] = row["passed"] and row["repeatable"]
+            else:
+                row["repeat_relative_error"] = max(relative_error(a, kernel.reference(data)) for a in again)
+                row["passed"] = row["passed"] and row["repeat_relative_error"] <= spec["tolerance"]
             failed += not row["passed"]
             rows.append(row)
             print(f"{'ok  ' if row['passed'] else 'FAIL'} shape {shape} columns {columns}: relative error {error:.2e}, "

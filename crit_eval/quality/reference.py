@@ -40,7 +40,8 @@ weights unquantized or in any scheme of crit_eval.limits.schemes (FP8, NVFP4, co
 bitsandbytes, ONNX Runtime's MatMulNBits), each decoded to exactly the FP32 values its own library produces.
 A GGUF (a lone .gguf, a split set or a folder holding one) is read through crit_eval.architectures.gguf_layout:
 every block type gguf-py decodes, with GGUF's reference converter layout undone per architecture, and the
-config.json its metadata derives (crit_core.model.gguf_files) unless its folder has the base model's.
+config.json its metadata derives (crit_core.model.gguf_files, by crit_eval.architectures.gguf_config's rules) unless
+its folder has the base model's.
 Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
 run once per prepared data.
 
@@ -257,9 +258,14 @@ class StreamingReference:
         self.inputs, self.head_inputs = {}, None
         # Chunked attention allocates a score block of another width for every block of query rows; torch's default
         # segments then fragment until the device is full (a 32K-token text on a 31B model), while expandable
-        # segments reuse the memory. Read when the process first allocates on the device; arithmetic is unchanged.
-        os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+        # segments reuse the memory; arithmetic is unchanged. Set on this process's allocator, not in its environment:
+        # processes it starts (crit run eval's crit serve) inherit the environment, and their engines would run in a
+        # memory layout they never asked for.
         import torch
+        if "PYTORCH_ALLOC_CONF" not in os.environ and "PYTORCH_CUDA_ALLOC_CONF" not in os.environ:
+            setting = getattr(torch._C, "_accelerator_setAllocatorSettings", None) or \
+                torch.cuda.memory._set_allocator_settings
+            setting("expandable_segments:True")
         from transformers import AutoModel
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -369,8 +375,32 @@ class StreamingReference:
         (tensor,) = inputs.values()
         if joined:
             suffix = next(key[len(base):] for base, key in next(iter(parts.values())))
-            tensor = dense(_Substituted(self.checkpoint, {target + suffix: tensor}), target, device)
+            replace = {target + suffix: tensor}
+            for companion, keys in self._companions(name).items():
+                replace[target + companion] = self.torch.cat([self.checkpoint.raw(key).to(device) for key in keys])
+            tensor = dense(_Substituted(self.checkpoint, replace), target, device)
         return tensor.float()
+
+    def _companions(self, name):
+        """{suffix: [stored key per part]} of the per-row tensors (such as scales) that each part of the converted
+        parameter `name` stores beside its matrix and its target does not: a table stored in shards, each shard with
+        its own row scales, the target only with the global one. Joined along the rows like the parts, which they
+        are only when the converter concatenates the parts along their rows."""
+        from transformers.core_model_loading import Concatenate
+        converter, parts = self.converted[name]
+        operations = converter.operations
+        if len(parts) != 1 or len(operations) != 1 or not isinstance(operations[0], Concatenate) or operations[0].dim:
+            return {}
+        target, sources = self._target(name), next(iter(parts.values()))
+        found = {}
+        for base, key in sources:
+            rows = self.checkpoint.header(key).shape[0]
+            for member in self.members.get(base, ()):
+                companion = member[len(base):]
+                if (member != key and not self.checkpoint.has(target + companion)
+                        and tuple(self.checkpoint.header(member).shape)[:1] == (rows,)):
+                    found.setdefault(companion, []).append(member)
+        return {companion: keys for companion, keys in found.items() if len(keys) == len(sources)}
 
     def _tensor(self, name, value):
         """Parameter or persistent buffer `name` (a modeling-code name) on the device: floating point in FP32, other
@@ -407,25 +437,28 @@ class StreamingReference:
         from ..limits.schemes import dense
         return dense(_Substituted(self.checkpoint, gathered), base, self.device)
 
-    def _gather_rows(self, base, primary, index, full_rows, rows=None):
+    def _gather_rows(self, base, primary, index, full_rows, rows=None, companions=None):
         """FP32 rows `index` of matrix `base` (stored key `primary`), on the device: its stored rows (or `rows`,
-        already gathered) decoded with its scales, per-row scales gathered alike."""
+        already gathered) decoded with its scales, per-row scales gathered alike (or given, already gathered, in
+        `companions` {key: rows})."""
         keys = self._row_keys(base, primary, full_rows)
         wanted = keys if rows is None else keys[1:]
         gathered = dict(zip(wanted, self.checkpoint.rows_many([(key, index) for key in wanted])))
         if rows is not None:
             gathered[primary] = rows
+        gathered.update(companions or {})
         return self._decode_rows(base, gathered)
 
     def _primary(self, base):
         return next((base + s for s in PRIMARY if self.checkpoint.has(base + s)), None)
 
-    def _gatherable(self, base, primary, rows=None):
-        """Whether matrix `base` is stored as rows of the table (GATHERABLE schemes)."""
+    def _gatherable(self, base, primary, rows=None, companions=None):
+        """Whether matrix `base` is stored as rows of the table (GATHERABLE schemes); `rows` and `companions` stand
+        for its joined parts."""
         from ..limits.schemes import scheme
         if primary is None:
             return False
-        view = self.checkpoint if rows is None else _Substituted(self.checkpoint, {primary: rows})
+        view = self.checkpoint if rows is None else _Substituted(self.checkpoint, {primary: rows, **(companions or {})})
         return scheme(view, base) in GATHERABLE
 
     def _row_source(self, name):
@@ -474,19 +507,29 @@ class StreamingReference:
             header = self.checkpoint.header(first)
             dtype = getattr(torch, next(name for name, short in TORCH_DTYPES.items() if short == header.dtype))
             meta = torch.empty((sum(sizes), *header.shape[1:]), device="meta", dtype=dtype)
-            if not self._gatherable(target, target + suffix, meta):
+            companions = self._companions(name)
+            metas = {}
+            for column, keys in companions.items():
+                part = self.checkpoint.header(keys[0])
+                kind = getattr(torch, next(name for name, short in TORCH_DTYPES.items() if short == part.dtype))
+                metas[target + column] = torch.empty((sum(sizes), *part.shape[1:]), device="meta", dtype=kind)
+            if not self._gatherable(target, target + suffix, meta, metas):
                 return None
 
             def joined(index):
                 part = torch.searchsorted(ends, index, right=True)
                 picks = [(part == j, j) for j in part.unique().tolist()]
-                rows = None
-                for (where, j), found in zip(picks, self.checkpoint.rows_many(
-                        [(sources[j][1], index[where] - (ends[j] - sizes[j])) for where, j in picks])):
-                    if rows is None:
-                        rows = torch.empty((len(index), *found.shape[1:]), dtype=found.dtype)
-                    rows[where] = found
-                return self._gather_rows(target, target + suffix, index, sum(sizes), rows)
+                gathered = {}
+                for column, keys in ((suffix, [key for _, key in sources]), *companions.items()):
+                    rows = None
+                    for (where, j), found in zip(picks, self.checkpoint.rows_many(
+                            [(keys[j], index[where] - (ends[j] - sizes[j])) for where, j in picks])):
+                        if rows is None:
+                            rows = torch.empty((len(index), *found.shape[1:]), dtype=found.dtype)
+                        rows[where] = found
+                    gathered[target + column] = rows
+                rows = gathered.pop(target + suffix)
+                return self._gather_rows(target, target + suffix, index, sum(sizes), rows, gathered)
             return joined
         if not all(self._gatherable(base, key) for base, key in sources):
             return None
@@ -1363,13 +1406,14 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
     return how
 
 
-def score_data(model, data, log=print, check=lambda: None, quality_mode=None):
+def score_data(model, data, log=print, check=lambda: None, quality_mode=None, allowance=False):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
-    store the scores under the data (crit_eval.quality.fixed), with the reference's own spread and, for a checkpoint
-    that declares quantized activations, the as_quantized allowance (store_allowance), unless they are stored already
-    under the same identity: one run serves both quality modes (quality_mode is accepted from callers of earlier
-    versions and changes nothing). check() runs between layers and texts: it raises to stop. Returns how they were
-    obtained."""
+    store the scores under the data (crit_eval.quality.fixed), with the reference's own spread, unless they are stored
+    already under the same identity: one run serves both quality modes (quality_mode is accepted from callers of
+    earlier versions and changes nothing). allowance: also measure, for a checkpoint that declares quantized
+    activations, how far the checkpoint run with them quantized lands from the scores (store_allowance), a second
+    scoring pass whose result is reported, not judged (protocol quality.allowance). check() runs between layers and
+    texts: it raises to stop. Returns how they were obtained."""
     from . import fixed
     protocol = load_json(EVAL_DIR / "protocol.json")
     prepared = load_json(Path(data) / PREPARED)
@@ -1381,6 +1425,8 @@ def score_data(model, data, log=print, check=lambda: None, quality_mode=None):
     out = store_texts(reference, texts, top_k, prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log,
                       check=check, spread=protocol["quality"].get("spread"), layout=layout,
                       budget=protocol["quality"]["thresholds"])
+    if not allowance:
+        return out
     identity = dict(reference.identity(prepared["model"]["sha256"]), **fixed.identity(texts, top_k, prepared["valid_vocab"]))
     try:
         declared = reference.declared_activations()

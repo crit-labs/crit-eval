@@ -37,13 +37,13 @@ class StagedRunTests(unittest.TestCase):
             result = run(directory)
         self.assertEqual(result["stages"]["reached"], 3)
         self.assertFalse(result["stages"]["certify"])
-        # The stage 1 request is the warmup of each short case's two repetitions (the fixture has no long prompt); a
-        # third follows when the two disagree (protocol speed.extra_repetition), as the mock's sub-ms timings may.
+        # The stage 1 request is the warmup of each short case's repetition (the fixture has no long prompt); a second
+        # and third follow when they disagree (protocol speed.extra_repetition), as the mock's sub-ms timings may.
         for case in result["speed"]["cases"].values():
-            self.assertEqual([s["warmup"] for s in case["samples"]][:3], [True, False, False])
+            self.assertEqual([s["warmup"] for s in case["samples"]][:2], [True, False])
             self.assertLessEqual(len(case["samples"]), 4)
         self.assertEqual(result["sampled_speed"]["status"], "measured")
-        self.assertEqual(result["sampled_speed"]["repetitions"], 2)
+        self.assertEqual(result["sampled_speed"]["repetitions"], 1)
         # Exactness on the two shortest cases, on the shared engine.
         self.assertEqual(sorted(result["exactness"]["cases"]), ["long", "short"])
         # The curve stops at its first point: no request fills the required context, so capacity is unmeasured.
@@ -53,18 +53,20 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual(gate(result, "capacity")["state"], "unmeasured")
         self.assertIn("--certify", gate(result, "capacity")["detail"])
         self.assertEqual(gate(result, "retrieval")["state"], "pass")
-        # The lower context ran once, after the engine at the requirement closed.
-        self.assertIn("lower_context", result["timing"]["parts"])
-        self.assertEqual(list(result["timing"]["parts"])[-1], "lower_context")
-        self.assertEqual(result["context"]["lower"]["context"], 16384)
-        self.assertEqual(sorted(result["context"]["lower"]["cases"]), ["long", "short"])
+        # The lower context opens a second engine: a certified run's alone.
+        self.assertNotIn("lower_context", result["timing"]["parts"])
+        self.assertIsNone(result["context"]["lower"]["context"])
+        self.assertEqual(gate(result, "lower_context")["state"], "unmeasured")
+        self.assertIn("--certify", gate(result, "lower_context")["detail"])
         # The request history repeats the shortest case alone.
         self.assertEqual(list(result["history"]["cases"]), ["short"])
         # The held-out prompts need a baseline that measured them.
         self.assertEqual(result["heldout"]["status"], "skipped")
         # What stage 1 gives without a long prompt: decode projected to the requirement and the TTFT floor.
         creep = result["context"]["creep"]
-        self.assertEqual(creep["measured_up_to"], 32768)
+        # The curve's first point fills its drawn share of 32,768 tokens (protocol jitter).
+        self.assertEqual(creep["measured_up_to"], result["context"]["points"]["32768"]["filled_context"])
+        self.assertTrue(0.8 * 32768 <= creep["measured_up_to"] <= 32768)
         self.assertTrue(creep["extrapolated"])
         self.assertIsNotNone(creep["decode_tps_at_requirement"])
         self.assertEqual(result["speed"]["ttft_floor_case"], "short")
@@ -119,6 +121,11 @@ class StagedRunTests(unittest.TestCase):
         self.assertTrue(result["context"]["certified"])
         self.assertEqual(gate(result, "capacity")["state"], "pass")
         self.assertTrue(result["context"]["retrieval"]["points"][str(REQUIRED)]["passed"])
+        # The lower context ran once, after the engine at the requirement closed.
+        self.assertEqual(list(result["timing"]["parts"])[-1], "lower_context")
+        self.assertEqual(result["context"]["lower"]["context"], 16384)
+        self.assertEqual(sorted(result["context"]["lower"]["cases"]), ["long", "short"])
+        self.assertNotEqual(gate(result, "lower_context")["state"], "unmeasured")
 
     def test_stage_full_runs_the_parts_as_before_stages(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -126,6 +133,7 @@ class StagedRunTests(unittest.TestCase):
         self.assertIsNone(result["stages"])
         self.assertEqual(list(result["context"]["points"]), ["32768", str(REQUIRED)])
         self.assertEqual(gate(result, "capacity")["state"], "pass")
+        self.assertEqual(result["context"]["lower"]["context"], 16384)   # without --certify, as before stages
 
     def test_certify_is_for_a_staged_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -150,12 +158,15 @@ class StagePlanTests(unittest.TestCase):
         planned = self.plan()
         self.assertEqual(len(planned[1]["speed"]), 2)
         self.assertEqual([r[0] for r in planned[1]["quality"]], [30, 30, 30])   # the text, the reply, its score
-        self.assertEqual(len(planned[2]["speed"]), 2)    # the short case twice more, the long one not again
+        self.assertEqual(len(planned[2]["speed"]), 1)    # the short case once more, the long one not again
         self.assertEqual(planned[2]["context"], [(32768 - 256, 256, 0, False)])
         self.assertEqual(planned[2]["retrieval"][0][0] + planned[2]["retrieval"][0][1], 4096)
-        self.assertEqual(len(planned[3]["sampled_speed"]), 6)   # a warmup and two seeds per case
+        self.assertEqual(len(planned[3]["sampled_speed"]), 4)   # a warmup and one seed per case
+        self.assertNotIn("lower_context", planned[3])
         self.assertEqual(planned["certify"], {})
-        self.assertEqual(self.plan(certify=True)["certify"]["context"], [(200000 - 256, 256, 0, False)])
+        certified = self.plan(certify=True)["certify"]
+        self.assertEqual(certified["context"], [(200000 - 256, 256, 0, False)])
+        self.assertEqual(len(certified["lower_context"]), 2)   # each speed case once at the lower context
 
     def test_the_budget_picks_the_highest_stage_that_fits(self):
         planned = self.plan()

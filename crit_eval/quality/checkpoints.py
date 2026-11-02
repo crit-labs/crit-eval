@@ -355,7 +355,7 @@ def _text_config(model):
         if data.get("model_type") not in CONFIG_MAPPING:
             raise SystemExit(f"{model}: the config derived from the GGUF names no transformers model type "
                              f"({data.get('model_type')!r}); the reference needs config rules for its architecture "
-                             "(crit_core.model.gguf_files) or the base model's config.json beside it")
+                             "(crit_eval.architectures.gguf_config) or the base model's config.json beside it")
         config = CONFIG_MAPPING[data["model_type"]].from_dict(data)
     else:
         config = AutoConfig.from_pretrained(str(source.folder or model))

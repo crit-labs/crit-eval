@@ -1,6 +1,5 @@
-"""Qwen3.8-Flash-Next GGUFs (architecture "qwen4exp"): the config.json their metadata derives
-(crit_core.model.gguf_qwen4exp) and the reference's layout (crit_eval.architectures.gguf_qwen4exp), with the n-gram table read by
-rows (GgufCheckpoint.row_source).
+"""Qwen3.8-Flash-Next GGUFs (architecture "qwen4exp"): the config.json their metadata derives and the reference's
+layout (crit_eval.architectures.gguf_qwen4exp), with the n-gram table read by rows (GgufCheckpoint.row_source).
 
 The conformance test converts a tiny transformers Qwen4Exp with GGUF's reference converter and needs a checkout of it
 whose converter and gguf-py know qwen4exp (CRIT_LLAMA_CPP=/path/to/the/checkout) plus torch, transformers with
@@ -22,7 +21,7 @@ for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import GgufError, inspect_gguf_model  # noqa: E402
 from crit_core.model.gguf import TensorInfo  # noqa: E402
 from crit_core.model.gguf_files import derive_config  # noqa: E402
-from crit_core.model.gguf_qwen4exp import head_vocab_sizes, layer_multipliers  # noqa: E402
+from crit_eval.architectures.gguf_qwen4exp import head_vocab_sizes, layer_multipliers  # noqa: E402
 from gguf_writer import ARRAY, INT32, UINT64, gguf_bytes  # noqa: E402
 import test_eval_gguf as base  # noqa: E402   (by module: its own test classes stay in its own module)
 

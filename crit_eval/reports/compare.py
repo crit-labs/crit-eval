@@ -114,6 +114,23 @@ def compare(paths):
             cells.append("–" if not ceiling else f"{ceiling:.1f}" + (f" (at {fraction:.0%})" if fraction else ""))
         rows.append(("Decode ceiling" + (" (sampled)" if any((r.get("headroom") or {}).get("decode_suite") == "sampled"
                                                             for r in results) else ""), cells))
+    # The concurrency part's aggregate per level (protocol concurrency; reported, not judged).
+    levels = sorted({int(n) for r in results for n in ((r.get("concurrency") or {}).get("levels") or {})})
+    for clients in levels:
+        cells = []
+        for r in results:
+            row = ((r.get("concurrency") or {}).get("levels") or {}).get(str(clients))
+            if not row:
+                cells.append("–")
+                continue
+            cell = "not qualified" if not row.get("aggregate_tps") else f"{row['aggregate_tps']:,.1f}"
+            if row.get("fraction_of_ceiling"):
+                cell += f" ({row['fraction_of_ceiling']:.0%} of ceiling)"
+            consistency = (row.get("consistency") or {}).get("fraction")
+            if consistency is not None and consistency < 1:
+                cell += f", {consistency:.0%} equal serial"
+            cells.append(cell)
+        rows.append((f"Concurrency {clients} clients (aggregate tok/s)", cells))
     sets_seen = []
     for r in results:
         for name in (r.get("quality") or {}).get("sets") or {}:

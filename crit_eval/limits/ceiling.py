@@ -31,6 +31,7 @@ from crit_core.model import open_model, parse_model_config
 from crit_core.model.gguf import TYPE_BY_NAME, TensorInfo as GgufTensor
 
 from .schemes import PRIMARY, quantization_of, refuse_unread, stored
+from .tiers import prompt_host
 from .tensors import tensor_role
 
 
@@ -150,19 +151,54 @@ def model_ceiling(model):
 
 
 RATE_SOURCES = (("tflops", "cuBLASLt GEMM"), ("mma_tflops", "raw MMA"))
+# The GEMM library each backend's probe times; its raw rates are the backend's matrix instructions.
+GEMM_LIBRARIES = {"cuda": "cuBLASLt GEMM", "hip": "hipBLASLt GEMM", "metal": "MPS GEMM", "vulkan": "cooperative-matrix GEMM"}
+# Rate keys whose matrix units a CUDA device has from a compute capability on: E4M3 MMA from 8.9, the block-scaled FP4
+# MMA on 10.x and 12.x (sm_100a, sm_120a, sm_121a), not on 9.0 or 11.x. Probes of other backends list the formats
+# their device lacks themselves (unsupported_formats).
+CUDA_FORMATS = {"fp8": lambda cc: cc >= (8, 9), "nvfp4": lambda cc: cc[0] in (10, 12),
+                "fp4_fp8": lambda cc: cc[0] in (10, 12)}
+WIDENED = "BF16 rate (no matrix units for this format)"
+
+
+def device_backend(device):
+    """The device API a `crit eval probe` result measured: its backend, cuda for a probe from before backends."""
+    return (device or {}).get("backend") or "cuda"
+
+
+def unsupported_formats(device):
+    """Rate keys the probed device has no matrix units for: the probe's unsupported_formats, or for a CUDA probe that
+    does not list them, those its compute capability lacks (CUDA_FORMATS). [] when it cannot tell."""
+    device = device or {}
+    if device.get("unsupported_formats") is not None:
+        return list(device["unsupported_formats"])
+    if device_backend(device) != "cuda":
+        return []
+    try:
+        cc = tuple(int(part) for part in str(device.get("compute_capability")).split("."))[:2]
+    except ValueError:
+        return []
+    return [key for key, has in CUDA_FORMATS.items() if len(cc) == 2 and not has(cc)]
 
 
 def best_rates(device):
     """The best achievable TFLOPS per format of a `crit eval probe` result, and what achieved each: {key: tflops} and
-    {key: "cuBLASLt GEMM" or "raw MMA"}. cuBLASLt's GEMMs (bf16, fp8, nvfp4) are not every device's best kernels
-    (an RTX 5090's BF16 GEMM reaches 185 TFLOPS where its BF16 tensor cores run 252), so each format takes the larger
-    of its GEMM rate and its raw tensor-core rate (bf16, fp16, fp16_acc, fp8, nvfp4, fp4_fp8). A probe from before
-    the raw rates has GEMM rates alone."""
+    {key: "cuBLASLt GEMM", "raw MMA" or WIDENED}. cuBLASLt's GEMMs (bf16, fp8, nvfp4) are not every device's best
+    kernels (an RTX 5090's BF16 GEMM reaches 185 TFLOPS where its BF16 tensor cores run 252), so each format takes the
+    larger of its GEMM rate and its raw tensor-core rate (bf16, fp16, fp16_acc, fp8, nvfp4, fp4_fp8). A probe from
+    before the raw rates has GEMM rates alone. A format the device has no matrix units for (unsupported_formats: FP8 on
+    an RTX 3090, FP4 on an RTX 4090 or most AMD and Apple GPUs) is priced at the BF16 rate, as engines there widen its
+    weights to 16 bits for the GEMM; a format merely missing from an old probe stays unpriced."""
     rates, sources = {}, {}
+    library = GEMM_LIBRARIES.get(device_backend(device), RATE_SOURCES[0][1])
     for key, source in RATE_SOURCES:
         for name, value in ((device or {}).get(key) or {}).items():
             if value and value > rates.get(name, 0):
-                rates[name], sources[name] = value, source
+                rates[name], sources[name] = value, library if key == "tflops" else source
+    if rates.get("bf16"):
+        for name in unsupported_formats(device):
+            if not rates.get(name):
+                rates[name], sources[name] = rates["bf16"], WIDENED
     return rates, sources
 
 
@@ -240,20 +276,34 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
     attention_rate = max(tflops["bf16"], tflops.get("fp8") or 0)
     attention = pairs * (ceiling.get("attention_flops_per_pair") or 0) / (attention_rate * 1e12) * 1000
     recurrent = n * (ceiling.get("recurrent_flops_per_token") or 0) / (tflops["bf16"] * 1e12) * 1000
-    return {"matmul_ms": matmul, "attention_ms": attention, "recurrent_ms": recurrent,
-            "total_ms": matmul + attention + recurrent, "matmul_by_format": by_format}, []
+    compute = matmul + attention + recurrent
+    out = {"matmul_ms": matmul, "attention_ms": attention, "recurrent_ms": recurrent, "total_ms": compute,
+           "matmul_by_format": by_format}
+    # Weights off the device (ceiling's tiers, protocol headroom.tiers): the prompt also moves them, alongside its
+    # arithmetic, and takes the longer of the two.
+    host = prompt_host(ceiling.get("tiers"), n, (ceiling.get("tiers") or {}).get("engine_hit_rate"))
+    if host:
+        out.update(compute_ms=compute, host=host, total_ms=max(compute, host["host_ms"]),
+                   bound="host" if host["host_ms"] > compute else "compute")
+    return out, []
 
 
 def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None, activations=None):
     """Floor of the time to first token: the larger of the prompt's compute floor (with the quantized formats'
     activations, prefill_floor_ms) and one read of the weights (bytes_per_pass when the adapter declares it) plus the
-    prompt's KV writes."""
+    prompt's KV writes. With the ceiling's tiers (protocol headroom.tiers) the weights off the device are read from host
+    memory instead, on their faster path (tiers.prompt_host), and the floor takes the longest of the three."""
     compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens, activations)
     weights = bytes_per_pass or (ceiling or {}).get("weight_bytes")
     if not weights or not bandwidth_gbs:
         missing = missing + ["device bandwidth (--device)" if not bandwidth_gbs else "model weight bytes (re-run prepare)"]
     if missing:
         return None, missing
-    memory = (weights + (ceiling.get("kv_bytes_per_token") or 0) * prompt_tokens) / (bandwidth_gbs * 1e9) * 1000
-    return {"compute_ms": compute["total_ms"], "memory_ms": memory, "total_ms": max(compute["total_ms"], memory),
-            "bound": "compute" if compute["total_ms"] >= memory else "memory"}, []
+    host = compute.get("host")
+    arithmetic = compute.get("compute_ms", compute["total_ms"])
+    on_device = max(0, weights - host["host_bytes"]) if host else weights
+    memory = (on_device + (ceiling.get("kv_bytes_per_token") or 0) * prompt_tokens) / (bandwidth_gbs * 1e9) * 1000
+    parts = {"compute": arithmetic, "memory": memory, **({"host": host["host_ms"]} if host else {})}
+    bound = max(parts, key=parts.get)
+    return {"compute_ms": arithmetic, "memory_ms": memory, **({"host_ms": host["host_ms"], "host": host} if host else {}),
+            "total_ms": parts[bound], "bound": bound}, []

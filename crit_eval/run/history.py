@@ -6,10 +6,17 @@ from .timing import timed_generate
 
 def run_followup(engine, info, prepared, protocol, log):
     """protocol followup: the conversation's turns in order, each allowed a prompt cache, with time to first token,
-    the prompt tokens the engine reports as cached and the prefill rate of the rest."""
+    the prompt tokens the engine reports as cached and the prefill rate of the rest. An engine that declares it keeps
+    no prompt cache (info prompt_cache false) is not sent them: each turn would be a fresh prefill the speed cases
+    already measure, and its answer the one the fresh path gives (no_prompt_cache; the prompt_cache gate passes).
+    Cached tokens of 0 are no such declaration: an exact-prompt cache serves only the turns' second pass."""
     turns, n = prepared.get("followup"), int(protocol["followup"]["output_tokens"])
     if not turns:
         return {"status": "missing", "reason": "the prepared data has no follow-up turns; prepare it again"}
+    if info.get("prompt_cache") is False:
+        reason = "the engine declares no prompt cache (prompt_cache false)"
+        log(f"followup: not run ({reason})")
+        return {"status": "skipped", "no_prompt_cache": True, "reason": reason}
     if len(turns[-1]["prompt_ids"]) + n > info["max_context"]:
         reason = f"its last turn needs {len(turns[-1]['prompt_ids']) + n:,} tokens of context"
         log(f"followup: skipped ({reason})")
@@ -40,7 +47,9 @@ def compare_followup(first, again):
         if diverge is None and len(before["tokens"]) != len(after["tokens"]):
             diverge = min(len(before["tokens"]), len(after["tokens"]))
         turns[str(before["turn"])] = {"identical": diverge is None, "first_difference": diverge,
-                                      "cached_tokens": after["cached_tokens"]}
+                                      "cached_tokens": after["cached_tokens"],
+                                      # both outputs when they differ, for the fork judge (protocol forks)
+                                      **({} if diverge is None else {"first": before["tokens"], "again": after["tokens"]})}
     return {"turns": turns, "passed": bool(turns) and all(t["identical"] for t in turns.values())}
 
 

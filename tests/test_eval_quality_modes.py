@@ -111,9 +111,9 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(activations(Stored(modelopt, {"quant_method": "modelopt"}), "model.layers.0.mlp.up_proj"),
                          ("nvfp4", 4.0))
 
-    def test_as_quantized_judges_by_twice_the_preserve_budget(self):
-        # protocol quality.mode_thresholds: 4-bit activation math swings KL far more than exact activations, so
-        # as_quantized's budget is twice preserve's; a run's own limits lay over either mode's.
+    def test_as_quantized_judges_by_eight_times_the_preserve_budget(self):
+        # protocol quality.mode_thresholds: as_quantized is the mode for speed; its budget is a floor that keeps out a
+        # broken engine, eight times preserve's; a run's own limits lay over either mode's.
         from crit_eval import load_json, EVAL_DIR
         from crit_eval.run import quality_checks
         protocol = load_json(EVAL_DIR / "protocol.json")
@@ -121,8 +121,8 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(preserve, {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5})
         self.assertEqual(quality_checks.quality_thresholds(protocol, mode="preserve"), preserve)
         quantized = quality_checks.quality_thresholds(protocol, mode="as_quantized")
-        self.assertEqual(quantized, {"ppl_ratio_max": 1.1, "kld_mean_max": 0.1, "kld_p99_max": 1.0})
-        self.assertAlmostEqual(quantized["ppl_ratio_max"] - 1, 2 * (preserve["ppl_ratio_max"] - 1))
+        self.assertEqual(quantized, {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0})
+        self.assertAlmostEqual(quantized["ppl_ratio_max"] - 1, 8 * (preserve["ppl_ratio_max"] - 1))
         self.assertEqual(quality_checks.quality_thresholds(protocol, {"kld_p99_max": 0.8}, "as_quantized"),
                          {**quantized, "kld_p99_max": 0.8})
 

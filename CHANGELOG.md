@@ -9,6 +9,249 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-02
+
+### Overview
+
+crit-eval 0.5.0 starts protocol series crit-eval-v0.5. The protocol changes since 0.4.1: a run measures fewer
+repetitions (one greedy repetition, one sampled seed per case, held-out prompts at 64 tokens once) at steady state, and
+reports stalls, a fixed-denominator decode fraction and tool-call validity; only a certified run opens the lower-context
+engine, and an engine that declares no prompt cache is sent no follow-up turns. The held-out prompts and the
+long-context curve's points below the requirement are measured at lengths each run draws. Quality mode `as_quantized` is
+the mode for speed: its budget is eight times preserve's, runs no longer need the allowance, and it passes replies that
+fork at a near-tie and served and scored paths that differ within a bound. Reported only: the concurrency part, memory
+tiers in the floors, the closed track's checks and the pricing of several GPUs as one device. Results do not compare
+with 0.4.x ones, and data prepared under 0.4.x is prepared again; the reference scores carry over.
+
+### Added
+
+- Forks in quality mode `as_quantized` (protocol `forks`, [measurements](docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)):
+  an output difference the `repeatable`, `request_history` or `prompt_cache` gate records passes when the two
+  replies part at a near-tie. crit-eval scores the shared prefix once through the engine's scoring path, and the other
+  reply's token must be among the top 16 within 2 nats of the first. An engine whose arithmetic depends on what it
+  served before (experts on the CPU or the device, a cache's state) can then run 4-bit formats as it likes, while a
+  fork one token clearly wins, a stale cache entry or a race, still fails. `preserve` is unchanged.
+- In `as_quantized` the quality honesty check bounds the served and scored paths instead of asking for the same values
+  (protocol `quality.honesty.modes`): each log-probability within 2 nats, and each reply's mean difference within 0.1
+  nats. Paths that round apart where the engine's arithmetic depends on what it served before no longer fail quality.
+- The kernel workbench's check accepts a kernel declared `"repeatable": false` in kernel.json (atomics, or a split the
+  workload chooses, for `as_quantized` engines): its repeats are judged against the FP64 reference within the
+  tolerance (`repeat_relative_error`) instead of bit for bit.
+- Output that varies (protocol `speed.output_varies`): a speed case whose measured repetitions decoded different
+  greedy replies is measured over them, with the disturbed check comparing repetitions of the same reply only, and
+  records `output_varies` (the distinct replies and their decode spread); the repeatable gate fails on it as before.
+  Before, such an engine stopped the round as a disturbed device and got no result.
+- Fresh decode (protocol `speed.fresh_decode`, reported, not judged): each suite records `fresh_decode_score`, the
+  geometric mean of every case's first request before its warmups, and `status` shows it beside the decode score
+  when they differ by more than 10%. Steady state measures a prompt the engine has just served, which an engine with
+  an adaptive expert cache, or one that drafts from its earlier replies, decodes faster than a new one.
+- A decode above its ceiling says why in `status`: the ceiling priced the expert cache at even routing, or counted one
+  token per pass, because the engine reported no `expert_reads`/`expert_hits` or `accepted`. Any OpenAI-compatible
+  server can stream them in a `crit_telemetry` object, as crit serve does.
+- Several GPUs (protocol `context.devices`, [measurements](docs/MEASUREMENTS.md#several-gpus)):
+  `crit eval probe --devices all|N,M` measures every GPU and the copy rate between each pair (the CUDA probe's
+  `--device`, `--count` and `--peer` modes). A run with that device file counts the members' memory together for the
+  max context, prices its floors as one device by the faster split of the weights (tensor, with two all-reduces per
+  layer over the slowest link, or pipeline, with its hand-overs) and the members' summed rates, and samples device
+  memory on every member; the result records the members and the split (`device.device_set`). Checked on one GPU (the
+  probe's device and peer modes, device 0 to itself) and with host tests; nothing ran on two GPUs. Before, Eval
+  probed and priced GPU 0 alone.
+- Closed and open tracks (protocol `tracks`, [measurements](docs/MEASUREMENTS.md#closed-and-open-tracks)):
+  a result's `track.closed` checks what a run shows of the closed track, which fixes the choices that move scores for
+  reasons other than engine work: the quality mode (preserve), one load for the run (a served engine's `/health`
+  `engine_loads` unchanged from its first request to its last; served engines answer `loads()`), and a drafter that
+  reads no more per step than the checkpoint's own draft layers (`draft_step_bytes`). It qualifies when every check
+  passes; the submitter's card declares the rest. `status` names the checks. Before, nothing told a result that kept
+  the checkpoint's own choices from one that tuned them.
+- A result names a checkpoint in crit pull's engine store (`models/<org>--<repository>@<revision>`) by its Hugging
+  Face repository and revision, as it does a hub cache's, so a result from `crit bench` says which checkpoint it ran.
+- Memory tiers in the floors (protocol `headroom.tiers`,
+  [measurements](docs/MEASUREMENTS.md#memory-tiers)): the weights the model files' placement leaves off the device
+  are priced at host memory's tier for an engine that declares no `host_bytes_per_pass`, so its floor no longer rests
+  on its own report: resident weights that do not fit next to the required context's KV cache on every pass
+  (`crit eval context` now names them, `resident_off_device`), and routed experts by the share a token activates
+  (S-MBU) at the device cache's miss rate, from the engine's `expert_hits` and `expert_reads` per case (adapter
+  `generate()` results, crit serve telemetry) or even routing without them, on the faster of the link and host
+  memory. Prompts move each off-device expert they touch once, on the faster of the link and the CPU (its arithmetic
+  at the probed CPU rate): the prefill floor takes the longer of that and its arithmetic, the first-token floor the
+  longest of those and the device's bytes, at every speed case and long-context point, whose rounds take their own
+  hit rates too. `status` names the pass's host bytes and how they were priced. Before, only an engine that declared
+  its host bytes got a host-priced decode floor, and no prompt or curve first-token floor counted the host at all.
+- Prompt-length jitter (protocol `jitter`, [measurements](docs/MEASUREMENTS.md#prompt-length-jitter)):
+  every run draws a seed, and from it each held-out prompt and each long-context curve point below the requirement
+  a length of 80-100% of its nominal one, from the seed and its own name. A held-out prompt keeps the chat template
+  and cuts its user text in tokens (prepare freezes the frame and each prompt's text tokens; a server is sent the
+  cut text); a curve point fills its drawn share of the context (`filled_context`), with its floors priced there.
+  The requirement's point stays exact for the capacity gate, and the speed suite, quality, retrieval-only points,
+  follow-up turns and the concurrency part keep their lengths. The result records `jitter` (seed, range, every
+  drawn length), `crit eval run --jitter-seed` draws a recorded run's lengths again, a resumed round keeps its
+  journal's seed, and `status` reports the held-out prompts' share of their lengths. Before, every prompt had one
+  fixed length, so an engine could tune CUDA graphs, tiles or prefill chunks to the suite's exact shapes and pass
+  the generality gate with them.
+- A served engine that runs several requests at once is measured at it (protocol `concurrency`,
+  [measurements](docs/MEASUREMENTS.md#concurrency)): after every other part, closed-loop levels of 1, 2, 4, ... 64
+  clients, up to the server's `max_concurrent_requests` (crit serve's model card) and the KV that N x (prompt +
+  output) needs, each client sending its next greedy 128-token request when its previous one ended, over the short
+  speed and the held-out prompts. Per level: completion tokens over the wall interval by `validate_cohort` (until now
+  unused), the requests in flight at the peak, time to first token p50/p95 and per-request decode p50, the share of
+  speed-case replies equal to the speed part's serial ones with each first difference, and the aggregate against a
+  batched ceiling (`crit_eval.limits.batched`: one decode step of N rows reads the weights once, the experts its rows
+  touch, E(1 - (1 - k/E)^N), and each row's KV). Staged runs price each level from the one before it; levels journal
+  and resume; `status` and `compare` report them. An adapter's engine and a server that reports no capacity above 1
+  stay unmeasured. Before, nothing in Eval measured an engine serving more than one request.
+- Speed cases are measured at steady state (protocol `speed.steady_state`,
+  [measurements](docs/MEASUREMENTS.md)):
+  before a case's first measured repetition, a request whose decode speed differs from the request's before it by
+  more than 10% stands as one more warmup, until two consecutive requests agree or the case has had four warmups;
+  the extra repetition and the disturbed check apply from there on. The sampled suite does the same on the time per
+  target pass and asks the first measured seed again. Each case records `steady_state` (its warmups, how many the
+  drift added, whether it settled and its drift). Before, an engine that adapts to what it serves, a device expert
+  cache filling with a case's experts, spread past `disturbed_spread` between repetitions and stopped the round, so
+  an engine passed by freezing its adaptation. An engine whose warmup agrees with its first repetition measures as
+  before; one still varying after four warmups is judged as before.
+- An engine may declare that it keeps no prompt cache: `prompt_cache: false` in an adapter's `info()` or crit serve's
+  `engine_facts`. Its run sends neither pass of the follow-up turns, which would be fresh prefills the speed cases
+  already measure: `followup` is recorded as not run (`no_prompt_cache`, with the reason), the estimate and the stage
+  plan leave both passes out, and the prompt_cache gate passes, as it does today for an engine without a cache. A first
+  pass with no cached tokens declares nothing, since a cache of whole prompts hits only in the second pass.
+- AMD GPUs (ROCm): `crit eval probe --backend hip` builds `probe/device_probe_hip.cpp` with `hipcc` and measures the
+  same memory, bandwidth, transfer and host figures, with hipBLASLt GEMM rates for BF16 and, where the architecture
+  has FP8 matrix instructions, FP8 (E4M3FNUZ on gfx94x, OCP E4M3 on gfx95x and gfx12xx); it measures no raw
+  matrix-instruction rates yet. `crit eval kernels --backend hip` traces kernels with a rocprofiler-sdk tool library
+  (`probe/kernel_trace_rocm.cpp`) in the CUPTI tracer's trace format. Both are written against ROCm 6.4 and not yet
+  run on an AMD device. The probe picks hip by itself when it finds `hipcc` and no `nvcc`.
+- Device files name their backend, architecture and runtime version (`backend`, `arch`, `runtime_version`; a CUDA
+  probe derives `arch` from its compute capability, as `sm_120a`) and the rate keys the device has no matrix units
+  for (`unsupported_formats`); results copy them when the device file has them.
+- Eval rounds keep a journal and resume where they stopped ([Journal and resume](docs/README.md#journal-and-resume)):
+  `crit eval run --out R.json` writes `R.journal.jsonl`, one line per engine opened, part started and request served,
+  synced as each completes, and a round that stops (interrupted, crashed, a disturbed device, a hung engine, a
+  failure) writes what it measured to `R.json` marked `aborted`. `--resume R.journal.jsonl` answers the journal's
+  requests again with the clock readings the earlier round took, loads an engine only for the requests left and
+  measures live from the first one the journal does not hold; it refuses a journal of another round's options. The
+  result records the journal (`journal`), and `crit eval journal FILE` says how far a round got. Before, a round that
+  stopped kept nothing but a disturbed or hung abort's partial result, and the next began from the start: a
+  Qwen3.8-Flash-Next candidate's Eval interrupted after an hour, minutes before its end, kept nothing.
+- Stalls (protocol `speed.stalls`, reported, not judged): every request records when each streamed chunk arrives,
+  and each speed case reports the longest and p99 gap between chunks after the first token, in ms and in the case's
+  median rounds (`speed.cases.*.stalls`, `status.kpis.stalls`). Speculative engines send several tokens per chunk,
+  so the gaps are chunk gaps. An engine that delivers fewer than three chunks leaves them unmeasured.
+- The quality gate's honesty failure names its usual cause when served and scored log-probabilities differ: a token's
+  arithmetic depending on how many tokens its decode step holds (plain steps, other verify widths and the score
+  call's replay running other GEMM shapes), with the fix (one step width, or column-count independent kernels) and
+  the in-process check (a served reply against its replay). Status text only; results and the protocol are unchanged.
+- An engine whose model weights exceed the device's memory and that declares no `host_bytes_per_pass` is named in
+  `headroom.missing` and warned (`crit_eval.limits.headroom.undeclared_host_bytes`): its pass floor then prices
+  every byte at the device's bandwidth, a floor it cannot reach, so its fractions of the ceiling read as out of
+  reach rather than as room. Declared, the floor is priced by source and `fixed_decode` keeps the all-on-device
+  fraction beside it. Reported only.
+- Placement sizes the device expert cache with no fixed prompt workspace (`expert_cache_bytes`): where experts stay
+  off the device, the cache also gets the reserve, since prompt (prefill) buffers are lent from cache slots while a
+  prompt runs and returned for decode. Before, the reserve sat idle during decode and the cache, its hit rate and the
+  floors below were sized without it. The plain-pass floors add misses split between the CPU and the host link
+  (`plain_pass_floor_ms.split`), bounded by host memory's read rate: a link copy reads host memory as the CPU's
+  arithmetic does, so the two paths share it rather than add up. The rendered placement says even routing is the
+  pessimistic case and the cache's hit rate under real routing the main lever. Reported only; scenarios are
+  unchanged.
+- Placement says whether host memory holds every routed expert (`host_holds_every_expert`), not only those beyond
+  the device: scenario 2's starting design, a device cache copying its slots from host memory, keeps all of them
+  there. Where only the off-device share fits, the rendered placement says so and points to a static split.
+  Reported only; the scenario is unchanged.
+- A fixed-denominator decode fraction (protocol `headroom.fixed_decode`, reported, not judged): each decode case's
+  tok/s over one token per pass at the probed bandwidth and the model files' bytes per pass plus the case's KV read,
+  whatever `bytes_per_pass` the engine reports, and the cases' geometric mean (`headroom.fixed_decode`,
+  `status.kpis.decode_*.fixed_fraction`). The decode headroom beside it keeps the engine's own bytes. Above 1 with
+  speculation.
+- Tool-call validity (protocol `speed.tool_calls`, reported, not judged): on `tool-call` and `agent-long`, the calls
+  in the case's first output up to the model's first end token, in the chat template's format read from the
+  prompt (`<tool_call>` with JSON, or with a `<function=...>` block of `<parameter=...>` blocks as Qwen3.8 renders),
+  and the calls a server parsed itself, counted valid (they parse and name a tool of `suite/agent/tools.json` with
+  declared arguments of their types and every required one), invalid, or truncated by the output limit
+  (`speed.cases.*.tool_calls`, `status.kpis.tool_calls`). A served reply keeps the calls its server parsed
+  (`samples[].tool_calls`).
+
+### Changed
+
+- `as_quantized` is the mode for speed: its quality budget is eight times preserve's (PPL ratio 1.4, mean KLD 0.4,
+  p99 KLD 4.0, protocol `quality.mode_thresholds`), the cap its per-set allowance used to be raised to at most. It is
+  a floor against broken engines, not a ration on precision, so the stored format's activations, lower-precision KV,
+  heads and dense weights fit without per-group evidence. Runs no longer read the allowance and no longer need one:
+  an `as_quantized` run of data without `allowance.json` is judged. `crit eval reference` measures the checkpoint's
+  own drift only with `--allowance` (reported, not judged), which saves a second scoring pass of every quality text
+  for quantized checkpoints.
+- Steady state's warmups (protocol `speed.steady_state` `max_warmup_tokens`, `max_warmup_requests`): a case's warmups
+  are done after four that decoded 1,024 tokens between them, and after 16 in any case, instead of after four. An
+  engine that adapts per decode window adapts by the tokens it decodes, so a case with a short reply could still be
+  speeding up after its fourth warmup and stop the round.
+- The GGUF config rules live here, beside the reference's layouts for the same architectures: crit-core holds no
+  model family's rules any more and reads them through its registry (`crit_core.registry`, kind `gguf_config`).
+  `crit_eval.architectures.gguf_config` gives `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35` and `qwen35moe`, and
+  `gguf_deepseek4` and `gguf_qwen4exp` give DeepSeek V4's and Qwen3.8-Flash-Next's next to their layouts;
+  importing `crit_eval` registers them, imported only when crit-core first derives a lone GGUF's config, and the
+  package names them in an entry point of group `crit_core.gguf_config`. Derived configs are unchanged. With a
+  crit-core before the registry, which holds these rules itself, nothing is registered.
+- DeepSeek V4's chat template lives here too, byte for byte the one crit-core shipped, so prepared data and model
+  identities keep its sha256 (`crit_eval/architectures/templates/deepseek-v4.jinja`, DeepSeek's MIT notice in its
+  header, with the encoder's golden tests in `tests/test_eval_deepseek4_template.py`):
+  `crit_eval.architectures.CHAT_TEMPLATES` gives it to crit-core's registry (`chat_templates`, by `config.json`
+  `model_type`) when `crit_eval` is imported, and the package names it in an entry point of group
+  `crit_core.chat_templates`. A DeepSeek V4 checkpoint without a template renders with it as before (origin `crit`).
+- The protocol: the sampled suite measures one seed per case (seed 1, was 1 and 2) after its warmup,
+  staged stage 3 included (`stages.sampled_repetitions` 1). Re-scored from one seed alone, 23 Qwen3.8-27B results kept
+  their sampled decode score within 0.8%, single cases moving by up to 23%. A case measured at one seed has no
+  standard error (`decode_se` null), and `status` says the error is unmeasured. The warmup stays and still serves the
+  sampling check's log-probabilities: over 32 recorded results its time per target pass came 1.4% above the measured
+  seed's at the median, but 4 to 8% above on every case of some engines, so judging the measured seed's reply instead
+  would time those engines with the log-probabilities' cost. `--repetitions N` takes seeds 1 to N, and
+  `--adaptive-sampled` takes seed 2 for a case measured once before judging its error. The hub profile keeps two
+  seeds (1 and 2).
+- The lower-context gate runs on a certified run (`--certify`) only: stage 3 no longer opens the second engine at the
+  lower context, and the gate is unmeasured, its detail pointing to `--certify`, as capacity is. A certified run opens
+  it after the engine at the requirement closes, as stage 3 did; `--stage full` and profiles keep their behaviour.
+- A stored format the device has no matrix units for is priced at the BF16 rate in the prefill floor, as engines
+  there widen its weights for the GEMM (`crit_eval.limits.ceiling.best_rates`, source "BF16 rate (no matrix units for
+  this format)"): FP8 before compute capability 8.9 and NVFP4 off 10.x and 12.x on CUDA, and what a HIP probe
+  lists. Before, an NVFP4 checkpoint's prefill floor on an RTX 4090, or any FP8 floor on an RTX 3090, read as
+  missing. A rate merely absent from an older probe still reads as missing.
+- The protocol: a greedy speed case runs one warmup and one measured repetition (was two). When the two
+  disagree (decode or time to first token spread over 5%, or different output) the case gets a second repetition,
+  and a third when those two disagree in turn (`speed.extra_repetition`); the repeatable gate compares the warmup's
+  output too. A staged run's stage 2 repeats its short cases once, its stage 1 request standing as their warmup.
+  Re-scored from their first repetition alone, 23 Qwen3.8-27B results kept their scores within 0.1% (4% at worst).
+  The run-to-run spreads come from the cases measured more than once (`headroom.noise.repeated_cases` of `cases`),
+  and `status` says when a spread or the greedy standard error is unmeasured because every case was measured once.
+  Data prepared under 0.4.x is prepared again; the reference scores carry over.
+- The sampled speed suite runs two seeds per case (1 and 2, was 1 to 3), as the hub profile does, and repeats a
+  case at further seeds only with `crit eval run --adaptive-sampled` (the default was adaptive;
+  `--no-adaptive-sampled` is now the default and still accepted). Re-scored from one seed alone, 23 Qwen3.8-27B
+  results kept their sampled decode score within 0.8%, single cases moving by up to 23%; `decode_se` still reports
+  the seeds' spread. A repetition past the protocol's seeds (`--repetitions 3`) takes the next seed instead of
+  repeating the last one.
+- The held-out prompts decode 64 tokens once (were 256 tokens, twice): over 23 Qwen3.8-27B results the held-out score
+  from the first 64 tokens' acceptance came within 1.4% of the 256-token score.
+
+### Fixed
+
+- Quality's KL no longer collapses when an engine is far off. Each reference token the engine's top-k leaves out
+  was lumped with the rest of both distributions, so two lists that share no token read a KL of 0: a broken
+  Qwen3.8-Flash-Next engine that ranked the reference's first token first at 0.9% of answer positions read a mean
+  KLD of 0.10, and prompt positions, judged by KLD alone, had no other check to catch it. A token the engine's full
+  list leaves out has at most the probability of its last entry, and the KL is now bounded with that cap; it stays a
+  lower bound of the full-vocabulary KL. On Qwen3.8-27B NVFP4 run as quantized against the exact reference, the
+  answers read the same and the long prompts 17-61% higher (long-4096 mean 0.056 to 0.090, p99 0.90 to 1.65). A
+  spread or allowance scored before this keeps the old bound until `crit eval reference` scores it again.
+- `reference` scores ModelOpt MIXED_PRECISION checkpoints (nvidia/Qwen3.8-Flash-Next-FP4-Local). Its MXFP8 matrices
+  (one E8M0 scale per 32 inputs of each row) were expanded as 128 x 128 blocks, a 53 GB tensor per projection that
+  failed under WSL with "Failed to create GPU mapping"; the block now comes from the scales' shape (crit_core's
+  `fp8_block`). Routed experts whose NVFP4 scales are CSF-compressed decode losslessly to their E4M3 bytes
+  (`csf_scales`). A table stored in shards that each keep their own row scales, beside one global scale, gathers each
+  part's scales with its rows (the PLE n-gram table).
+- `reference` sets expandable allocator segments on its own process's allocator instead of exporting
+  `PYTORCH_ALLOC_CONF`, which every process it started inherited: `crit run eval` constructs the reference and then
+  starts `crit serve`, whose engine ran under expandable segments it never asked for: a different device memory
+  layout from the same engine served or run on its own, which hid a Qwen3.8-Flash-Next engine's graph-pool bug from
+  its in-process tests (1.1 tokens per round served, 2.6 in process).
+
 ## [0.4.1] - 2026-10-30
 
 ### Fixed
@@ -335,7 +578,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.4.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/crit-labs/crit-eval/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/crit-labs/crit-eval/compare/v0.4.0...v0.4.1
 [0.4.0]: https://github.com/crit-labs/crit-eval/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/crit-labs/crit-eval/compare/v0.2.0...v0.3.0

@@ -176,6 +176,51 @@ class FormatTests(unittest.TestCase):
                 expected = Fp8Dequantize(None)._dequantize_one(weight, scale, torch.float32)
                 self.assertTrue(torch.equal(checkpoint.dense("m", "cpu"), expected))
 
+    def test_mxfp8_row_group_scales_decode_per_32_inputs(self):
+        # modelopt MIXED_PRECISION's MXFP8 layers: one E8M0 scale byte per 32 inputs of each row, no block size in
+        # the config (its group_size is per layer).
+        import torch
+        from crit_eval.quality.checkpoints import StateDictCheckpoint
+        torch.manual_seed(0)
+        weight = (torch.randn(48, 128) * 100).to(torch.float8_e4m3fn)
+        scale = torch.randint(118, 124, (48, 4), dtype=torch.uint8)
+        checkpoint = object.__new__(StateDictCheckpoint)
+        checkpoint.where = {"m.weight": weight, "m.weight_scale": scale}
+        checkpoint.quantization = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+                                   "quantized_layers": {"m": {"quant_algo": "MXFP8", "group_size": 32}}}
+        expected = weight.float() * torch.pow(2.0, scale.float() - 127).repeat_interleave(32, -1)
+        self.assertTrue(torch.equal(checkpoint.dense("m", "cpu"), expected))
+
+    def test_csf_compressed_nvfp4_scales_decode_to_the_plain_ones(self):
+        # ModelOpt's CSF scale encoding (Qwen3.8-Flash-Next-FP4-Local's experts): per 16-row slab one base byte per
+        # row, then 4-bit codes low nibble first; scales outside a row's window are exceptions (24-bit position, byte).
+        import torch
+        from crit_eval.quality.checkpoints import StateDictCheckpoint
+        torch.manual_seed(0)
+        rows, groups = 32, 8
+        packed = torch.randint(0, 256, (rows, groups * 8), dtype=torch.uint8)
+        scale = torch.randint(40, 56, (rows, groups), dtype=torch.uint8)
+        scale[3, 5], scale[20, 0] = 120, 7   # outside their rows' windows
+        bases = scale.min(dim=1).values.clamp(max=240)
+        bases[3], bases[20] = 40, 40
+        codes = (scale.to(torch.int16) - bases[:, None]).clamp(0, 15)
+        outside = (scale.to(torch.int16) - bases[:, None] > 15) | (scale.to(torch.int16) < bases[:, None])
+        codes[outside] = 0
+        nibbles = codes.to(torch.uint8).reshape(rows, groups // 2, 2)
+        fixed = torch.cat((bases.reshape(rows // 16, 16),
+                           (nibbles[..., 0] | (nibbles[..., 1] << 4)).reshape(rows // 16, -1)), dim=1)
+        where = outside.reshape(-1).nonzero().flatten()
+        exceptions = (where | (scale.reshape(-1)[where].to(torch.int64) << 24)).to(torch.int64)
+        exceptions = torch.where(exceptions >= 1 << 31, exceptions - (1 << 32), exceptions).to(torch.int32)
+        common = {"m.weight": packed, "m.weight_scale_2": torch.tensor(0.5)}
+        plain, csf = (object.__new__(StateDictCheckpoint) for _ in range(2))
+        plain.where = {**common, "m.weight_scale": scale.view(torch.float8_e4m3fn)}
+        csf.where = {**common, "m.weight_scale.nvfp4_csf_fixed": fixed,
+                     "m.weight_scale.nvfp4_csf_exceptions": exceptions}
+        for checkpoint in (plain, csf):
+            checkpoint.quantization = {"quant_method": "modelopt"}
+        self.assertTrue(torch.equal(csf.dense("m", "cpu"), plain.dense("m", "cpu")))
+
     @unittest.skipUnless(_has("gptqmodel"), "needs gptqmodel")
     def test_gptq(self):
         from gptqmodel import BACKEND, GPTQModel, QuantizeConfig

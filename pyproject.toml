@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.4.1"
+version = "0.5.0"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
@@ -22,8 +22,16 @@ Repository = "https://github.com/crit-labs/crit-eval"
 [project.scripts]
 crit-eval = "crit_eval.cli:main"
 
+# The model-family knowledge crit-core reads through its registry (crit_core.registry), found without importing
+# crit_eval: the GGUF config rules of the architectures the reference reads, and the chat templates crit ships.
+[project.entry-points."crit_core.gguf_config"]
+crit-eval = "crit_eval.architectures.gguf_config:CONFIG_RULES"
+
+[project.entry-points."crit_core.chat_templates"]
+crit-eval = "crit_eval.architectures:CHAT_TEMPLATES"
+
 [tool.setuptools.packages.find]
 include = ["crit_eval*"]
 
 [tool.setuptools.package-data]
-crit_eval = ["protocol.json", "suite/**/*", "probe/*", "examples/*", "workbench/harness.py"]
+crit_eval = ["protocol.json", "suite/**/*", "probe/*", "examples/*", "workbench/harness.py", "architectures/templates/*.jinja"]

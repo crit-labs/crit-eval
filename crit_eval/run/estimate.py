@@ -13,7 +13,8 @@ prompt and m output tokens is then expected to take prefill(n) + (m - 1) * step(
 also returns a row per scored position, the server's own work no reply shows (SCORE_ROW_SECONDS each), and the
 exactness check decodes one token per target pass (step times the tokens per round the speed cases measured).
 
-Left out: a speed case's third repetition (only when its first two disagree, which a quiet engine's rarely do),
+Left out: a speed case's third repetition (only when its first two disagree, which a quiet engine's rarely do), the
+warmups a case's drift adds before its first repetition (protocol speed.steady_state),
 prompt caches (follow-up turns and retrieval requests prefill in full) and replies ending early (each runs its
 length), so a cached or early-stopping engine takes less.
 """
@@ -176,7 +177,7 @@ def requests(prepared, protocol, parts, required, settings=None, info=None, warm
         add("history", _history(prepared, held))
         add("history_again", _history(prepared, held))
     turns, n = prepared.get("followup") or [], int(protocol["followup"]["output_tokens"])
-    if turns and len(turns[-1]["prompt_ids"]) + n <= held:
+    if turns and len(turns[-1]["prompt_ids"]) + n <= held and (info or {}).get("prompt_cache") is not False:
         add("followup", [(len(t["prompt_ids"]), n) for t in turns])
         add("followup_again", [(len(t["prompt_ids"]), n) for t in turns])
     if "speed" in names:

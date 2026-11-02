@@ -74,28 +74,26 @@ def stored_spread(data, prepared, protocol, reference_identity, store=fixed.STOR
                                     "spread_texts": texts}, store)
 
 
-def set_limits(thresholds, spread, factor, cap=None):
+def set_limits(thresholds, spread, factor):
     """A set's drift limits (quality_thresholds) raised to `factor` times the reference's own spread on it
-    (protocol quality.spread), or the as_quantized allowance (protocol quality.allowance): kld_mean_max and
-    kld_p99_max to factor times the spread's, ppl_ratio_max to 1 plus factor times the spread ratio's distance from 1,
-    each raise stopping at cap's value for that limit when cap names one. Returns (limits, the keys raised)."""
+    (protocol quality.spread): kld_mean_max and kld_p99_max to factor times the spread's, ppl_ratio_max to 1 plus
+    factor times the spread ratio's distance from 1. Returns (limits, the keys raised)."""
     if not spread:
         return dict(thresholds), []
-    cap = cap or {}
     limits, raised = dict(thresholds), []
     for key, name in (("kld_mean_max", "kld_mean"), ("kld_p99_max", "kld_p99")):
         if key in limits and spread.get(name) is not None:
-            value = min(factor * spread[name], cap.get(key, float("inf")))
+            value = factor * spread[name]
             if value > limits[key]:
                 limits[key], raised = value, raised + [key]
     if "ppl_ratio_max" in limits and spread.get("ppl_ratio") is not None:
-        from_spread = min(1.0 + factor * abs(spread["ppl_ratio"] - 1.0), cap.get("ppl_ratio_max", float("inf")))
+        from_spread = 1.0 + factor * abs(spread["ppl_ratio"] - 1.0)
         if from_spread > limits["ppl_ratio_max"]:
             limits["ppl_ratio_max"], raised = from_spread, raised + ["ppl_ratio_max"]
     return limits, raised
 
 
-def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, allowance=None):
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, mode="preserve"):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.run.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.quality.fixed.load, None when the data has none). Each set is judged on
@@ -105,10 +103,8 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     Then the honesty check (run_honesty). A set whose texts do not fit the engine's max_context is skipped. Sets
     are scored in the prepared order and judged as each completes; a set far over the budget (clearly_failed) stops
     the scoring, and the result says so (stopped_early). spread: the reference's own spread per set and path
-    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). allowance (quality mode
-    as_quantized): how far the checkpoint run with its own activation quantization lands from the reference per set
-    and path (fixed.load_allowance), which raises a set's limits to protocol quality.allowance.margin times it where
-    that exceeds them, at most to quality.allowance.cap."""
+    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). mode: the quality mode,
+    for the honesty check's bound."""
     rule = protocol["quality"]
     # A served engine scores through the paths it serves with; an in-process adapter's score() is development evidence:
     # reported, never a gate result (protocol quality.development).
@@ -126,8 +122,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if reference is None:
         log("quality: not measured (no reference scores for this data)")
         return {**out, "status": "unsupported",
-                "reason": "the data holds no reference scores (or, for quality mode as_quantized, no allowance "
-                          "measured with them): run crit eval reference --model --data first"}
+                "reason": "the data holds no reference scores: run crit eval reference --model --data first"}
     started, skipped, parts, labels, timings = time.time(), {}, {}, {}, []
     sets, buckets, judged, stopped = {}, {}, 0.0, None
     order = list(dict.fromkeys(text["set"] for text in prepared["quality"]))
@@ -166,17 +161,10 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             row = metrics.text_quality(reference_rows, found)
             limits, raised = set_limits(thresholds, (spread or {}).get(name), float(rule["spread"]["factor"])
                                         if rule.get("spread") else 0.0)
-            allowed = []
-            if allowance is not None:
-                # protocol quality.allowance: the checkpoint's own quantization drift, times the margin, capped.
-                limits, allowed = set_limits(limits, allowance.get(name), float(rule["allowance"]["margin"]),
-                                             rule["allowance"].get("cap"))
             if name.endswith("/prompt"):
                 # protocol quality.prompt_perplexity: reported, not judged on the prompt positions.
                 limits.pop("ppl_ratio_max", None)
                 raised = [key for key in raised if key != "ppl_ratio_max"]
-                allowed = [key for key in allowed if key != "ppl_ratio_max"]
-            raised = [key for key in raised if key not in allowed]   # the larger raise names the limit
             failures = metrics.judge(row, limits)
             # The share's dependence on the positions the set holds (protocol quality.position_spread): reported.
             noise = rule.get("position_spread") or {}
@@ -185,14 +173,10 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
                           "budget_used": metrics.budget_used(row, limits), "limits": limits,
                           **({"budget_spread": spread_found} if spread_found else {}),
-                          **({"reference_spread": spread[name], "raised": raised} if raised else {}),
-                          **({"allowance": allowance[name], "allowance_raised": allowed} if allowed else {})}
+                          **({"reference_spread": spread[name], "raised": raised} if raised else {})}
             if raised:
                 log(f"quality {name}: judged against the reference's own spread, "
                     + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in raised))
-            if allowed:
-                log(f"quality {name}: judged with the checkpoint's own quantization drift as allowance, "
-                    + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in allowed))
             buckets[name] = {label: {key: value[key] for key in ("targets", "ppl_ratio", "kld_mean", "kld_p99",
                                                                   "top1_agreement")}
                              for label, value in metrics.bucketed(reference_rows, found, labels[name]).items()}
@@ -208,7 +192,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if not parts:
         return {**out, "status": "skipped", "skipped": skipped,
                 "reason": f"no quality text fits the engine's {info['max_context']:,}-token context"}
-    honesty = run_honesty(engine, info, prepared, protocol, log, skipped)
+    honesty = run_honesty(engine, info, prepared, protocol, log, skipped, mode=mode)
     passed = all(s["passed"] for s in sets.values()) and honesty["passed"] is not False
     timing = {"scores": _phase_timing(timings), "metrics_seconds": judged, "texts": timings,
               **({"honesty": honesty.pop("timing")} if "timing" in honesty else {})}
@@ -218,7 +202,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
 
 
 def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
-                    context_tokens=None, allowance=None):
+                    context_tokens=None):
     """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
     exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
     {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
@@ -238,7 +222,7 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
         engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
         try:
             scored = run_quality(engine, info, prepared, protocol, lambda line: log(f"attribution {name}: {line}"),
-                                 reference, thresholds, spread, allowance)
+                                 reference, thresholds, spread)
         finally:
             engine.close()
         sets = {set_name: s["budget_used"] for set_name, s in (scored.get("sets") or {}).items()}
@@ -270,15 +254,18 @@ def clearly_failed(set_name, sets, thresholds, rule):
     return None
 
 
-def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=True):
+def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=True, mode="preserve"):
     """protocol quality.honesty: the engine's greedy reply over the chat API to every text of the honesty sets (an
     engine's reply(prompt, max_new_tokens, top_k)), then the same reply tokens scored as the continuation: the served
     and the scored log-probabilities must agree within tolerance, top-k alternatives included, and the top-k lists
-    hold the same tokens but those within tolerance of the k-th. extra: (id, prompt ids, served reply) of replies
-    already served with their log-probabilities (the long-context curve's first point), judged the same way, their
-    tokens scored once; texts False judges only those."""
+    hold the same tokens but those within tolerance of the k-th. In a quality mode honesty.modes names (as_quantized)
+    the two paths may round apart: its tolerance bounds each position and its mean_tolerance each reply's mean
+    difference of the reply tokens' log-probabilities. extra: (id, prompt ids, served reply) of replies already served
+    with their log-probabilities (the long-context curve's first point), judged the same way, their tokens scored once;
+    texts False judges only those."""
     rule, top_k = protocol["quality"]["honesty"], protocol["quality"]["top_k"]
-    tolerance = rule["tolerance"]
+    bound = (rule.get("modes") or {}).get(mode) or {}
+    tolerance, mean_tolerance = bound.get("tolerance", rule["tolerance"]), bound.get("mean_tolerance")
     if not callable(getattr(engine, "reply", None)):
         return {"passed": None, "reason": "the engine replies over no chat API", "tolerance": tolerance}
     replies, failures, worst, timing = [], [], 0.0, {"replies": [], "scores": []}
@@ -293,9 +280,10 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
         for part, value in (("replies", served), ("scores", rescored)):
             if value.get("timing"):
                 timing[part].append(value["timing"])
-        diff, lists = 0.0, []
+        diff, lists, total = 0.0, [], 0.0
         for position, (logprob, top, row) in enumerate(zip(served["logprobs"], served["top"], scored)):
             diff = max(diff, abs(logprob - row["logprob"]))
+            total += abs(logprob - row["logprob"])
             mine, theirs = dict(top), dict(row["top"])
             diff = max([diff] + [abs(mine[t] - theirs[t]) for t in mine.keys() & theirs.keys()])
             # A token in only one list must sit at that list's edge: within tolerance of its k-th value.
@@ -307,16 +295,21 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
                     lists.append(position)
                     break
         worst = max(worst, diff)
+        mean = total / len(scored) if scored else 0.0
         replies.append({"id": text_id, "tokens": len(served["tokens"]), "max_abs_logprob_diff": diff,
-                        "top_k_differs_at": lists[:8]})
+                        "mean_abs_logprob_diff": mean, "top_k_differs_at": lists[:8]})
         if diff > tolerance:
             failures.append(f"{text_id}: scored log-probabilities differ from the served ones by {diff:.2e} "
                             f"(tolerance {tolerance})")
+        if mean_tolerance is not None and mean > mean_tolerance:
+            failures.append(f"{text_id}: scored log-probabilities differ from the served ones by {mean:.2e} on average "
+                            f"(tolerance {mean_tolerance})")
         if lists:
             failures.append(f"{text_id}: the scored and served top-{top_k} lists differ at {len(lists)} tokens")
     log(f"quality honesty: {len(replies)} served replies scored again, max |difference| {worst:.2e}"
         + ("" if not failures else " - " + "; ".join(failures)))
-    return {"passed": not failures if replies else None, "tolerance": tolerance, "max_abs_logprob_diff": worst,
+    return {"passed": not failures if replies else None, "tolerance": tolerance,
+            **({"mean_tolerance": mean_tolerance} if mean_tolerance is not None else {}), "max_abs_logprob_diff": worst,
             "replies": replies, "failures": failures,
             "timing": {part: _phase_timing(values) for part, values in timing.items()}}
 

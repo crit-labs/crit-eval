@@ -259,6 +259,10 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(tool["samples"][0]["output_tokens"], 9)
         self.assertEqual(tool["samples"][0]["served"]["finish_reason"], "tool_calls")
         self.assertEqual(tool["tokens"], prepare.token_ids(Text(), 'lookread_file{"path": "a.py"}'))
+        # The call the server parsed is judged as streamed (protocol speed.tool_calls).
+        self.assertEqual(tool["samples"][0]["tool_calls"], [{"name": "read_file", "arguments": '{"path": "a.py"}'}])
+        # The fixture's template renders no <tool_call> format: the count is unmeasured, never a guess.
+        self.assertEqual(tool["tool_calls"]["status"], "unmeasured")
         self.assertEqual(result["heldout"]["prompts"]["de"]["status"], "measured")
         self.assertTrue(result["history"]["passed"])
         sent = self.server.requests
@@ -643,8 +647,10 @@ class ChatServerTests(unittest.TestCase):
                 reference.score_data("other", self.data, log=lambda m: None)
             how = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((how["method"], how["positions"]), ("scored", sum(len(i) - 1 for i, _ in texts.values())))
-            self.assertEqual((how["spread"], how["allowance"]), ("scored", "none"))
-            again = reference.score_data("source", self.data, log=lambda m: None)
+            self.assertEqual((how["spread"], how.get("allowance")), ("scored", None))   # the allowance only on request
+            asked = reference.score_data("source", self.data, log=lambda m: None, allowance=True)
+            self.assertEqual((asked["method"], asked["allowance"]), ("stored", "none"))
+            again = reference.score_data("source", self.data, log=lambda m: None, allowance=True)
             self.assertEqual((again["method"], again["spread"], again["allowance"]), ("stored", "stored", "stored"))
         prepared = json.loads((self.data / "prepared.json").read_text())
         stored = fixed.load(self.data, {"model_sha256": "model", **fixed.identity(texts, 16, prepared["valid_vocab"])})
