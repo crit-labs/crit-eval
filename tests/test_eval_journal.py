@@ -179,6 +179,36 @@ class JournalTests(unittest.TestCase):
             kept = journal.replayable(journal.read(path))
         self.assertEqual(sum(row["event"] == "call" for row in kept), 5)
 
+    def test_a_request_that_raised_raises_again_on_replay_and_replay_goes_on(self):
+        class Refusing(Engine):
+            def loads(self):
+                self.calls += 1
+                raise ConnectionRefusedError("no /health")
+
+        def refusing(context):
+            engine = Refusing()
+            return engine, engine.info()
+
+        def measure(path, resume=None):
+            raised = []
+            with journal.Journal(path, IDENTITY, resume=resume, log=lambda m: None) as written:
+                engine, _ = written.open(refusing, {})
+                try:
+                    engine.loads()
+                except OSError as error:
+                    raised.append((type(error), str(error)))
+                for prompt, n in REQUESTS:
+                    engine.generate(prompt, n, lambda tokens: None)
+            return raised, engine, written
+        with tempfile.TemporaryDirectory() as folder:
+            first, _, _ = measure(Path(folder) / "a.journal.jsonl")
+            again, engine, written = measure(Path(folder) / "b.journal.jsonl", resume=Path(folder) / "a.journal.jsonl")
+        self.assertEqual(first, [(ConnectionRefusedError, "no /health")])
+        self.assertEqual(again, first)
+        self.assertIsNone(engine.real)
+        self.assertIsNone(written.diverged)
+        self.assertEqual(written.counts["replayed_calls"], 5)
+
     def test_a_round_interrupted_in_its_curve_resumes_with_the_speed_it_measured(self):
         from unittest.mock import patch
         from crit_eval.run import runner
