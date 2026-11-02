@@ -13,7 +13,7 @@ so the disturbed case is measured again rather than read back.
 
 Lines (protocol journal): `round` (the round's identity, what it resumes), `open` (an engine: its context, info,
 methods and load time), `mark` (a part starts), `call` (a request: method, inputs digest, delivered tokens with
-their offsets, seconds, result); each of these three carries the clock readings taken since the line before it
+their offsets, seconds, result, or the error a request raised, raised again on replay); each of these three carries the clock readings taken since the line before it
 (`clock`), `load` (an engine the round opened only for its live requests), `diverged` (where
 replay stopped early), `end` (the round's outcome). Replayed lines carry `replayed: true`, so each journal is
 complete on its own and a resumed round can be resumed again."""
@@ -273,6 +273,8 @@ class Journal:
             self.replays += 1
             engine.served.append(row)
             self._write({**row, "engine": engine.index, "replayed": True})
+            if row.get("error"):
+                raise _error(row["error"])
             return row["result"]
         real = engine.load()
         deliveries = []
@@ -285,12 +287,19 @@ class Journal:
             return on_tokens
         live_args = [recorder(a) if callable(a) else a for a in args]
         live_kwargs = {k: recorder(v) if callable(v) else v for k, v in kwargs.items()}
-        result = getattr(real, method)(*live_args, **live_kwargs)
-        seconds = time.perf_counter() - started
         line = {"event": "call", "engine": engine.index, "engine_key": engine.key, "method": method,
                 "inputs_sha256": inputs_sha, "prompt_tokens": len(args[0]) if args and isinstance(args[0], list)
-                and not any(isinstance(t, list) for t in args[0]) else None,
-                "deliveries": deliveries, "seconds": round(seconds, 6)}
+                and not any(isinstance(t, list) for t in args[0]) else None, "deliveries": deliveries}
+        try:
+            result = getattr(real, method)(*live_args, **live_kwargs)
+        except Exception as error:
+            # A request that raised is part of the round: a round resuming this journal raises it at the same place.
+            line.update(seconds=round(time.perf_counter() - started, 6), result=None,
+                        error={"types": [kind.__name__ for kind in type(error).__mro__], "message": str(error)})
+            self.counts["live_calls"] += 1
+            self._record(line)
+            raise
+        line["seconds"] = round(time.perf_counter() - started, 6)
         try:
             line["result"] = _plain(result)
         except TypeError as error:
@@ -364,8 +373,20 @@ class JournaledEngine:
                 raise AttributeError(name)
             return lambda *args, **kwargs: self.journal.call(self, name, args, kwargs)
         if name == "deadline" and self.real is None:
-            return None    # what the engine served so far is in the journal's samples (stages.observations)
+            return self._deadline()
         return getattr(self.load(), name)
+
+    def _deadline(self):
+        """A served engine's request deadline as it stands after the journal's requests this engine answered, the same
+        observations the engine's own deadline made of them (the stages' rates read it); None for an engine that keeps
+        none."""
+        if not self.info_value.get("served"):
+            return None
+        from .. import EVAL_DIR, load_json
+        from .deadline import RequestDeadline
+        seen = RequestDeadline(load_json(EVAL_DIR / "protocol.json")["requests"]["timeout"])
+        _observe(seen, self.served)
+        return seen
 
     def __setattr__(self, name, value):
         if name in ("journal", "index", "opener", "context", "info_value", "methods", "key", "real", "kind", "served"):
@@ -375,12 +396,14 @@ class JournaledEngine:
 
 
 def _observe(engine, rows):
-    """A served engine's request deadline (crit_eval.run.deadline) learns the journal's requests as if it had served
-    them, so its first live request is bounded by the rates the round measured."""
-    deadline = getattr(engine, "deadline", None)
+    """A served engine's request deadline (crit_eval.run.deadline), or the deadline itself, learns the journal's
+    requests as if it had served them, so its first live request is bounded by the rates the round measured."""
+    deadline = engine if hasattr(engine, "observe") else getattr(engine, "deadline", None)
     if deadline is None or not hasattr(deadline, "observe"):
         return
     for row in rows:
+        if row.get("error"):
+            continue    # a request that raised observed nothing
         prompt = row.get("prompt_tokens") or 0
         if row["deliveries"]:
             first, last = row["deliveries"][0][0], row["deliveries"][-1][0]
@@ -422,6 +445,17 @@ def describe(path):
                if end else "no end: the round is running, or its process stopped without one (killed, a crash); "
                "a round resuming it answers every whole line")
     return "\n".join(out)
+
+
+def _error(recorded):
+    """The exception a journaled request raised, raised again on replay: its own class when it is a builtin one, else
+    the nearest builtin class it derives from (an HTTPError is an OSError), with its message."""
+    import builtins
+    for name in recorded["types"]:
+        kind = getattr(builtins, name, None)
+        if isinstance(kind, type) and issubclass(kind, Exception):
+            return kind(recorded["message"])
+    return RuntimeError(recorded["message"])
 
 
 def _class_name(kind):

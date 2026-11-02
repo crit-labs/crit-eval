@@ -9,6 +9,16 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.5.2] - 2026-11-02
+
+### Fixed
+
+- A resumed round replays the round it resumes again: a request that raised (a served engine's load count read from a
+  server without it) is a journal line, raised again on replay; a served engine the journal answers keeps the
+  request deadline its requests would have given it, so the stages' first estimate reads the same rates; and the
+  closed track's last load count is read only by a round that measured to its end. Before, a resumed round left the
+  journal at its first request and measured everything live.
+
 ## [0.5.1] - 2026-11-02
 
 ### Fixed
@@ -585,7 +595,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...HEAD
+[0.5.2]: https://github.com/crit-labs/crit-eval/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/crit-labs/crit-eval/compare/v0.5.0...v0.5.1
 [0.5.0]: https://github.com/crit-labs/crit-eval/compare/v0.4.1...v0.5.0
 [0.4.1]: https://github.com/crit-labs/crit-eval/compare/v0.4.0...v0.4.1

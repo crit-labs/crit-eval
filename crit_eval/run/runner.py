@@ -473,8 +473,10 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 with times.part("forks"):
                     judge_forks(result, engine, prepared, protocol, log)
             concurrency()
-    finally:
+        # Only a round that measured to its end reads it: a request after a stop would be a line in the journal that a
+        # round resuming it never makes.
         result["engine_loads"]["last"] = engine_loads(engine)
+    finally:
         engine.close()
     if staged is not None and plan["lower"]:
         if plan["fits"]("lower_context", plan["lower_seconds"]):
