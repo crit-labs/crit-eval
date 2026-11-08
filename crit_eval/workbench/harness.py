@@ -54,7 +54,7 @@ def check(kernel, spec, shapes):
                 row["passed"] = row["passed"] and row["column_invariant"]
             # Determinism: the same inputs again give the same bits (catches atomics, races and reads past a buffer).
             # A kernel declared repeatable false (kernel.json; atomics or a split chosen by the workload, for engines
-            # in quality mode as_quantized) has each repeat judged against the reference within tolerance instead.
+            # in quality mode speed) has each repeat judged against the reference within tolerance instead.
             again = [kernel.candidate(data) for _ in range(2)]
             row["repeatable"] = all(torch.equal(a, found) for a in again)
             if spec.get("repeatable", True):

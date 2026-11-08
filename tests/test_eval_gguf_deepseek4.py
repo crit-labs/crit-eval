@@ -4,7 +4,7 @@
 The conformance test writes a tiny checkpoint in DeepSeek's own format (FP8 matrices with E8M0 block scales, FP4
 routed experts with E8M0 scales per 32 values, BF16 and F32 tensors, hash-routing tables), converts it with GGUF's
 reference converter and needs a checkout of it whose converter and gguf-py know DeepSeek V4
-(CRIT_LLAMA_CPP=/path/to/the/checkout) plus torch, transformers with deepseek_v4, safetensors, tokenizers and a gguf
+(CRIT_GGUF_TOOLS=/path/to/the/checkout) plus torch, transformers with deepseek_v4, safetensors, tokenizers and a gguf
 package that knows deepseek4 (the checkout's gguf-py on PYTHONPATH will do); without them it is skipped. The same
 checkpoint as safetensors in DeepSeek's own tensor names scores as transformers loads it (DeepseekV4NamesTests)."""
 from dataclasses import replace
@@ -52,10 +52,10 @@ def _checkout_knows_deepseek4(checkout):
             and constants.is_file() and '"deepseek4"' in constants.read_text(encoding="utf-8"))
 
 
-LLAMA_CPP = os.environ.get("CRIT_LLAMA_CPP")
+GGUF_TOOLS = os.environ.get("CRIT_GGUF_TOOLS")
 HAS_V4 = _transformers_has_deepseek4()
 HAS_CONVERTER = (HAS_V4 and _has("torch", "safetensors", "tokenizers", "numpy") and _gguf_knows_deepseek4()
-                 and _checkout_knows_deepseek4(LLAMA_CPP))
+                 and _checkout_knows_deepseek4(GGUF_TOOLS))
 
 # The deepseek4.* metadata of a published DeepSeek-V4-Flash-0731 GGUF (unsloth's UD-Q4_K_XL), with its value types.
 FLASH_METADATA = [
@@ -171,12 +171,12 @@ SPLITS = [r"\p{N}{1,3}", "[一-龥぀-ゟ゠-ヿ]+",
           "[!\"#$%&'()*+,\\-./:;<=>?@\\[\\\\\\]^_`{|}~][A-Za-z]+|[^\r\n\\p{L}\\p{P}\\p{S}]?[\\p{L}\\p{M}]+|"
           " ?[\\p{P}\\p{S}]+[\r\n]*|\\s*[\r\n]+|\\s+(?!\\S)|\\s+"]
 CONVERT = """import runpy, sys
-llama = sys.argv[1]
-sys.path[:0] = [llama, llama + "/gguf-py"]
+checkout = sys.argv[1]
+sys.path[:0] = [checkout, checkout + "/gguf-py"]
 import conversion.base as base
 base.TextModel.get_vocab_base_pre = lambda self, tokenizer: "joyai-llm"   # DeepSeek V4's; tiny vocabularies hash anew
 sys.argv = ["convert_hf_to_gguf.py"] + sys.argv[2:]
-runpy.run_path(llama + "/convert_hf_to_gguf.py", run_name="__main__")
+runpy.run_path(checkout + "/convert_hf_to_gguf.py", run_name="__main__")
 """
 
 
@@ -353,7 +353,7 @@ class DeepseekV4NamesTests(unittest.TestCase):
                 self.assertTrue(torch.equal(a, b))
 
 
-@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_LLAMA_CPP (a converter checkout whose converter and gguf-py know "
+@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_GGUF_TOOLS (a converter checkout whose converter and gguf-py know "
                                     "DeepSeek V4), torch, transformers with deepseek_v4, safetensors, tokenizers and "
                                     "a gguf that knows deepseek4")
 class DeepseekV4ConformanceTests(unittest.TestCase):
@@ -376,8 +376,8 @@ class DeepseekV4ConformanceTests(unittest.TestCase):
         folder = self.root / f"gguf-{name}"
         folder.mkdir()
         out = folder / f"{name}.gguf"
-        subprocess.run([sys.executable, str(self.root / "convert.py"), LLAMA_CPP, str(original), "--outfile", str(out)],
-                       check=True, capture_output=True)
+        subprocess.run([sys.executable, str(self.root / "convert.py"), GGUF_TOOLS, str(original), "--outfile",
+                        str(out)], check=True, capture_output=True)
         return folder
 
     def assert_described_alike(self, folder, original):

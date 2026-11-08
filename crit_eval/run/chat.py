@@ -78,6 +78,14 @@ class Server:
         with _bounded(timeout, path), self.opener.open(request, timeout=timeout) as response:
             return json.load(response)
 
+    def health(self, timeout):
+        """The server's /health, which sits at its root beside the API (crit serve answers /health, not /v1/health):
+        the API URL without a trailing /v1."""
+        root = self.url[:-len("/v1")] if self.url.endswith("/v1") else self.url
+        request = urllib.request.Request(root + "/health", headers=self.headers)
+        with _bounded(timeout, "/health"), self.opener.open(request, timeout=timeout) as response:
+            return json.load(response)
+
     def post(self, path, body, timeout):
         return self.post_timed(path, body, timeout)[0]
 
@@ -348,9 +356,28 @@ class ChatEngine:
                                for e in entries]
             try:   # the same reply as reply() gives it, ids by bytes, for the honesty check of a long reply
                 out["reply"] = self._reply_rows(entries, finish, logprobs, usage)
+                served_ids = self.served_ids(prompt, messages, tools, usage)
+                if served_ids != prompt:
+                    out["reply"]["prompt_ids"] = served_ids
             except RuntimeError as error:
                 out["reply_unmapped"] = str(error)
         return out
+
+    def served_ids(self, prompt, messages, tools, usage):
+        """The prompt ids a reply was served after. A frame's prompt reaches the server as text decoded from its ids,
+        which the server's chat template renders anew and may tokenize to other ids (a document cut where a merge
+        spans the cut, a token that decodes to text encoding as two): the reply is scored after what the server
+        rendered, the model's chat template applied to the same messages. RuntimeError when the server's usage counts
+        neither."""
+        if tuple(prompt) in self.server.prompts:
+            return prompt
+        rendered_ids = list(self.text.encode_chat(messages, tools=tools, add_generation_prompt=True,
+                                                  enable_thinking=False))
+        if usage.get("prompt_tokens") == len(rendered_ids):
+            return rendered_ids
+        if usage.get("prompt_tokens") == len(prompt):
+            return prompt
+        raise RuntimeError(rendered(self.server.url, usage.get("prompt_tokens"), len(rendered_ids)))
 
     def generate_sampled(self, prompt, max_new_tokens, on_tokens, sampling, logprobs=None):
         """A sampled reply (protocol sampled_speed) at the sampling fields given."""
@@ -479,9 +506,23 @@ class ChatEngine:
     def loads(self):
         """How many times the server's resident host has loaded an engine (crit serve's /health engine_loads), or None
         from a server that reports none: the closed track's one load for the run (protocol tracks)."""
-        status = (self.server.get("/health", self.deadline.seconds(0)) or {}).get("engine") or {}
+        status = (self.server.health(self.deadline.seconds(0)) or {}).get("engine") or {}
         value = status.get("engine_loads") if isinstance(status, dict) else None
         return value if type(value) is int else None
+
+    def device_free_bytes(self):
+        """The device memory the server's engine process can still allocate, as it read it when it last became ready
+        (crit serve's /health engine device_free_bytes), or None from a server that reports none."""
+        status = (self.server.health(self.deadline.seconds(0)) or {}).get("engine") or {}
+        value = status.get("device_free_bytes") if isinstance(status, dict) else None
+        return value if type(value) is int and value >= 0 else None
+
+    def telemetry(self):
+        """The engine's own counters, as crit serve's /health reports them at its root (engine_telemetry:
+        {"expert_cache": {"reads", "hits", ...}, ...}; CONTRACTS section 7), or None from a server that reports none:
+        the expert cache's hit rate where requests report no expert reads (protocol headroom.tiers)."""
+        value = (self.server.health(self.deadline.seconds(0)) or {}).get("engine_telemetry")
+        return value if isinstance(value, dict) else None
 
     def capacity(self):
         """The requests the server runs at once: crit serve's max_concurrent_requests on the model's card, read again
@@ -534,7 +575,7 @@ class ChatEngine:
         timeout = self.deadline.seconds(len(prompt), max_new_tokens) * max(1, clients)
         request = urllib.request.Request(self.server.url + "/chat/completions", data=json.dumps(body).encode(),
                                          headers=self.server.headers)
-        lines, pieces, usage, first, last = [], [], {}, None, None
+        lines, pieces, usage, first, last, telemetry = [], [], {}, None, None, {}
         started = time.perf_counter() - epoch
         try:
             with _bounded(timeout, "/chat/completions"), self.server.opener.open(request, timeout=timeout) as response:
@@ -546,6 +587,7 @@ class ChatEngine:
                         continue
                     event = json.loads(data[5:])
                     usage = event.get("usage") or usage
+                    telemetry = event.get("crit_telemetry") or telemetry
                     for choice in event.get("choices") or []:
                         piece = reply_text(choice.get("delta") or {})
                         if piece:
@@ -568,10 +610,15 @@ class ChatEngine:
         errors = list(outcome.errors)
         if cached_tokens(usage):
             errors.append(f"{self.server.url} served {cached_tokens(usage)} prompt tokens from its cache")
+        # The request's routed expert reads and those the device cache served (crit serve's telemetry): the level's own
+        # hit rate prices its batched ceiling (protocol concurrency.ceiling).
+        telemetry = telemetry if isinstance(telemetry, dict) else {}
+        counts = {key: telemetry[key] for key in ("expert_reads", "expert_hits") if type(telemetry.get(key)) is int}
         return {"prompt_tokens": len(prompt), "started": started, "first": first, "last": last, "finished": finished,
                 "completion_tokens": outcome.completion_tokens, "finish_reason": outcome.finish_reason,
                 "cached_tokens": cached_tokens(usage), "errors": errors,
-                "tokens": token_ids(self.text, "".join(pieces))}
+                "tokens": token_ids(self.text, "".join(pieces)),
+                **(counts if len(counts) == 2 and 0 <= counts["expert_hits"] <= counts["expert_reads"] else {})}
 
     def close(self):
         pass

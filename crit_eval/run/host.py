@@ -178,6 +178,24 @@ def device_memory(index=None, indices=None):
     return device_memory_row(rows, index)
 
 
+def with_engine_reading(row, engine):
+    """`row` (device_memory's) with the engine process's own free memory where its server reports one
+    (`engine.device_free_bytes()`): under the Windows display driver nvidia-smi counts only resident memory, so what an
+    engine holds but has not touched reads as free there. free_bytes becomes the smaller figure; both are kept."""
+    reader = getattr(engine, "device_free_bytes", None)
+    if row is None or not callable(reader) or row.get("devices"):
+        return row
+    try:
+        own = reader()
+    except (AttributeError, OSError, RuntimeError, ValueError):
+        own = None
+    if type(own) is not int:
+        return row
+    smi = row.get("free_bytes")
+    return {**row, "free_bytes_nvidia_smi": smi, "free_bytes_engine": own,
+            "free_bytes": own if smi is None else min(smi, own)}
+
+
 def device_memory_row(rows, index):
     """nvidia-smi's row of GPU `index` as {"index", "free_bytes", "used_bytes", "total_bytes"}, or None."""
     for row in rows:

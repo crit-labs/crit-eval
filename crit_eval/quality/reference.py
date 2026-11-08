@@ -45,16 +45,17 @@ its folder has the base model's.
 Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX. This is the slow, trusted path,
 run once per prepared data.
 
-Quality mode as_quantized (protocol quality.allowance): when the checkpoint declares quantized input activations,
-the same run scores the texts once more with the activations quantized as the checkpoint's own inference does: every
-matrix (and the output head) whose stored scheme declares input activations (crit_eval.limits.schemes.activations:
-NVFP4 in groups of 16 with the stored global scale, FP8 per token or per tensor) multiplies its inputs quantized and
-dequantized in FP32, the weights as in preserve mode. The KV cache and every other operation stay as in preserve mode.
-Only how far that run lands from the stored scores is kept, per set and path (store_allowance, fixed.ALLOWANCE): an
-engine that runs the checkpoint as quantized is judged against the exact scores with its limits widened by that drift.
-Fused experts (MergeModulelist, then Concatenate along the output rows) quantize each expert matrix's input with that
-matrix's own declared scale (_FusedInputs). A matrix with declared activations that the modeling code multiplies any
-other way is refused rather than left exact.
+Both quality modes (protocol quality.modes) judge against these scores: the checkpoint's stored weights, exact
+activations, whatever format the checkpoint stores. The allowance (protocol quality.allowance, on request): when the
+checkpoint declares quantized input activations, the same run scores the texts once more with the activations
+quantized as the checkpoint's own inference does: every matrix (and the output head) whose stored scheme declares
+input activations (crit_eval.limits.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
+token or per tensor) multiplies its inputs quantized and dequantized in FP32, the weights as in the exact pass. The KV
+cache and every other operation stay exact. Only how far that run lands from the stored scores is kept, per set and
+path (store_allowance, fixed.ALLOWANCE): what the declared format itself costs, reported and never judged. That pass
+is the one place the reference quantizes activations (StreamingReference declared_activations). Fused experts (MergeModulelist, then Concatenate
+along the output rows) quantize each expert matrix's input with that matrix's own declared scale (_FusedInputs). A
+matrix with declared activations that the modeling code multiplies any other way is refused rather than left exact.
 """
 import math
 import re
@@ -65,7 +66,7 @@ from pathlib import Path
 from .. import EVAL_DIR, load_json
 from ..architectures.indexers import FORM_VERSIONS, exact_forms
 from .prepare import PREPARED, model_identity, prepared_template
-from .fixed import QUALITY_MODES, STORE
+from .fixed import STORE
 from ..limits.schemes import PRIMARY, SchemeError
 from .attention import CHUNKED, CHUNKED_SINKS, _sink_attention, chunked_attention, chunked_sink_attention
 from .checkpoints import (STAGE_LIMIT, TORCH_DTYPES, TensorCheckpoint, _Substituted, _stored_tensor, _text_config,
@@ -82,6 +83,53 @@ GATHERABLE = (None, "fp8", "nvfp4")
 SCORE_ROWS = 512
 # What a forward that cannot resume a stored cache raises.
 RESUME_ERRORS = (RuntimeError, NotImplementedError, TypeError, ValueError, AttributeError)
+
+
+def torch_paths_on_cpu(model):
+    """Keep `model`'s CPU work on the modeling code's own torch functions. transformers swaps a modeling module's
+    torch functions (a recurrence, a convolution) for a package's device kernels where the package is installed (its
+    hub_kernels integration: fla's Triton kernels for a gated delta rule), whatever device the tensors are on, so a
+    layer running on CPU tensors fails inside Triton. Each such function of every modeling module `model`'s modules come
+    from is replaced, once per process, by one that calls the torch function when its first tensor argument is on the
+    CPU and the package's kernel otherwise (the kernel's own device checks then see any mix): device runs are
+    unchanged. Not patched: a function a modeling module imports from another modeling module (the importing module
+    keeps its own reference to the package kernel's wrapper; only the defining module's name is replaced, when one of
+    `model`'s modules comes from it), and modules outside transformers' own package (remote code). Returns the names
+    replaced."""
+    import functools
+    import inspect
+    import sys
+    import torch
+    found = []
+    for name in sorted({type(module).__module__ for module in model.modules()}):
+        source = sys.modules.get(name)
+        if source is None or not name.startswith("transformers."):
+            continue
+        for key, value in list(vars(source).items()):
+            if not inspect.isfunction(value) or getattr(value, "_crit_cpu_dispatch", False):
+                continue
+            chain, step = [value], value
+            while hasattr(step, "__wrapped__") and len(chain) < 8:
+                step = step.__wrapped__
+                chain.append(step)
+            base = chain[-1]
+            hub = any(f.__code__.co_filename.replace("\\", "/").endswith("transformers/integrations/hub_kernels.py")
+                      for f in chain[:-1] if inspect.isfunction(f))
+            if base is value or not hub or not inspect.isfunction(base) or base.__module__ != name:
+                continue
+            parameters = inspect.signature(base).parameters
+            open_ = any(p.kind is inspect.Parameter.VAR_KEYWORD for p in parameters.values())
+
+            def dispatch(*args, _kernel=value, _torch=base, _parameters=parameters, _open=open_, **kwargs):
+                first = next((v for v in (*args, *kwargs.values()) if isinstance(v, torch.Tensor)), None)
+                if first is None or first.device.type != "cpu":
+                    return _kernel(*args, **kwargs)
+                return _torch(*args, **(kwargs if _open else {k: v for k, v in kwargs.items() if k in _parameters}))
+            dispatch = functools.wraps(base)(dispatch)
+            dispatch._crit_cpu_dispatch = True
+            setattr(source, key, dispatch)
+            found.append(f"{name}.{key}")
+    return found
 
 
 @contextmanager
@@ -169,7 +217,8 @@ class _StreamedExperts:
 
 
 class _FusedInputs:
-    """Quality mode as_quantized for a fused experts module (StreamingReference._fused_inputs): while its forward
+    """The allowance's pass (StreamingReference declared_activations) for a fused experts module
+    (StreamingReference._fused_inputs): while its forward
     runs, an expert's matrix read from one of its fused parameters (param[expert], or a _StreamedExperts index) is
     remembered, and a linear with it as the weight multiplies each block of output rows by the input quantized as
     that block's stored matrix declares (crit_eval.limits.schemes.quantize_activations), the rows joined in order."""
@@ -249,12 +298,13 @@ class StreamingReference:
     # would take more than half the device's free memory in FP32, True for every one, False for none.
     stream_experts = None
 
-    def __init__(self, model, device="cuda", quality_mode="preserve"):
+    def __init__(self, model, device="cuda", declared_activations=False):
         import os
-        if quality_mode not in QUALITY_MODES:
-            raise SystemExit(f"quality mode must be one of {', '.join(QUALITY_MODES)}")
-        self.quality_mode = quality_mode
-        # as_quantized: {checkpoint base: crit_eval.limits.schemes.activations} as found, and the output head's
+        # The reference's own arithmetic, not a run's quality mode: exact activations score what both quality modes
+        # judge against; declared_activations quantizes them as the checkpoint declares, the allowance's pass alone
+        # (store_allowance), reported and never judged.
+        self.declared = declared_activations
+        # declared_activations: {checkpoint base: crit_eval.limits.schemes.activations} as found, and the output head's
         self.inputs, self.head_inputs = {}, None
         # Chunked attention allocates a score block of another width for every block of query rows; torch's default
         # segments then fragment until the device is full (a 32K-token text on a 31B model), while expandable
@@ -277,6 +327,9 @@ class StreamingReference:
         # Faster forms of modeling-code loops, bound where the code is the one they were checked against
         # (crit_eval.architectures.indexers): the same selection, without a Python loop per token.
         self.forms = exact_forms(self.skeleton)
+        # Layers run on CPU tensors (a reference on the CPU) keep the modeling code's torch functions where an installed
+        # package's device kernels would take them (torch_paths_on_cpu).
+        torch_paths_on_cpu(self.skeleton)
         # The buffers each decoder layer computes when built (rotary frequencies a layer holds itself, as attention
         # compressors do): a used layer is released to meta, and its next load puts them back (_restore).
         self.built = [{name: buffer for name, buffer in layer.named_buffers() if not buffer.is_meta}
@@ -573,7 +626,7 @@ class StreamingReference:
             state[name] = value if tensor is None else tensor
         module.load_state_dict(state, strict=True, assign=True)
         self._place(module)
-        if self.quality_mode == "as_quantized":
+        if self.declared:
             self._quantize_inputs(module, path)
         for name, experts in streamed.items():
             owner, _, attribute = name.rpartition(".")
@@ -598,7 +651,7 @@ class StreamingReference:
         return self.inputs[base]
 
     def _quantize_inputs(self, module, path):
-        """Quality mode as_quantized: the nn.Linear matrices of `module` (modeling-code path `path`) whose checkpoint
+        """The allowance's pass: the nn.Linear matrices of `module` (modeling-code path `path`) whose checkpoint
         declares input activations quantize their inputs as it declares (crit_eval.limits.schemes.quantize_activations), by
         a forward pre-hook set once per module, and fused experts per expert matrix (_fused_inputs). In a decoder layer,
         every stored matrix with declared activations must be one of them: one the modeling code multiplies otherwise
@@ -634,12 +687,12 @@ class StreamingReference:
             missed = sorted(base for base in self.members if base.startswith(prefix) and base not in hooked
                             and self._activations(base))
             if missed:
-                raise SchemeError(f"as_quantized: {', '.join(missed[:3])} declare quantized input activations, but the "
+                raise SchemeError(f"allowance: {', '.join(missed[:3])} declare quantized input activations, but the "
                                   "modeling code multiplies them other than through an nn.Linear (fused experts or a "
                                   "converted parameter); crit does not emulate their activations")
 
     def _fused_inputs(self, module, path):
-        """Quality mode as_quantized: {attribute: per expert [(base, rows, activations), ...] in output-row order} for
+        """The allowance's pass: {attribute: per expert [(base, rows, activations), ...] in output-row order} for
         `module`'s own fused expert parameters (modeling-code path `path`) whose stored matrices declare input
         activations: the converter only stacks the experts' matrices (MergeModulelist along dim 0) and joins them
         along the output rows (Concatenate along dim 1), so each output row of expert e comes from one stored matrix
@@ -655,7 +708,7 @@ class StreamingReference:
                     or any(type(op).__name__ != "Concatenate" or op.dim != 1 for op in operations[1:]) \
                     or any(len(sources) != value.shape[0] for sources in parts.values()):
                 if any(self._activations(base) for sources in parts.values() for base, _ in sources):
-                    raise SchemeError(f"as_quantized: {name} joins matrices that declare quantized input activations "
+                    raise SchemeError(f"allowance: {name} joins matrices that declare quantized input activations "
                                       "in a way crit does not emulate")
                 continue
             patterns = [pattern for pattern in converter.source_patterns if pattern in parts]
@@ -663,7 +716,7 @@ class StreamingReference:
                        self._activations(parts[pattern][expert][0])) for pattern in patterns]
                      for expert in range(value.shape[0])]
             if sum(rows for _, rows, _ in specs[0]) != value.shape[1]:
-                raise SchemeError(f"as_quantized: {name}: its stored matrices' rows do not make its {value.shape[1]}")
+                raise SchemeError(f"allowance: {name}: its stored matrices' rows do not make its {value.shape[1]}")
             if any(declared for parts_ in specs for _, _, declared in parts_):
                 found[attribute] = specs
         return found
@@ -870,7 +923,7 @@ class StreamingReference:
         device = self.torch.cuda.get_device_name(self.device) if str(self.device).startswith("cuda") else "cpu"
         return {"reference": REFERENCE_VERSION, "transformers": transformers.__version__,
                 "torch": self.torch.__version__, "device": device, "model_sha256": model_sha,
-                **({"quality_mode": self.quality_mode} if self.quality_mode != "preserve" else {}),
+                **({"activations": "declared"} if self.declared else {}),
                 **({"forms": [f"{name}@{FORM_VERSIONS.get(name, 1)}" for name in self.forms]} if self.forms else {}),
                 # Only attention with sinks runs its long texts otherwise (chunked_sink_attention).
                 **({"long_attention": self.chunked} if self.chunked != CHUNKED else {})}
@@ -1177,8 +1230,8 @@ class StreamingReference:
                          if module is self.skeleton.get_input_embeddings())
         base = (self._key(embedding + ".weight") if tied else stored)[: -len(".weight")]
         head = self.checkpoint.dense(base, self.device)[:valid_vocab]
-        # as_quantized: the head's inputs quantized as the checkpoint declares for it (FP8 per token, typically).
-        self.head_inputs = self._activations(base) if self.quality_mode == "as_quantized" else None
+        # The allowance's pass: the head's inputs quantized as the checkpoint declares for it (FP8 per token, typically).
+        self.head_inputs = self._activations(base) if self.declared else None
         return head, getattr(self.config, "final_logit_softcapping", None)
 
     def _text_rows(self, ids, pieces, outputs, head, cap, top_k, long):
@@ -1358,13 +1411,12 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
                     check=lambda: None, device="cuda"):
     """protocol quality.allowance: how far the checkpoint run with its activations quantized as it declares
     (`declared`: StreamingReference.declared_activations) lands from the stored scores, per set and path
-    (_compare_sets), stored beside them (fixed.write_allowance) for runs in quality mode as_quantized. A checkpoint
-    that declares none stores an empty allowance (as_quantized is then preserve). Scores of the as_quantized mode
-    stored by crit-eval before protocol crit-eval-v0.3.0 (fixed.LEGACY_AS_QUANTIZED) of the same model, texts and
-    reference give it without the second run. Returns "stored", "none", "derived", "measured" or "unsupported" (a
-    declared form crit does not emulate, recorded so runs in that mode say why)."""
+    (_compare_sets), stored beside them (fixed.write_allowance): what the declared format itself costs, reported and
+    never judged (both quality modes judge against the exact scores). A checkpoint that declares none stores an empty
+    allowance. Returns "stored", "none", "measured" or "unsupported" (a declared form crit does not emulate, recorded
+    so the allowance says why it is missing)."""
     from . import fixed
-    allowance_identity = {**identity, "allowance": "as_quantized"}
+    allowance_identity = {**identity, "allowance": "declared_activations"}
     if fixed.load_allowance(data, allowance_identity) is not None:
         return "stored"
     if isinstance(declared, Exception):
@@ -1375,29 +1427,20 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
         fixed.write_allowance(data, allowance_identity, {"activations": [], "sets": {}})
         return "none"
     stored = fixed.load(data, identity)
-    legacy = fixed.load(data, {**{key: identity[key] for key in ("reference", "model_sha256", "top_k", "valid_vocab",
-                                                                 "texts")}, "quality_mode": "as_quantized"},
-                        fixed.LEGACY_AS_QUANTIZED)
     started = time.time()
-    if legacy is not None:
-        found = {name: [{"logprob": row["logprob"], "top": list(zip(row["top_ids"], row["top_logprobs"]))}
-                        for row in rows] for name, rows in legacy.items()}
-        sets, how = _compare_sets(found, stored, layout), "derived"
-        log(f"reference allowance: derived from the {fixed.LEGACY_AS_QUANTIZED} scores stored beside the data")
-    else:
-        names = list(texts)
-        log(f"reference allowance: the texts scored again with the activations quantized as the checkpoint declares "
-            f"({', '.join(declared)})")
-        try:
-            quantized = StreamingReference(model, device, quality_mode="as_quantized")
-            rows = quantized.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
-                                         Path(data) / STORE / "scratch-allowance", log=log,
-                                         long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
-        except SchemeError as error:
-            fixed.write_allowance(data, allowance_identity, {"unsupported": str(error), "sets": {}})
-            log(f"reference allowance: not measured ({error})")
-            return "unsupported"
-        sets, how = _spread_sets(dict(zip(names, rows)), stored, layout), "measured"
+    names = list(texts)
+    log(f"reference allowance: the texts scored again with the activations quantized as the checkpoint declares "
+        f"({', '.join(declared)})")
+    try:
+        quantized = StreamingReference(model, device, declared_activations=True)
+        rows = quantized.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
+                                     Path(data) / STORE / "scratch-allowance", log=log,
+                                     long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
+    except SchemeError as error:
+        fixed.write_allowance(data, allowance_identity, {"unsupported": str(error), "sets": {}})
+        log(f"reference allowance: not measured ({error})")
+        return "unsupported"
+    sets, how = _spread_sets(dict(zip(names, rows)), stored, layout), "measured"
     for name, row in sets.items():
         log(f"reference allowance {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
             f"PPL x{row['ppl_ratio']:.4f} over {row['targets']:,} positions")
@@ -1406,11 +1449,10 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
     return how
 
 
-def score_data(model, data, log=print, check=lambda: None, quality_mode=None, allowance=False):
+def score_data(model, data, log=print, check=lambda: None, allowance=False):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
     store the scores under the data (crit_eval.quality.fixed), with the reference's own spread, unless they are stored
-    already under the same identity: one run serves both quality modes (quality_mode is accepted from callers of
-    earlier versions and changes nothing). allowance: also measure, for a checkpoint that declares quantized
+    already under the same identity: both quality modes judge against them. allowance: also measure, for a checkpoint that declares quantized
     activations, how far the checkpoint run with them quantized lands from the scores (store_allowance), a second
     scoring pass whose result is reported, not judged (protocol quality.allowance). check() runs between layers and
     texts: it raises to stop. Returns how they were obtained."""

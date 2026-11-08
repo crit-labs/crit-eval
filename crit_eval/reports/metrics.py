@@ -268,10 +268,16 @@ def bucketed(reference_rows, engine_rows, labels):
     return {label: text_quality(*rows) for label, rows in groups.items()}
 
 
-def mode_thresholds(rule, mode="preserve"):
-    """The drift budget of quality mode `mode` under protocol quality rule `rule`: its mode_thresholds entry, else
-    thresholds (preserve's)."""
-    return dict((rule.get("mode_thresholds") or {}).get(mode) or rule["thresholds"])
+def mode_thresholds(rule, mode):
+    """The drift budget of quality mode `mode` under protocol quality rule `rule`: preserve's thresholds, another
+    mode's its mode_thresholds entry; a mode the protocol does not name is refused."""
+    if mode == "preserve":
+        return dict(rule["thresholds"])
+    found = (rule.get("mode_thresholds") or {}).get(mode)
+    if not isinstance(found, dict):
+        named = ["preserve"] + [k for k, v in (rule.get("mode_thresholds") or {}).items() if isinstance(v, dict)]
+        raise ValueError(f"quality mode {mode!r} has no budget in the protocol: {' or '.join(named)}")
+    return dict(found)
 
 
 def budget_used(quality, thresholds):

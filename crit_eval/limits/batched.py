@@ -1,15 +1,25 @@
 """The ceiling of serving several requests at once (protocol concurrency.ceiling): one decode step of B rows, one per
 request, reads every weight read on every pass once for all of them, the routed experts its rows touch, and each row's
-KV and fixed state, and computes every row's matmuls, logits and attention. Its floor is the larger of
+KV and fixed state, and computes every row's matmuls, logits and attention. Its floor is the largest of
 
-    memory   (resident bytes + expert bytes x E(1 - (1 - k/E)^B)/E + B x (KV per token x context + fixed state)) / bandwidth
+    memory   (device-resident bytes + touched experts held on the device + B x (KV per token x context + fixed state))
+             / bandwidth
+    host     the host bytes (resident weights off the device + touched experts read from host memory) on the faster of
+             two paths: copied over the host link (bytes / the link's rate) or computed on the CPU (the longer of bytes /
+             host memory's read rate and B rows' arithmetic on their share of them / the CPU's rate)
     compute  B x sum over stored formats of active matmul FLOPs per token / that format's best rate
              + B x context x attention FLOPs per query-key pair / the faster of the BF16 and FP8 rates
 
 where a layer of E experts routing k per token has E(1 - (1 - k/E)^B) of them touched by B independent rows, and a
-row's active matmul FLOPs are the dense matrices', the output head's and k/E of the experts'. The aggregate ceiling is
-B tokens per step over that floor. Counted from the weight headers and config, as crit_eval.limits.ceiling counts a
-single pass; engines that speculate decode more than a token per row per step, which this bound leaves out, as the
+row's active matmul FLOPs are the dense matrices', the output head's and k/E of the experts'. For a model whose weights
+the device cannot all hold (the run's memory tiers, crit_eval.limits.tiers), the touched experts the device's capacity
+cannot hold are read from host memory every step, and so are those the engine's expert cache misses at its measured
+hit rate (tiers.expert_misses): each row brings its own misses, so an engine whose misses come from host memory serves
+little more at B rows than at one. Without a measured hit rate that part is unmeasured and the floor holds the capacity
+bound alone, every other routed expert read from the device: an optimistic floor.
+The aggregate ceiling is B tokens per step over that floor; the speedup the cost model expects at B rows is the
+ceiling at B over the ceiling at one row. Counted from the weight headers and config, as crit_eval.limits.ceiling counts
+a single pass; engines that speculate decode more than a token per row per step, which this bound leaves out, as the
 fixed decode denominator does."""
 import math
 
@@ -17,6 +27,7 @@ from .ceiling import matmul_flops, model_config, weight_files
 from .context import weight_split
 from .schemes import quantization_of
 from .tensors import tensor_role
+from .tiers import UNMEASURED, expert_misses
 
 
 def batch_terms(model, kv_bytes_per_element):
@@ -64,18 +75,49 @@ def touched(experts, per_token, rows):
     return 1.0 - (1.0 - min(1.0, per_token / experts)) ** rows
 
 
-def step_floor(terms, rows, context, bandwidth_gbs, tflops):
+def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None):
     """The floor of one decode step of `rows` rows at `context` tokens each: {"rows", "memory_ms", "compute_ms",
-    "step_ms", "bound", "ceiling_tps" (rows over the step), "expert_share" (experts touched)}, or (None, missing)."""
+    "step_ms", "bound", "ceiling_tps" (rows over the step), "expert_share" (experts touched)}, or (None, missing).
+    host: what a model whose weights the device cannot all hold reads from host memory ({"tiers": the run's memory
+    tiers (crit_eval.limits.tiers.derive, with their link and host memory rates and the CPU's), "hit_rate": the expert
+    cache's hit rate, measured or declared by host_bytes_per_pass, or None, "hit_rate_source"}); the step then records
+    "host_ms" on its "host_path" (link or cpu; "host_paths_ms" both), "host_bytes", "hit_rate", "hit_rate_source" and,
+    without a hit rate, "unmeasured" (the misses beyond the capacity bound)."""
     missing = [name for name, value in (("model weight headers", terms), ("device bandwidth (--device)", bandwidth_gbs),
                                         ("device GEMM rates (--device)", tflops)) if not value]
     if missing:
         return None, missing
     share = touched(terms["experts"], terms["experts_per_token"], rows)
-    read = (terms["resident_bytes"] + terms["expert_bytes"] * share
+    active = min(1.0, terms["experts_per_token"] / terms["experts"]) if terms["experts"] else 0.0
+    tiers = host["tiers"] if host else None
+    if tiers:
+        # The placement's resident weights off the device, at most those a step reads: its resident weights hold the
+        # draft layers, which a decode step leaves out (batch_terms).
+        resident_off = min(int(tiers["resident_off_device_bytes"]), int(terms["resident_bytes"]))
+        missed, miss_share, source = expert_misses({**tiers, "expert_bytes": terms["expert_bytes"]}, share,
+                                                   host["hit_rate"], host["hit_rate_source"])
+    else:
+        resident_off, missed, miss_share, source = 0, 0.0, 0.0, None
+    from_host = resident_off + missed
+    read = (terms["resident_bytes"] - resident_off + terms["expert_bytes"] * share - missed
             + rows * (terms["kv_bytes_per_token"] * context + terms["fixed_state_bytes"]))
     memory = read / (bandwidth_gbs * 1e9) * 1000
-    active = min(1.0, terms["experts_per_token"] / terms["experts"]) if terms["experts"] else 0.0
+    paths = {}
+    if from_host:
+        rates = tiers["rates_gbs"]
+        if rates["link"]:
+            paths["link"] = from_host / (rates["link"] * 1e9) * 1000
+        if rates["memory"]:
+            cpu = from_host / (rates["memory"] * 1e9) * 1000
+            if tiers["flops_per_weight_byte"] and tiers["cpu_gflops"]:
+                # Each row's arithmetic on its share of the host bytes: the resident ones off the device and its own
+                # experts' misses, at the step's miss share.
+                per_row = resident_off + terms["expert_bytes"] * active * miss_share
+                cpu = max(cpu, rows * per_row * tiers["flops_per_weight_byte"] / (tiers["cpu_gflops"] * 1e9) * 1000)
+            paths["cpu"] = cpu
+        if not paths:
+            return None, ["host link and host memory rates (re-run crit eval probe)"]
+    path = min(paths, key=paths.get) if paths else None
     compute, unpriced = 0.0, []
     for fmt in sorted(set(terms["dense_flops"]) | set(terms["expert_flops"])):
         flops = terms["dense_flops"].get(fmt, 0) + terms["expert_flops"].get(fmt, 0) * active
@@ -89,7 +131,15 @@ def step_floor(terms, rows, context, bandwidth_gbs, tflops):
         compute += rows * context * terms["attention_flops_per_pair"] / (attention_rate * 1e12) * 1000
     if unpriced:
         return None, unpriced
-    step = max(memory, compute)
-    return {"rows": rows, "memory_ms": memory, "compute_ms": compute, "step_ms": step,
-            "bound": "memory" if memory >= compute else "compute", "ceiling_tps": rows / step * 1000 if step else None,
-            "expert_share": share if terms["experts"] else None}, []
+    parts = {"memory": memory, "compute": compute, **({path: paths[path]} if path else {})}
+    bound = max(parts, key=parts.get)
+    step = parts[bound]
+    out = {"rows": rows, "memory_ms": memory, "compute_ms": compute, "step_ms": step, "bound": bound,
+           "ceiling_tps": rows / step * 1000 if step else None, "expert_share": share if terms["experts"] else None}
+    if tiers:
+        out.update(host_ms=paths[path] if path else 0.0, host_path=path, host_paths_ms=paths,
+                   host_bytes=int(from_host), hit_rate=None if source == "unmeasured" else 1.0 - miss_share,
+                   hit_rate_source=source)
+        if source == "unmeasured":
+            out["unmeasured"] = UNMEASURED
+    return out, []

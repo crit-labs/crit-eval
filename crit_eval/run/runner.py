@@ -16,7 +16,7 @@ from .concurrency import run_concurrency
 from .deadline import Hung, RequestDeadline
 from .estimate import estimate, summary as estimate_summary
 from ..limits.context import GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes, placement, weight_split
-from ..limits.tiers import derive as derive_tiers
+from ..limits.tiers import derive as derive_tiers, telemetry_counts
 from ..limits import devices as device_set
 from .pin import load_continuations
 from ..quality.prepare import PREPARED, check_prepared, check_template, model_description
@@ -25,7 +25,7 @@ from .adapters import file_sha256, load_adapter, native_identity, open_engine, p
 from .forks import judge_forks
 from .history import compare_followup, compare_history, history_cases, history_outputs, run_followup
 from .jitter import new_seed, record as jitter_record
-from .tracks import closed as closed_track, engine_loads
+from .tracks import closed as closed_track, engine_loads, mode_budgets
 from .long_context import compare_lower, context_requirement, run_context, run_lower_context, run_retrieval
 from .quality_checks import (merge_honesty, merge_quality, quality_thresholds, reference_origin, run_attribution,
                              run_honesty, run_quality, stored_spread)
@@ -75,8 +75,8 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
         abort_disturbed=True, url=None, served_model=None, requested_context=None, context_basis=None, profile=None,
-        chat_template=None, attribute_drift=False, adaptive_sampled=False, quality_mode="preserve", stage=None,
-        certify=False, budget_seconds=None, journaled=True, resume=None, identity=None, jitter_seed=None):
+        chat_template=None, attribute_drift=False, adaptive_sampled=False, quality_mode=fixed.DEFAULT_QUALITY_MODE,
+        stage=None, certify=False, budget_seconds=None, journaled=True, resume=None, identity=None, jitter_seed=None):
     """adapter: the eval-v1 adapter file, or an object that opens engines as an adapter module does
     (create_eval_engine), its `server` naming them in the result (crit run eval serves a candidate per engine); with
     url instead, the engine behind that OpenAI-compatible server (crit_eval.run.chat), served_model naming its model.
@@ -105,10 +105,12 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     (run_sampled_speed; crit eval run --adaptive-sampled), recorded in the result (sampled_speed.adaptive); off by
     default, the seeds' repetitions alone (sampled_speed.adaptive null). A fixed repetition count (--repetitions, a
     profile's sampled_repetitions) is never extended.
-    quality_mode: "preserve" judges quality against the reference with exact activations, "as_quantized" against the
-    same scores with its own budget (protocol quality.mode_thresholds), output differences that part at near-ties
-    allowed (protocol forks) and the honesty check bounded (quality.honesty.modes); the result records it in
-    requirements and its status prices prefill against that mode's arithmetic.
+    quality_mode (protocol quality.modes): how much output drift from the checkpoint the engine may trade for speed,
+    never how the checkpoint is stored; both modes judge against the same reference scores (the checkpoint's stored
+    weights, exact activations). \"speed\" (the default) judges by its own budget (protocol
+    quality.mode_thresholds), output differences that part at near-ties allowed (protocol forks) and the honesty
+    check bounded (quality.honesty.modes); "preserve" by the protocol's thresholds. The result records it in
+    requirements and its status prices prefill against the arithmetic that mode admits.
     stage: a run without a profile measures in stages (protocol stages): None goes as far as budget_seconds (default
     the protocol's) allows at the engine's measured rates, 1, 2 or 3 at most that far, "full" every part at the
     protocol's repetitions as before stages (warmups and repetitions apply to it alone). certify: the candidate that
@@ -128,7 +130,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     if quality_mode not in fixed.QUALITY_MODES:
         raise SystemExit(f"quality mode must be one of {', '.join(fixed.QUALITY_MODES)}")
     protocol = load_json(EVAL_DIR / "protocol.json")
-    thresholds = quality_thresholds(protocol, quality_budget, quality_mode)
+    thresholds = quality_thresholds(protocol, quality_budget, mode=quality_mode)
     exactness = exactness or protocol["exactness"].get("default", "required")
     if exactness not in EXACTNESS_MODES:
         raise SystemExit(f"exactness must be one of {', '.join(EXACTNESS_MODES)}")
@@ -206,7 +208,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         "server": url or getattr(opener, "server", None),
         "device": {k: device.get(k) for k in ("device", "compute_capability", "cuda_runtime", "bandwidth_gbs", "tflops",
                                                "mma_tflops", "host_to_device_gbs", "device_to_host_gbs", "host_threads",
-                                               "cpu_isa",
+                                               "cpu_isa", "host_expert_gbs", "host_expert_isa",
                                                "host_memory_gbs", "cpu_gflops", "memory_total_bytes",
                                                "memory_free_bytes", "host_memory_total_bytes", "measured_at")}
                    | {k: device[k] for k in ("backend", "arch", "runtime_version", "fp8_encoding", "unsupported_formats",
@@ -289,6 +291,72 @@ def _nothing():
     yield None
 
 
+class Counters:
+    """The engine's own expert cache counters (its telemetry(), crit_eval.limits.tiers.telemetry_counts) over the
+    requests of each speed suite: result telemetry {suite: {"reads", "hits", "hit_rate"}}, the hit rate the memory
+    tiers price the expert misses at where the requests report no expert reads (protocol headroom.tiers). A window is
+    the counters' change from before a suite's first request to after its last: it covers every request the suite
+    sent (warmups and the prompts' prefills included) and, on a server, whatever else the engine served meanwhile; a
+    served engine's counters are those its last status report carried (crit serve refreshes /health after each
+    request), which may lag the last request. A window is recorded only when its suite completes, and dropped when
+    the counters went backwards (the engine opened again). An engine without telemetry(), or one whose telemetry
+    names no expert cache, records none."""
+
+    def __init__(self, engine):
+        self.engine, self.windows = engine, {}
+
+    def read(self):
+        if not callable(getattr(self.engine, "telemetry", None)):
+            return None
+        try:
+            return telemetry_counts(self.engine.telemetry())
+        except Exception:   # noqa: BLE001 - counters are a figure, never a reason to stop the round
+            return None
+
+    @contextmanager
+    def window(self, name):
+        before = self.read()
+        yield   # a suite that raises records no window: its counters cover requests it did not finish
+        after = self.read() if before is not None else None
+        if after is not None and after[0] >= before[0] and after[1] >= before[1]:
+            row = self.windows.setdefault(name, {"reads": 0, "hits": 0})
+            row["reads"] += after[0] - before[0]
+            row["hits"] += after[1] - before[1]
+
+    def record(self):
+        return {name: {**row, "hit_rate": row["hits"] / row["reads"] if row["reads"] else None}
+                for name, row in self.windows.items()}
+
+
+def placement_tiers(model, device, settings, required, info, ceiling, loaded_free):
+    """The model's memory tiers on the device at the required context (protocol headroom.tiers,
+    crit_eval.limits.tiers.derive), or None when every weight a pass reads is on the device or Eval cannot place the
+    model. loaded_free: the device memory free with the engine opened at the requirement, whose footprint (free memory
+    before its load less after it) says which resident weights fit beside its KV cache."""
+    before = (device or {}).get("memory_free_bytes")
+    held = (before - loaded_free if isinstance(loaded_free, int) and isinstance(before, int) and before >= loaded_free
+            else None)
+    try:
+        where = placement(model, device, settings.get("vram_headroom_bytes", GIB),
+                          float(machine_settings().get("ram_headroom_gib", 2.0)) * GIB, settings, required,
+                          held_bytes=held, kv_bytes_per_token=info.get("kv_bytes_per_token")) \
+            if device and required else None
+    except (OSError, ValueError, KeyError, TypeError):
+        where = None
+    return derive_tiers(where, ceiling)
+
+
+def declared_hit_rate(info, tiers):
+    """The expert cache hit rate an engine's host_bytes_per_pass implies (its declared host bytes beyond the resident
+    weights off the device, over the experts a token activates), or None without a declaration or tiers."""
+    found = info.get("host_bytes_per_pass")
+    active = (tiers or {}).get("active_expert_bytes_per_token")
+    if not isinstance(found, dict) or not active or not (found.get("link") or found.get("cpu")):
+        return None
+    misses = (found.get("link") or 0) + (found.get("cpu") or 0) - (tiers.get("resident_off_device_bytes") or 0)
+    return 1.0 - min(1.0, max(0.0, misses / active))
+
+
 def _stopped(result, times, out, written, reason, detail):
     """Write what a round that stopped measured, marked aborted, and end its journal with the reason."""
     result["aborted"] = {"reason": reason, "detail": detail}
@@ -328,18 +396,29 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     result["context"]["engine_max_context"] = info["max_context"]
     # protocol context.device_memory: what the device keeps free with this engine built for the required context.
     gpus = device_set.indices(device)   # every GPU of a device set, else the engine's one
-    memory = {"after_load": host.device_memory(indices=gpus)}
+    memory = {"after_load": host.with_engine_reading(host.device_memory(indices=gpus), engine)}
     if info.get("native_libraries"):
         result["native_libraries"] = native_identity(info)
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
 
+    counters = Counters(engine)
+
     def ceiling_inputs():
-        """The batched ceiling's inputs (crit_eval.limits.batched): the model's step terms, bandwidth and rates."""
+        """The batched ceiling's inputs (crit_eval.limits.batched): the model's step terms, bandwidth and rates, and
+        for a model whose weights the device cannot all hold its memory tiers with the expert cache's measured hit rate
+        (the decode suite's requests, else the engine's counters, else its host_bytes_per_pass; unmeasured without)
+        and the probed link rate."""
         try:
             terms = batch_terms(model, float(settings["kv_bytes_per_element"]))
         except (OSError, ValueError, KeyError):
             terms = None
-        return terms, bandwidth_gbs, best_rates(device)[0] or None
+        tiers = placement_tiers(model, device, settings, required, info, ceiling,
+                                (memory.get("after_load") or {}).get("free_bytes"))
+        rate, source = headroom.measured_hit_rate({**result, "telemetry": counters.record()})
+        if rate is None and declared_hit_rate(info, tiers) is not None:
+            rate, source = declared_hit_rate(info, tiers), "host_bytes_per_pass"
+        host = {"tiers": tiers, "hit_rate": rate, "hit_rate_source": source} if tiers else None
+        return terms, bandwidth_gbs, best_rates(device)[0] or None, host
 
     def concurrency(fits=None):
         """protocol concurrency: after every other part on this engine, the request history's closing request
@@ -347,12 +426,13 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if "concurrency" in parts and not result.get("stopped_early"):
             with times.part("concurrency"):
                 result["concurrency"] = run_concurrency(engine, info, prepared, protocol, result, required, log, fits,
-                                                        ceiling_inputs)
+                                                        ceiling_inputs,
+                                                        forks=headroom.quality_mode(result) == "speed")
     try:
         if staged is not None:
             plan = _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required,
                            settings, exactness, disturbed, reference_scores, reference_spread,
-                           memory, times, baseline, staged, concurrency)
+                           memory, times, baseline, staged, concurrency, counters)
         else:
             fresh = None
             if "history" in parts:
@@ -386,7 +466,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                     if found is not None:
                         result["estimate"] = found
                         log(estimate_summary(found))
-                with times.part("speed"):
+                with times.part("speed"), counters.window("speed"):
                     result["speed"] = run_speed(engine, info, prepared, protocol, warmups, repetitions, log,
                                                 continuations, disturbed, after_first=log_estimate)
                 if info.get("served") and not info.get("speculative") and drafts(result["speed"]):
@@ -395,7 +475,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                     info.update(speculative=True, speculative_source="telemetry")
                     log("engine: speculative (its telemetry reports more than one token per target pass)")
                 checked = {}
-                with times.part("sampled_speed"):
+                with times.part("sampled_speed"), counters.window("sampled_speed"):
                     result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, warmups,
                                                                 sampled_repetitions, log, disturbed, checked,
                                                                 adaptive=adaptive_sampled and sampled_repetitions is None)
@@ -442,7 +522,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                     for key, row in result["context"]["interpolated"].items():
                         log(f"context {int(key):,}: interpolated decode {row['decode_tps']:.1f} tok/s, first token "
                             f"after {row['ttft_ms']:,.0f} ms")
-                memory["after_curve"] = host.device_memory(indices=gpus)
+                memory["after_curve"] = host.with_engine_reading(host.device_memory(indices=gpus), engine)
                 with times.part("retrieval"):
                     result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log,
                                                                    asked)
@@ -468,7 +548,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 for case_id, row in result["history"]["cases"].items():
                     log(f"history {case_id}: " + (f"identical after {between}" if row["identical"] else
                                                   f"differs at token {row['first_difference']} after {between}"))
-            if headroom.quality_mode(result) == "as_quantized" and not stopped:
+            if headroom.quality_mode(result) == "speed" and not stopped:
                 # protocol forks: each recorded output difference judged on this engine before it closes
                 with times.part("forks"):
                     judge_forks(result, engine, prepared, protocol, log)
@@ -478,10 +558,15 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         result["engine_loads"]["last"] = engine_loads(engine)
     finally:
         engine.close()
+    if counters.windows:
+        # The engine's own expert cache counters over each speed suite (protocol headroom.tiers).
+        result["telemetry"] = counters.record()
     if staged is not None and plan["lower"]:
         if plan["fits"]("lower_context", plan["lower_seconds"]):
             with times.part("lower_context"):
-                lower = run_lower_context(module, model, config, prepared, protocol, required, 0, 1, log,
+                # One warm-up per case: the engine at the requirement measured its cases after the history and
+                # other parts had warmed it, the lower context's is freshly opened.
+                lower = run_lower_context(module, model, config, prepared, protocol, required, 1, 1, log,
                                           continuations, disturbed, exact_prompts="quality" in parts)
     elif staged is not None and "context" in parts and "speed" in parts and required:
         lower = {"context": None, "passed": None, "reason": plan["lower_reason"]}
@@ -504,7 +589,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 result["quality"]["attribution"] = run_attribution(
                     module, model, config, prepared, protocol, log, reference_scores,
                     result["requirements"]["quality_budget"], reference_spread, result["quality"],
-                    info.get("exact_variants"), required)
+                    info.get("exact_variants"), required, mode=headroom.quality_mode(result))
     wider = info.get("wider_draft")
     if (wider and "speed" in result and info.get("speculative") and not info.get("served")
             and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
@@ -564,14 +649,10 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         # Each format's best probed rate, cuBLASLt's GEMM or the raw tensor cores' (crit_eval.limits.ceiling.best_rates).
         rates, rate_sources = best_rates(device)
         # The model's memory tiers on the device at the required context (protocol headroom.tiers): the weights its
-        # placement leaves off the device, which an engine that declares no host bytes is priced by.
-        try:
-            where = placement(model, device, settings.get("vram_headroom_bytes", GIB),
-                              float(machine_settings().get("ram_headroom_gib", 2.0)) * GIB, settings, required) \
-                if device and required else None
-        except (OSError, ValueError, KeyError, TypeError):
-            where = None
-        tiers = derive_tiers(where, ceiling)
+        # placement leaves off the device, which an engine that declares no host bytes is priced by. The engine opened
+        # at the requirement: its measured footprint says which resident weights fit beside its KV cache.
+        loaded = ((result["context"].get("device_memory") or {}).get("after_load") or {}).get("free_bytes")
+        tiers = placement_tiers(model, device, settings, required, info, ceiling, loaded)
         result["headroom"] = headroom.summarize(facts, result["speed"], step_ms, bandwidth_gbs, protocol["headroom"],
                                                 ceiling=ceiling, tflops=rates or None, steps=steps,
                                                 prefill_cases=protocol["speed"].get("prefill_cases", []),
@@ -579,7 +660,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                                 decode_speed=decode_speed, decode_name=decode_name,
                                                 host_rates={"link": link_gbs(device),
                                                             "memory": ((device or {}).get("host_memory_gbs") or {}).get("read")},
-                                                model_pass=model_pass, tiers=tiers)
+                                                model_pass=model_pass, tiers=tiers, telemetry=result.get("telemetry"))
         # An engine whose weights cannot all be on the device: priced by the placement's tiers when it declares no host
         # bytes, and asked for them only when Eval cannot place the model.
         try:
@@ -590,10 +671,12 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
             info, split and split["resident"] + split["experts"], (device or {}).get("memory_total_bytes"))
         if undeclared and tiers:
             off = result["headroom"]["host_pass"] or {}
+            rate = (f"at a {off['hit_rate']:.0%} expert cache hit rate ({off.get('hit_rate_source')})"
+                    if off.get("hit_rate") is not None else
+                    "with the expert cache's misses unmeasured (no expert_reads and expert_hits)")
             result["headroom"]["warnings"].append(
                 f"pass floor priced by the placement's tiers ({tiers['scenario']}): {(off.get('link') or 0) + (off.get('cpu') or 0):,.0f} "
-                f"bytes per pass from host memory at a {off.get('hit_rate', 0):.0%} expert cache hit rate "
-                f"({off.get('hit_rate_source')}); the engine's host_bytes_per_pass would price its own path")
+                f"bytes per pass from host memory {rate}; the engine's host_bytes_per_pass would price its own path")
             log("headroom: " + result["headroom"]["warnings"][-1])
         elif undeclared:
             result["headroom"]["missing"].append(undeclared)
@@ -617,7 +700,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     except (OSError, ValueError, KeyError):
         own = None
     result["track"] = {"closed": closed_track(result, result.get("engine") or {}, own,
-                                              float(protocol["tracks"]["draft_tolerance"]))}
+                                              float(protocol["tracks"]["draft_tolerance"]), mode_budgets(protocol))}
     result["timing"] = times.record()
     log(f"timing: {times.summary()}; total {result['timing']['total_seconds']:.0f} s")
     written = journal.active()
@@ -632,11 +715,13 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
 
 def _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required, settings, exactness,
             disturbed, reference_scores, reference_spread, memory, times, baseline, staged,
-            concurrency=None):
+            concurrency, counters):
     """The parts of a staged run on its engine (protocol stages): stage 1, then the highest stage that fits the
     budget at the rates the engine measured (with the certification's request at the requirement when certified),
-    the request history again, and the concurrency part, each level while it fits (concurrency(fits)). Returns what the run does after the engine closed: {"lower": whether stage 3
-    measures the lower context, "lower_seconds", "lower_reason" when it does not, "fits": the budget check}."""
+    the request history again, and the concurrency part, each level while it fits (concurrency(fits)). counters: the
+    engine's expert cache counters over each speed suite (Counters). Returns what the run does after the engine
+    closed: {"lower": whether stage 3 measures the lower context, "lower_seconds", "lower_reason" when it does not,
+    "fits": the budget check}."""
     rule, certify, budget = protocol["stages"], staged["certify"], staged["budget_seconds"]
     record = result["stages"] = {"budget_seconds": budget, "cap": staged["stage"], "certify": certify, "reached": 1,
                                  "skipped": {}, "estimate": None}
@@ -655,10 +740,12 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         return False
 
     if required:
-        result["context"]["fit"] = memory_fit(memory.get("after_load"), info, result.get("ceiling"), required)
+        result["context"]["fit"] = memory_fit(memory.get("after_load"), info, required)
     sampled = "speed" in parts and hasattr(engine, "generate_sampled")
     shared = "exactness" in parts and "speed" in parts and plain_on_engine(engine, info)
-    heldout = "heldout" in parts and ((baseline or {}).get("heldout") or {}).get("status") == "measured"
+    # The held-out prompts run in stage 1, so a candidate's first staged Eval measures them and a later candidate's
+    # generality gate has a baseline that did (protocol stages 1).
+    heldout = "heldout" in parts
     lower = "context" in parts and "speed" in parts and bool(required) and not isinstance(module, Server)
     # Which run part each timing part belongs to: a part the run leaves out costs nothing.
     owner = {"followup_again": "followup", "retrieval": "context", "sampled_speed": "speed",
@@ -679,17 +766,19 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         return sum(price({"rows": rows}, now, rounds[len(rounds) // 2] if rounds else None).values())
 
     def admit(case, measured):
-        """Why stage 1 leaves out a speed case after the first: its expected time and stage 1's quality and request
-        history after it would pass the budget. None when it fits, or before the rates are known."""
+        """Why stage 1 leaves out a speed case after the first: its expected time and stage 1's held-out prompts,
+        quality and request history after it would pass the budget. None when it fits, or before the rates are
+        known."""
         if budget is None:
             return None
         need = expected([(len(case["prompt_ids"]), case["output_tokens"], 0, False)], measured)
-        after = expected(planned[1].get("quality", []) + planned[1].get("history_again", []), measured)
+        after = expected(planned[1].get("heldout", []) + planned[1].get("quality", []) + planned[1].get("history_again", []),
+                         measured)
         if need is None:
             return None
         left = budget - elapsed() - (after or 0.0)
         return None if need <= left else (f"over budget: about {duration(need)} with {duration(max(0.0, left))} left "
-                                          "before stage 1's quality")
+                                          "before stage 1's held-out prompts and quality")
 
     def log_estimate(case):
         """The run's first estimate, after its first speed case: stage 1 in all and what each later stage adds."""
@@ -713,7 +802,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         log("history: fresh outputs of " + (", ".join(fresh) or "no case (none fits the engine)"))
     text = decode_text(info, continuations)
     if "speed" in parts:
-        with times.part("speed"):
+        with times.part("speed"), counters.window("speed"):
             result["speed"] = run_speed(engine, info, prepared, protocol, 0, 1, log, continuations, disturbed,
                                         after_first=log_estimate, admit=admit)
         if info.get("served") and not info.get("speculative") and drafts(result["speed"]):
@@ -722,6 +811,11 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         if result["speed"].get("ttft_floor_ms"):
             log(f"speed: first token of the shortest prompt ({result['speed']['ttft_floor_case']}) after "
                 f"{result['speed']['ttft_floor_ms']:,.0f} ms")
+    if heldout:
+        # protocol stages 1: the held-out prompts on every candidate, so the first staged Eval is a baseline that
+        # measured them (protocol heldout.generality).
+        with times.part("heldout"):
+            result["heldout"] = run_heldout(engine, info, prepared, protocol, log, settings["jitter"])
     short = int(rule["short_quality_tokens"])
     later = quality_sets(prepared, short, above=True)
     stopped = None
@@ -768,6 +862,11 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         costs = {s: sum(price(planned.get(s) or {}, found, per_round).values()) for s in (2, 3, "certify")} if found else {}
     else:
         stage, costs = choose(planned, found, elapsed(), budget, per_round, load, cost(1, "history_again") or 0.0)
+        if found is None and "speed" not in parts:
+            # Rates come from the speed part: a run that leaves it out (crit eval run --only context) has none to
+            # check a budget against, and runs the later stages' parts it asked for rather than none of them.
+            stage = 3
+            log("stages: no speed part, so no rates to budget the later stages by: the parts asked for run")
     stage = 1 if stopped else min(stage, staged["stage"])
     if stopped:
         # protocol quality.fail_fast: nothing after quality can pass a run this far over the budget.
@@ -791,7 +890,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             # The stage 1 request warmed the engine for the repetitions: it stays as their warmup, compared with the
             # first of them (protocol speed.extra_repetition).
             rows = dict(result["speed"]["cases"])
-            with times.part("speed"):
+            with times.part("speed"), counters.window("speed"):
                 again = run_speed(engine, info, with_speed(prepared, repeat), protocol, 0, int(rule["repetitions"]),
                                   log, continuations, disturbed, warmed=rows)
             rows.update({case_id: row for case_id, row in again["cases"].items() if row["status"] == "measured"})
@@ -825,7 +924,8 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             if certify:
                 result["context"]["interpolated"] = interpolated_curve(result["context"]["points"], required,
                                                                        settings)
-            memory["after_curve"] = host.device_memory(indices=(memory.get("after_load") or {}).get("indices"))
+            memory["after_curve"] = host.with_engine_reading(
+                host.device_memory(indices=(memory.get("after_load") or {}).get("indices")), engine)
             with times.part("retrieval"):
                 result["context"]["retrieval"] = run_retrieval(engine, info, prepared, settings, required, log, asked)
     elif "followup" in parts:
@@ -833,7 +933,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
     if stage >= 3 and not stopped:
         if sampled and fits("sampled_speed", cost(3, "sampled_speed")):
             checked = {}
-            with times.part("sampled_speed"):
+            with times.part("sampled_speed"), counters.window("sampled_speed"):
                 result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, 1,
                                                             int(rule["sampled_repetitions"]), log, disturbed, checked)
             if result["sampled_speed"]["status"] == "measured":
@@ -843,12 +943,6 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             with times.part("exactness"):
                 result["exactness"] = run_exactness(module, None, {}, with_speed(prepared, exactness_cases(
                     prepared, info, rule)), result["speed"], log, exactness, engine=engine, info=info)
-        if heldout and fits("heldout", cost(3, "heldout")):
-            with times.part("heldout"):
-                result["heldout"] = run_heldout(engine, info, prepared, protocol, log, settings["jitter"])
-        elif "heldout" in parts:
-            result["heldout"] = {"status": "skipped", "reason": "the held-out prompts are decoded only against a "
-                                 "baseline that measured them: their generality gate needs one"}
         if (result.get("followup") or {}).get("status") == "measured" and fits("followup_again",
                                                                              cost(3, "followup_again")):
             with times.part("followup_again"):
@@ -857,8 +951,6 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
     else:
         if sampled:
             result["sampled_speed"] = not_run(3)
-        if "heldout" in parts:
-            result["heldout"] = not_run(3)
     if info.get("speculative") and "exactness" in parts and "exactness" not in result and (stage < 3 or info.get("served")):
         result["exactness"] = {"mode": exactness, "status": "unmeasured", "cases": {},
                                "reason": not_run(3)["reason"] if stage < 3 else
@@ -876,10 +968,11 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         for case_id, row in result["history"]["cases"].items():
             log(f"history {case_id}: " + (f"identical after {', '.join(between) or 'nothing else'}" if row["identical"]
                                           else f"differs at token {row['first_difference']}"))
-    if headroom.quality_mode(result) == "as_quantized" and not stopped:
+    if headroom.quality_mode(result) == "speed" and not stopped:
         # protocol forks: each recorded output difference judged on this engine before it closes
-        judge_forks(result, engine, prepared, protocol, log)
-    if concurrency is not None and not stopped:
+        with times.part("forks"):
+            judge_forks(result, engine, prepared, protocol, log)
+    if not stopped:
         concurrency(fits)
     if required:
         result["context"]["creep"] = creep(result, required)

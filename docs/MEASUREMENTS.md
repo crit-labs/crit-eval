@@ -24,7 +24,9 @@ Defaults: 1 warmup and 1 measured repetition, compared with each other. When the
 disagree (their decode speed or time to first token spread by more than 5%, or their outputs differ) the case gets
 a second repetition, and a third when those two disagree in turn ([protocol.json](../crit_eval/protocol.json)
 `speed.extra_repetition`); the case's KPIs are the medians over its measured repetitions, and the repeatable gate
-compares every output, the warmup's included. One repetition is enough on a quiet device: re-scored from their first
+compares every output of a case decoded more than once, the warmup's included: a case decoded once (a staged run's
+stage 1, a long case in stage 2) is not compared, and with no case compared the gate is unmeasured. One repetition
+is enough on a quiet device: re-scored from their first
 repetition alone, 23 Qwen3.8-27B results kept their scores within 0.1% (4% at worst). Until v0.4 every case ran
 two repetitions. A KPI's run-to-run spread comes from the cases measured more than once (`headroom.noise`
 `repeated_cases` of `cases`); with every case measured once it and the greedy standard error are unmeasured, and
@@ -46,8 +48,10 @@ again. An engine whose warmup agrees with its first repetition measures as befor
 **Fresh decode** (`speed.fresh_decode`, reported, not judged): steady state measures a prompt
 the engine has just served, and an engine that adapts its cache to a prompt or drafts from its earlier replies
 decodes that faster than a new prompt. Each suite therefore records `fresh_decode_score`, the geometric mean of each
-case's first request before its warmups, and `status` shows it beside the decode score when the two differ by more
-than 10%.
+case's first request before its warmups (with a pinned continuation, its first free generation, which runs before the
+replays), and `repeat_speedup`, the settled decode over it. `status` shows the greedy suite's first-time and settled
+decode side by side on every run: the greedy suite runs each prompt first, so its first requests are the engine's first
+time on them. An engine whose cache adapts in the background shows its gain there.
 
 **Output that varies** (`speed.output_varies`): an engine whose greedy reply changes between
 repetitions (an expert cache that moves experts between CPU and GPU arithmetic which round differently) decodes different
@@ -201,6 +205,14 @@ AVX2; the probe builds with `-march=native`, with `/arch:AVX2` on Windows), with
 crit-eval score reads these yet; a result carries them in `device`. Pass it with `run --device`;
 `--bandwidth GBS` overrides the bandwidth.
 
+The CPU expert lane (`host_expert_gbs`, `host_expert_isa`) is what a CPU tier computing expert misses reaches:
+crit's integer block rows (4-bit weights against int8 activations, exact integer block sums, one FP32 step a
+block) on vpdpbusd, vpmaddubsw or scalar code, as GB/s of weight bytes over 512 MiB at 1, 3 and 8 tokens an
+expert on one thread per core, and at 3 tokens beside expert-sized pinned copies with both rates measured over
+the same window (`with_link_cpu`, `with_link_link`). The placement prices misses computed on the CPU at the
+lane's one-token rate (never above the read rate) and a CPU/link split at the two concurrent rates' sum; a
+probe without the lane prices them at the read rate, an upper bound FP32 rows do not reach.
+
 **Prefill ceiling.** `prepare` counts arithmetic per token from safetensors or GGUF headers and config
 ([crit_eval/limits/ceiling.py](../crit_eval/limits/ceiling.py)): 2 × rows × columns for every
 projection in its stored format (BF16, FP8 or NVFP4; a GGUF's block types at the FP8 rate, the
@@ -211,7 +223,9 @@ each format's best probed rate, attention at the faster of the BF16 and FP8 rate
 the quality budget, so a BF16 attention floor can be beaten), and the recurrence at the BF16 rate.
 
 **TTFT floor:** the larger of the prompt's compute floor and one weight read (`bytes_per_pass`,
-else the language-model and output-head bytes) plus the prompt's KV writes at device bandwidth.
+else the language-model and output-head bytes) plus the prompt's KV writes at the engine's
+`kv_bytes_per_token`, at device bandwidth. An engine that reports no count gets a floor without the
+KV writes, which is still a floor, and `missing` asks for the count, as for the decode floors.
 
 **Where the time to first token goes.** A short prompt's time to first token is mostly not its
 prefill's arithmetic. Each speed sample keeps the engine's own `prefill_ms` and `first_token_ms` when
@@ -253,7 +267,9 @@ adapter fields add the ceiling:
 - `draft_width`: **saturation**, tokens per round ÷ (draft width + 1).
 - `bytes_per_pass` (weights read, not gathered embeddings, plus recurrent state) and the
   bandwidth: the **pass floor**, compared with the measured one-token step. Each case adds the
-  KV read at its context: BF16 K and V of every full-attention layer, or `kv_bytes_per_token`.
+  KV read at its context, at the engine's `kv_bytes_per_token`. An engine that reports none gets a
+  floor without that term (still a floor: the model's geometry does not say the precision the engine
+  stores its KV at) and `missing` asks for it.
   An engine that reports no `bytes_per_pass`, such as one behind another server, gets the stored
   model's: the weights read on every pass but draft layers, the routed experts' share
   (`num_experts_per_tok` of the experts) and the fixed recurrent and sliding-window state
@@ -268,8 +284,10 @@ adapter fields add the ceiling:
   beside it. An engine that declares none is priced by the model's [memory tiers](#memory-tiers) instead; only
   when Eval cannot place the model and its weights exceed the device's memory does the result list it under
   `headroom.missing` and warn that its pass floor assumes every weight on the device.
-- `expert_reads` and `expert_hits` from `generate()` (or crit serve's telemetry): the decode's routed expert reads
-  and those its device expert cache served, the hit rate the [memory tiers](#memory-tiers) price each case at.
+- `expert_reads` and `expert_hits` from `generate()` (or crit serve's telemetry), or the expert cache's `reads` and
+  `hits` in the engine's `telemetry()`: the decode's routed expert reads and those its device expert cache served, the
+  hit rate the [memory tiers](#memory-tiers) price the misses at. Without them an engine whose experts the device
+  cannot all hold has its misses beyond the capacity bound unmeasured, and its floors are optimistic.
 - `accepted` per round from `generate()`: tokens per round at every width up to the measured one.
   With the draft cost (`draft_ms`, else round time beyond one pass ÷ width) crit-eval projects the
   **best draft width at current costs**; with `draft_bytes_per_step` also the best width at floor
@@ -355,22 +373,31 @@ model files' placement on the device at the required context (the scenario `crit
 
 - The **resident weights the device cannot hold** next to the required context's KV cache (`dense_device_host`) are
   read from host memory on every pass.
-- **Routed experts** count by the share a token activates (experts_per_token of the experts), those off the device
-  at the device cache's miss rate: one less the engine's hit rate (`expert_hits` over `expert_reads`, per case where
-  it reports them) or, without one, the share of the experts the device holds (even routing, the pessimistic case).
+- **Routed experts** count by the share a token activates (experts_per_token of the experts), and which of them miss
+  the device is the engine's, never assumed: reads that touch more distinct experts than the device can hold miss at
+  least the excess (the *device capacity bound*, from the placement's experts on the device), and beyond it the misses
+  are one less the engine's hit rate: `expert_hits` over `expert_reads` per case where the requests report them, else
+  the engine's own counters (`telemetry()`'s expert cache reads and hits over the decode suite, `result.telemetry`).
+  Without either the misses beyond the bound are **unmeasured**: the floor holds the bound alone (for one token's
+  experts nothing, so the pass floor reads every routed expert from the device: an optimistic floor),
+  `headroom.missing` names what would price them and `status` says so.
 - A **decode pass** takes its host bytes on the faster of the host link and host memory's read rate; an engine that
   declares `host_bytes_per_pass` keeps its own path. Each case's floor uses its own hit rate (`expert_hit_rate`), and
   the long-context curve's points theirs.
-- A **prompt** of n tokens moves the resident bytes off the device and each off-device expert it touches at least
-  once (E(1 - (1 - k/E)^n) of a layer's E experts) at the run's miss rate, on the faster of the link and the CPU
+- A **prompt** of n tokens moves the resident bytes off the device and the off-device experts it touches (E(1 - (1 -
+  k/E)^n) of a layer's E experts): at least those beyond the device's capacity, which for a prompt that touches every
+  expert are all the experts off the device, and at the run's miss rate where that is more, on the faster of the link
+  and the CPU
   (host memory's read rate, and the tokens' arithmetic on those bytes at the probed CPU rate, which sends long prompts
   over the link). The prefill floor is the longer of its arithmetic and that transfer (`bound: host`), the first
   token's the longest of its arithmetic, the device-resident bytes at the device's bandwidth and that transfer, at
   every speed case and curve point.
 
 Experts the placement leaves on disk are priced as host memory: the probe measures no disk, so their floor is a
-lower bound. `headroom.tiers` records the placement's split and the run's hit rate, `headroom.host_pass` the pass's
-host bytes and how they were priced, and `status` names both beside the decode's pass floor.
+lower bound. `headroom.tiers` records the placement's split, the run's `engine_hit_rate` and where it came from
+(`engine_hit_rate_source`: `engine`, `engine telemetry` or `unmeasured`); `headroom.host_pass` the pass's host bytes,
+how they were priced and their `hit_rate_source` (`engine`, `engine telemetry`, `device capacity` where the bound
+exceeds the engine's misses, `on device`, `unmeasured`), and `status` names both beside the decode's pass floor.
 
 ## Quality
 
@@ -384,24 +411,32 @@ the model's chat template with its generation prompt, followed by its answer cut
 `crit eval reference` scores every position of every text once, teacher forced on the checkpoint,
 and stores each position's log-probability and the reference's top 16 under the data.
 
-**Quality modes.** A run judges quality in one of two modes, recorded in `requirements.quality_mode`.
-`preserve`, the default, judges against the checkpoint's arithmetic with exact (FP32) activations:
-what the engine loses on top of the weights the user chose. `as_quantized`, the mode for speed,
-judges against the same scores with a budget eight times preserve's (protocol `quality.mode_thresholds`:
-PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0). It is a floor that keeps out a broken engine (skipped
-layers, dropped experts, a collapsed path), not a ration on precision. The checkpoint's own activations
-(W4A4, W8A8, as serving stacks run them), a lower-precision KV cache, head or dense weights fit it
-without separate evidence. In `as_quantized`, output differences that part at near-ties pass
-([forks](#forks-in-quality-mode-as_quantized)), and the honesty check bounds the served and scored
-paths. Everything else is judged as in `preserve`. 4-bit activation math turns rounding-level
-differences into large KL swings: on Qwen3.8-27B NVFP4, prompt rows move by a mean KLD of 0.045-0.08
-(p99 0.5-1.4) under rounding alone. The checkpoint run as quantized lands up to mean KLD 0.23 and p99 3.7
-from the exact scores itself. Its share of the preserve budget on the worst set: Qwen3.8-27B NVFP4 183%
-(long-32768 prompt p99), Nanbeige4.3-33B NVFP4 319% (long-32768 prompt p99), Qwen3.8-Flash-Next NVFP4 555%
-(long-1024 prompt mean). The KV cache stays exact in the reference in both modes, so an engine's KV
-quantization is drift in either one.
+**Quality modes.** A quality mode says how much output drift from the checkpoint the user selected
+the engine may trade for speed. It is not about how that checkpoint is quantized or stored: both
+modes judge against the same reference scores (that checkpoint's stored weights decoded exactly, with
+FP32 activations), and a 16-bit, an FP8 or a 4-bit checkpoint takes either mode. A run judges in one,
+recorded in `requirements.quality_mode`, which every result states. `speed`, the default, has a
+budget eight times preserve's (protocol `quality.mode_thresholds`: PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD
+≤ 4.0). It is a floor that keeps out a broken engine (skipped layers, dropped experts, a collapsed
+path), not a ration on precision: lower-precision arithmetic that fits it (4-bit or 8-bit activations
+on quantized matrices, as serving stacks run W4A4 and W8A8 checkpoints, a lower-precision KV cache,
+head or dense weights) needs no separate evidence. Output differences that part at near-ties pass
+([forks](#forks-in-quality-mode-speed)), and the honesty check bounds the served and scored
+paths. `preserve` keeps the engine's output close to the checkpoint's (PPL ratio ≤ 1.05, mean KLD ≤
+0.05, p99 KLD ≤ 0.5), so every precision change is drift to measure against that budget. Everything
+else is judged the same in both. A result that states no quality mode, or another, is refused.
 
-The budget is the cap that as_quantized's per-set allowance had from crit-eval-v0.3.0 to v0.4.x: four
+The speed budget's width comes from what 4-bit activation math does: it turns rounding-level
+differences into large KL swings. On Qwen3.8-27B NVFP4, prompt rows move by a mean KLD of 0.045-0.08
+(p99 0.5-1.4) under rounding alone, and the checkpoint run with its activations quantized as it declares
+lands up to mean KLD 0.23 and p99 3.7 from the exact scores itself. Its share of the preserve budget on the
+worst set: Qwen3.8-27B NVFP4 183% (long-32768 prompt p99), Nanbeige4.3-33B NVFP4 319% (long-32768 prompt
+p99), Qwen3.8-Flash-Next NVFP4 555% (long-1024 prompt mean). The budget is the same for every checkpoint,
+however it is stored. The reference keeps the activations and the KV cache exact in both modes, so an
+engine's activation quantization (the format the checkpoint declares included) and KV quantization are
+drift in either one.
+
+The budget is the cap that the speed mode's per-set allowance had from crit-eval-v0.3.0 to v0.4.x: four
 times the checkpoint's own drift, never past these limits. `crit eval reference --allowance` measures that
 drift on request when the checkpoint declares quantized input activations on any matrix or the output head (NVFP4
 in groups of 16 with the stored global scale, FP8 per token or per tensor;
@@ -413,18 +448,22 @@ along the output rows) quantize each expert matrix's input with that matrix's ow
 model whose declared matrices the modeling code multiplies any other way than through `nn.Linear` or
 such fused experts gets no measured drift (`unsupported`).
 
-Until crit-eval-v0.3.0 `as_quantized` kept a second full set of scores (`reference-as-quantized/`, with its own
-spread), judged against with twice preserve's budget: a second reference run and package per checkpoint.
-`crit eval reference` derives the allowance from such a store when the data holds one, without running again, and
-`crit eval fetch` removes it.
+Until crit-eval-v0.3.0 the speed mode kept a second full set of scores (the checkpoint run with its
+activations quantized as declared, with its own spread), judged against with twice preserve's budget: a second
+reference run and package per checkpoint.
 
-The mode also sets the limits prefill and the first tokens are measured against, since an engine that keeps the
-activations exact cannot reach the stored format's rate (W4A4 runs several times faster than 16-bit activations).
-In `preserve` the prefill ceiling and the time-to-first-token floors (headline and long-context) are priced at the
-fastest 16-bit prompt activations (BF16 or FP16 accumulation, `headroom.mode_limits`), or at a faster arithmetic
-quality shows passing (the reachable limit); in `as_quantized` at the stored format. Goals and `kpis` carry the
-mode's limits (`stored_ceiling` and `stored_floor_ms` keep the stored format's), and status names the mode and, in
-`preserve`, what `as_quantized` would allow, once. The engine
+The mode also sets the limits prefill and the first tokens are measured against, since an engine that keeps
+16-bit activations on quantized matrices cannot reach the stored format's rate (W4A4 runs several times faster
+than 16-bit activations). In `preserve` the prefill ceiling and the time-to-first-token floors (headline and
+long-context) are priced at the fastest 16-bit prompt activations (BF16 or FP16 accumulation,
+`headroom.mode_limits`), or at a faster arithmetic quality shows passing (the reachable limit). In `speed`
+they are priced at the fastest prompt arithmetic that mode admits on the quantized matrices, the stored format's
+own, FP8 or 16-bit (`headroom.MODE_ACTIVATIONS`), or a faster one quality shows passing, so the speed mode never
+prices below `preserve`. On a device with the stored format's tensor cores that is the stored format; on one without
+4-bit tensor cores, FP8 for an NVFP4 checkpoint's 4-bit matrices. A checkpoint that stores no FP8 or NVFP4 matrices
+is priced at its stored format in both modes. Goals and `kpis` carry the mode's limits
+(`stored_ceiling` and `stored_floor_ms` keep the stored format's), and status names the mode and, in `preserve`,
+the limits `speed` would price for the result (`kpis.prefill.speed_trade`, when above preserve's), once. The engine
 scores the same ids through crit serve's score call (`chat-score-v1`): every prompt position and the
 first answer token from one prefill of the prompt, as it prefills any request, and every later
 answer token from its decode, each step forced to the answer (a speculative engine accepts drafts
@@ -440,7 +479,10 @@ from decode. No request returns the prompt positions' logits, but they are the p
 that every reply's first token comes from, a single position among a set's served ones: an engine
 whose prefill drifts far more than its decode (lower-precision prefill activations, for one) is
 judged on it. The prompt positions are judged by KLD alone, their perplexity ratio reported (since
-crit-eval-v0.2.1): they predict the user's own turn, which a chat model gives little probability
+crit-eval-v0.2.1), in either quality mode: a `SET/prompt` set's `limits` leave out `ppl_ratio_max`, so a
+ratio above the budget's (x1.10 against preserve's x1.05, say) is neither a failure nor a pass, and the run's
+log, the status line and `crit eval compare` mark it "reported, not judged"; the perplexity KPI is the worst
+served set's. They predict the user's own turn, which a chat model gives little probability
 (Qwen3.8-27B puts nearly all of it on `<|im_end|>`, for a prompt perplexity of about 3,000 to 5,300
 on the long texts), so the ratio is decided by the log-probabilities of tokens the model calls
 near-impossible. Scoring the reference again in FP32 with its prompt cut into 4,096-token instead
@@ -479,8 +521,8 @@ long-context curve's first point (32,768 tokens): its request asks for the log-p
 its reply is scored once as the continuation of its prompt (the reply `curve@32768`), one long
 prefill where a reply of its own cost two; a server that cannot stream log-probabilities keeps its
 curve point and the check records why there is no long reply. `quality.honesty` records the largest
-difference; a failure fails the quality gate. In `as_quantized` the two paths may round apart, as
-the [forks](#forks-in-quality-mode-as_quantized) allow (`quality.honesty.modes`), so the check bounds
+difference; a failure fails the quality gate. In `speed` the two paths may round apart, as
+the [forks](#forks-in-quality-mode-speed) allow (`quality.honesty.modes`), so the check bounds
 the difference instead of asking for the same values. Each log-probability must be within 2 nats,
 and each reply's mean difference of its tokens' log-probabilities within 0.1 nats. A token in only
 one list must be within 2 nats of that list's edge. The served path then stays that close to the
@@ -540,8 +582,8 @@ consecutive positions drawn with replacement from a seeded generator, as the 5th
 percentiles, and the KLD p99's 5th and 95th. `status` prints the worst set's 5th to 95th percentile
 beside its share. It is reported, not judged: the gate judges the measured set.
 
-The **drift budget** defaults to PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5 (`preserve`; eight times
-that in `as_quantized`).
+The **drift budget** defaults to PPL ratio ≤ 1.4, mean KLD ≤ 0.4, p99 KLD ≤ 4.0 (`speed`, the
+default); `preserve`'s is an eighth of that: PPL ratio ≤ 1.05, mean KLD ≤ 0.05, p99 KLD ≤ 0.5.
 `--quality-budget '{"ppl_ratio_max": 1.02}'` sets any subset;
 `{"ppl_ratio_max": 1.0, "kld_mean_max": 0, "kld_p99_max": 0}` asks for no drift. Each set
 reports `budget_used`, its largest share of any limit. The budget is there to be spent on speed:
@@ -633,16 +675,16 @@ run nothing, and the gate passes. crit-eval does not infer the declaration from 
 no cached tokens: a cache of whole prompts hits only when the turns run again, which is what the
 gate checks. The part is skipped when its last turn does not fit the engine's context.
 
-## Forks in quality mode as_quantized
+## Forks in quality mode speed
 
-In `as_quantized`, an engine may compute the same token with arithmetic that depends on what it
+In `speed`, an engine may compute the same token with arithmetic that depends on what it
 served before. An expert may run on the CPU in one request and on the device in the next, a cache
 may be in another state, or a prompt may come from a prompt cache. Each tier rounds the 4-bit
-format its own way. Rounding can only flip a near-tie, so the `repeatable`, `request_history`
-and `prompt_cache` gates allow a difference that starts at one. Before the engine closes,
-crit-eval judges every difference those three gates record (each distinct reply of a case's
+format its own way. Rounding can only flip a near-tie, so the `repeatable`, `request_history`,
+`prompt_cache` and `concurrency` gates allow a difference that starts at one. Before the engine closes,
+crit-eval judges every difference those gates record (each distinct reply of a case's
 repetitions against the first, the request history's two outputs, each repeated follow-up turn
-against its first answer). It scores the shared prefix plus the first reply's token once through
+against its first answer, each batched reply against its serial one). It scores the shared prefix plus the first reply's token once through
 the engine's scoring path (chat-score-v1, `forks.top_k` 16 alternatives). The fork is a
 **near-tie** when the other reply's token is among the alternatives within `forks.margin`
 (2 nats) of the first one's. A fork where one token clearly wins fails as before: so do a token
@@ -671,8 +713,9 @@ run.
 
 `timing.parts` records the wall seconds of every part in the order it ran (`lower_context`, `load`,
 `history`, `followup`, `speed`, `sampled_speed`, `sampling_check`, `heldout`, `quality`, `context`,
-`retrieval`, `exactness`, `followup_again`, `history_again`), and `timing.total_seconds` the run from
-its start to the result; the log's last lines print both. A part that did not run has no entry.
+`retrieval`, `exactness`, `followup_again`, `history_again`, `forks`, `concurrency`), and `timing.total_seconds` the
+run from its start to the result; the log's last lines print both. A part that did not run has no entry. A staged
+run runs `heldout` right after its stage 1 `speed`, then each later stage's parts.
 
 After the first measured speed case the log prints an **estimate** of every part and the total
 (`estimate`, [crit_eval/run/estimate.py](../crit_eval/run/estimate.py)): every request's prompt and
@@ -680,21 +723,23 @@ output length is fixed by the prepared data and the protocol, so the requests th
 so far fit its prefill (t0 + a·n + c·n²) and decode (p + q·context per token) costs, and the plan
 is priced with them. It leaves out third repetitions, prompt caches and replies that stop early;
 on a Qwen3.8-27B engine it projected 720 s for a 606 s run, most of the excess in the long-context
-curve, whose quadratic term the first requests (up to 14K tokens) fit only loosely.
+curve, whose quadratic term the first requests (up to 14K tokens) fit only loosely. It leaves out the concurrency part
+too: how long a level takes depends on how far the engine runs its clients together (a staged run prices each level
+from the one before it).
 
 ## Held-out prompts and generality
 
 [suite/heldout.json](../crit_eval/suite/heldout.json) holds ten other prompts: Chinese, Japanese,
 Korean, Russian, Arabic, Hindi, German and Spanish prose, Rust code and SQL. No engine choice may
-be tuned or selected on them ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)). After the speed cases, each,
-cut to the length the run draws for it ([prompt-length jitter](#prompt-length-jitter)), decodes
+be tuned or selected on them ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)). After the speed cases (in a
+staged run, stage 1's, so every candidate's first Eval measures them), each, cut to the length the run draws for it ([prompt-length jitter](#prompt-length-jitter)), decodes
 its own greedy output (64 tokens, once; until v0.4 256 tokens, twice: over 23 Qwen3.8-27B results the held-out
 score from the first 64 tokens' acceptance came within 1.4% of the 256-token one); crit-eval reports per-prompt
 decode tok/s and tokens per round and the **held-out decode score**, their geometric mean (`--only heldout` runs
 just this).
 
 The **generality gate** compares with a baseline (`--baseline`, normally the run's first
-candidate): the held-out score may not fall more than 5%, and no prompt may decode more than 10%
+candidate, whose stage 1 measured them): the held-out score may not fall more than 5%, and no prompt may decode more than 10%
 slower. Each run measures at the lengths it drew, so the gate compares tok/s at two draws of the
 same prompts, which a small change in prompt length moves little. For the most sensitive check also compare
 with the parent (`crit eval status RESULT --baseline PARENT_RESULT`). Without a baseline, or with
@@ -727,15 +772,17 @@ journal's seed. `status` reports the held-out prompts' share of their nominal le
 ## Closed and open tracks
 
 A result says how far it qualifies for the **closed track**, which fixes the choices that move
-scores for reasons other than engine work (as MLPerf's closed division and SPEC's base do): quality mode
-`preserve`; one configuration for every workload, loaded once for the run; and the checkpoint's own draft layers as
-the only drafter where it has them, no drafter trained or picked elsewhere ([tracks.py](../crit_eval/run/tracks.py),
-protocol `tracks`; reported, not judged). The **open track** is everything the protocol allows. `track.closed` holds
-the checks Eval can make from the run, each `pass`, `fail` or `unmeasured`:
+scores for reasons other than engine work (as MLPerf's closed division and SPEC's base do): either quality mode,
+judged by that mode's protocol budget unchanged, with results compared within one mode; one configuration for every
+workload, loaded once for the run; and the checkpoint's own draft layers as the only drafter where it has them, no
+drafter trained or picked elsewhere ([tracks.py](../crit_eval/run/tracks.py), protocol `tracks`; reported, not
+judged). How the engine encodes the checkpoint's weights is not one of these choices: the quality budget judges it.
+The **open track** is everything the protocol allows. `track.closed` holds the checks Eval can make from the run,
+each `pass`, `fail` or `unmeasured`:
 
 | Check | Passes when |
 | --- | --- |
-| `quality_mode` | The run was judged in `preserve` |
+| `quality_mode` | The run was judged in a quality mode the protocol names by that mode's budget unchanged (`quality.mode_thresholds`, else `quality.thresholds`). A `--quality-budget` other than it, looser or tighter, fails; a result that records no budget is unmeasured |
 | `one_load` | Eval loaded the engine once for the run, and a server that reports its load count (crit serve's `/health` `engine_loads`) loaded no engine between the run's first request and its last |
 | `own_drafter` | An engine that drafts reads per draft step at most 5% (`draft_tolerance`) more than the checkpoint's own draft layers and the head their logits go through, the model files' `draft_step_bytes`; a re-encoded head reads less. A checkpoint without draft layers has no drafter of its own to draft with |
 
@@ -746,9 +793,9 @@ with the case or the prompt length, is the submitter's declaration on its crit-h
 ## Concurrency
 
 A run measures how a served engine that runs several requests at once does it
-([concurrency.py](../crit_eval/run/concurrency.py), protocol `concurrency`). It is reported, not judged, and it
-leaves every single-stream figure and gate as they were: it runs on the engine built for the required context after
-every other part, the request history's closing request included. It needs a server (`crit eval run --url`, or
+([concurrency.py](../crit_eval/run/concurrency.py), protocol `concurrency`), and the **concurrency gate** judges it
+(below). It leaves every single-stream figure and other gate as they were: it runs on the engine built for the
+required context after every other part, the request history's closing request included. It needs a server (`crit eval run --url`, or
 `crit run ... eval` through crit serve) whose model card reports `max_concurrent_requests` above 1, as crit serve's
 does for a package declaring `chat-concurrent-v1`
 ([Serving](https://github.com/crit-labs/crit/blob/main/docs/SERVING.md#concurrent-requests)); an adapter's engine
@@ -766,23 +813,52 @@ fails, as in the speed part). The levels are N = 1, 2, 4, 8, 16, 32 and 64, up t
 | --- | --- |
 | `aggregate_tps` | Completion tokens of every request over the level's wall interval (first request sent to last reply read), by [validate_cohort](#served-benchmark-outcomes): a failed, missing or duplicated request, or fewer requests in flight at once than clients, disqualifies it (`qualified` false, the rate null, `errors`) |
 | `peak_concurrency` | The requests in flight at once at the peak, as the clients see them |
+| `streaming_peak`, `ran_together` | The replies streaming at once at the peak (their first and last tokens' intervals overlapping), and whether that is two or more (null: each reply in one chunk, or one client) |
 | `ttft_ms_p50`, `ttft_ms_p95`, `decode_tps_p50` | Per request: time to its first reply text, and its tokens after the first over the time from first to last |
-| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply from the speed part, as far as both go: the share that match and each differing reply's first different token. A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/core/src/batch/README.md#batch-invariance)) |
+| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply from the speed part, as far as both go: the share that match and each differing reply's first different token (with its `fork` in quality mode `speed`, [judged](#forks-in-quality-mode-speed) on the engine). A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/core/src/batch/README.md#batch-invariance)) |
 | `ceiling`, `fraction_of_ceiling` | The aggregate against the batched ceiling below |
+| `speedup`, `expected_speedup`, `fraction_of_expected`, `expected_missing` | The aggregate over one client's, the cost model's at the run's single-stream hit rate, the share of it reached, and why there is none |
 
 The **batched ceiling** of a level ([batched.py](../crit_eval/limits/batched.py)) is N tokens per step over the floor
-of one decode step of N rows: the larger of its bytes (the weights read on every pass once, the routed experts the
-rows touch, and each row's KV at the protocol's KV precision over the pool's mean context plus its fixed state, over
-the probed bandwidth) and its arithmetic (each row's active matmul FLOPs, the output head and k/E of the experts, at
-each stored format's best rate, plus its attention). A layer of E experts routing k per token has E(1 - (1 - k/E)^N)
-of them touched by N rows, so a mixture of experts reads more of its weights the more rows a step holds. The bound
-leaves speculation out, as the fixed decode denominator does.
+of one decode step of N rows: the largest of its device bytes (the weights read on every pass once, the routed experts
+the rows touch, and each row's KV at the protocol's KV precision over the pool's mean context plus its fixed state,
+over the probed bandwidth), its host bytes on the faster of the host link (over the probed link rate) and the CPU (the
+longer of the bytes over host memory's read rate and the rows' arithmetic on their share of them over the probed CPU
+rate; `host_path`), and its arithmetic (each row's active matmul FLOPs, the output head and k/E of the experts, at each
+stored format's best rate, plus its attention). A layer of E experts routing k per token has E(1 - (1 - k/E)^N) of them
+touched by N rows, so a mixture of experts reads more of its weights the more rows a step holds. Where the run's
+[memory tiers](#memory-tiers) leave weights off the device, the resident ones off it and the touched experts the
+device cannot hold come from host memory every step, and so do those the engine's cache misses at its hit rate: the
+level's own where its requests report `expert_reads` and `expert_hits` (`level requests`), else the run's single-stream
+rate (the decode suite's, else its `telemetry()` counters, else what its `host_bytes_per_pass` declares): each row
+brings its own misses, so such an engine serves little more at N rows than at one. Without a hit rate those misses are
+unmeasured and the ceiling holds the capacity bound alone, every other routed expert read from the device: an
+optimistic ceiling, which `status` says. The bound leaves speculation out, as the fixed decode denominator does.
+
+The **concurrency gate** fails when a measured level did not qualify, when a level of 2 or more clients did not run
+together, or when a batched reply differs from its serial one (in `speed`, at a fork that is not a near-tie).
+A level **ran together** when two or more of its replies were streaming at once (`streaming_peak`, `ran_together`):
+its clients see every request they sent in flight whether the server queues it or not, so only overlapping replies
+show it, and a server that runs its requests one after another streams one reply at a time. Two, not the level's
+clients: an engine that prefills one request while the others decode, or whose first requests end before its last
+start decoding, never streams them all at once yet runs them together. Otherwise it is unmeasured while the part did
+not run (an adapter's engine, a server reporting no capacity above 1), no level beyond one client was measured, a
+level's replies each came in one chunk (no overlap either way), or no batched reply was compared with a serial one.
+How much more a level serves is not the gate.
+
+Each level's **speedup** (reported, not judged) is its aggregate over the 1-client level's, beside the speedup the cost
+model expects for the engine's placement (`expected_speedup`: its ceiling over the 1-client level's, both at the run's
+single-stream hit rate, so every level compares like with like) and the fraction of that the level reached
+(`fraction_of_expected`): a dense model read once per step for every row expects close to N, a mixture of experts
+whose misses come from host memory about 1. Without both ceilings, or with expert misses unmeasured, the expectation
+is unmeasured and `expected_missing` says why. `status` prints the speedups, each level's ceiling's hit rate and the
+run's, on a line of their own, and `compare` beside each level's aggregate.
 
 A staged run measures a level while it fits the budget, each priced from the best aggregate measured so far (the
 first has no price); one that would pass it is named in `concurrency.skipped` and the sweep stops there. A certified
 run and a profile measure every level. Each level is one line of the round's [journal](README.md#journal-and-resume),
 so a resumed round answers the levels it measured. `status` lists the levels with their figures and `compare` shows
-each level's aggregate side by side.
+each level's aggregate and speedup side by side.
 
 ## Full-vocabulary comparison
 

@@ -2,6 +2,7 @@
 from pathlib import Path
 
 from .. import load_json, protocol_series
+from ..limits import headroom
 from ..run.host import summary
 from .status import decode_text_identity
 
@@ -33,8 +34,15 @@ def compare(paths):
         rows.append(("Profile", [r.get("profile") or "full" for r in results]))
         warn.append("Results ran under different crit-eval profiles; their context scores and gates are not "
                     "comparable.")
+    modes = [headroom.quality_mode(r) for r in results]
+    if len(set(modes)) > 1:
+        # Results compare within one quality mode: the budgets, the gates' forks and the prefill limits differ.
+        rows.append(("Quality mode", modes))
+        warn.append("Results were judged in different quality modes; their quality, the gates that judge forks and "
+                    "their prefill limits are not comparable.")
     texts = [decode_text_identity(r) for r in results]
-    rows.append(("Decode text", [("pinned " + t[:12]) if t != "generated" else "own output" for t in texts]))
+    rows.append(("Decode text", ["–" if t is None else ("pinned " + t[:12]) if t != "generated" else "own output"
+                                 for t in texts]))
     if len(set(texts)) > 1:
         warn.append("Results decoded different texts; their decode scores are not comparable.")
     if any(r.get("native_libraries") for r in results):
@@ -109,12 +117,12 @@ def compare(paths):
         cells = []
         for r in results:
             p = (r.get("headroom") or {}).get("projection") or {}
-            ceiling = p.get("ceiling_score") or p.get("speed_of_light_score")
-            fraction = p.get("fraction_of_ceiling") or p.get("fraction_of_speed_of_light")
+            ceiling, fraction = p.get("ceiling_score"), p.get("fraction_of_ceiling")
             cells.append("–" if not ceiling else f"{ceiling:.1f}" + (f" (at {fraction:.0%})" if fraction else ""))
         rows.append(("Decode ceiling" + (" (sampled)" if any((r.get("headroom") or {}).get("decode_suite") == "sampled"
                                                             for r in results) else ""), cells))
-    # The concurrency part's aggregate per level (protocol concurrency; reported, not judged).
+    # The concurrency part's aggregate per level, its speedup and the cost model's (protocol concurrency; its gate
+    # judges the replies and whether the requests ran together, the speedup is reported).
     levels = sorted({int(n) for r in results for n in ((r.get("concurrency") or {}).get("levels") or {})})
     for clients in levels:
         cells = []
@@ -123,10 +131,15 @@ def compare(paths):
             if not row:
                 cells.append("–")
                 continue
-            cell = "not qualified" if not row.get("aggregate_tps") else f"{row['aggregate_tps']:,.1f}"
-            if row.get("fraction_of_ceiling"):
+            cell = "not qualified" if not row["aggregate_tps"] else f"{row['aggregate_tps']:,.1f}"
+            if row["fraction_of_ceiling"]:
                 cell += f" ({row['fraction_of_ceiling']:.0%} of ceiling)"
-            consistency = (row.get("consistency") or {}).get("fraction")
+            if clients >= 2 and row["speedup"]:
+                # The speedup KPI beside the cost model's (protocol concurrency.speedup).
+                cell += f", {row['speedup']:.2f}x one client" + (
+                    f" ({row['fraction_of_expected']:.0%} of {row['expected_speedup']:.2f}x expected)"
+                    if row["fraction_of_expected"] else "")
+            consistency = row["consistency"]["fraction"]
             if consistency is not None and consistency < 1:
                 cell += f", {consistency:.0%} equal serial"
             cells.append(cell)
@@ -140,8 +153,11 @@ def compare(paths):
         cells = []
         for r in results:
             q = ((r.get("quality") or {}).get("sets") or {}).get(name)
+            # A prompt set's perplexity ratio is reported, not judged (protocol quality.prompt_perplexity).
+            reported = q is not None and "ppl_ratio_max" not in q["limits"]
             cells.append("–" if q is None else
-                         f"PPL ×{q['ppl_ratio']:.4f}, KLD {q['kld_mean']:.1e} (p99 {q['kld_p99']:.1e}), "
+                         f"PPL ×{q['ppl_ratio']:.4f}{' (reported, not judged)' if reported else ''}, "
+                         f"KLD {q['kld_mean']:.1e} (p99 {q['kld_p99']:.1e}), "
                          f"top-1 {q['top1_agreement']:.3f} {'✓' if q['passed'] else '✗'}")
         rows.append((f"Quality: {name}", cells))
     if any("exactness" in r for r in results):
@@ -172,7 +188,7 @@ def compare(paths):
 
 def _gaps(result):
     room = result.get("headroom") or {}
-    return room.get("gaps", room.get("levers", []))
+    return room.get("gaps", [])
 
 
 def _gates(gates):

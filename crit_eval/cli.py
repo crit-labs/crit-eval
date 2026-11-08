@@ -6,6 +6,13 @@ import sys
 
 # runner.PARTS, kept here so parsing imports nothing else.
 PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
+# The quality modes and the default, defined once (crit_eval.quality.fixed imports nothing outside the standard library).
+from .quality.fixed import DEFAULT_QUALITY_MODE, QUALITY_MODES  # noqa: E402
+QUALITY_MODE_HELP = ("how much output drift from the checkpoint the engine may trade for speed, whatever format the "
+                     "checkpoint is stored in; both modes judge against the same reference (its stored weights, exact "
+                     f"activations). {DEFAULT_QUALITY_MODE} (the default): a budget eight times "
+                     "preserve's that only keeps out a broken engine, output differences that part at near-ties "
+                     "allowed; preserve: a budget that keeps the output close to the checkpoint's")
 CHAT_TEMPLATE_HELP = ("Chat template (jinja) to render the prompts with, for a model that carries none (default: the "
                       "one crit ships for the model's family); it becomes part of the model's identity")
 
@@ -22,6 +29,38 @@ def json_option(text, option):
             return json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as error:
             raise SystemExit(f"{option} file {path} is not JSON: {error}")
+
+
+def core_adapter():
+    """Core's eval-v1 adapter file (crit_core/eval_adapter.py), the one adapter of every crit engine package."""
+    import crit_core.eval_adapter
+    return crit_core.eval_adapter.__file__
+
+
+def package_engine(package, text, option):
+    """--package: Core's adapter and its configuration, the option's overrides with the package named (the adapter
+    reads the package's own configuration.json under them)."""
+    folder = Path(package).expanduser().resolve()
+    if not (folder / "plugins").is_dir() or not (folder / "configuration.json").is_file():
+        raise SystemExit(f"{folder} is no crit engine package: it holds plugins/ and configuration.json")
+    return core_adapter(), json.dumps({**json_option(text, option), "package": str(folder)})
+
+
+def run_folder(path):
+    """The crit run folder (run.json beside candidates/) holding `path`, or None."""
+    for folder in Path(path).expanduser().resolve().parents:
+        if (folder / "run.json").is_file() and (folder / "candidates").is_dir():
+            return folder
+    return None
+
+
+def refuse_run_adapter(adapter, option):
+    """An --adapter file inside a crit run folder is refused: a crit engine is its plugins, measured through Core's
+    loader with --package, and an adapter of the run's own would measure an engine crit serve never runs."""
+    found = run_folder(adapter) if adapter else None
+    if found is not None:
+        raise SystemExit(f"{option} {adapter} is inside the crit run folder {found}: measure a crit engine package with "
+                         "--package DIR, which opens it through Core's loader as crit serve does")
 
 
 def adapter_config(adapter, text, option):
@@ -43,6 +82,8 @@ def main(argv=None):
 
     run = subs.add_parser("run", help="Evaluate one engine (prepares the data first when missing)")
     engine = run.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--package", help="A crit engine package (plugins/ and configuration.json), which Core's "
+                                          "eval-v1 adapter opens through Core's loader")
     engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
     engine.add_argument("--url", help="Base URL of an OpenAI-compatible server the engine runs behind, for example "
                                       "http://127.0.0.1:8000/v1 (needs --context: the context the server was started with)")
@@ -66,8 +107,8 @@ def main(argv=None):
     run.add_argument("--quality-budget", metavar="JSON",
                      help='Drift limits over the protocol defaults, e.g. \'{"ppl_ratio_max": 1.02}\'; '
                           'keys ppl_ratio_max, kld_mean_max, kld_p99_max')
-    run.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default="preserve",
-                     help="preserve (default): quality is judged against the model's own arithmetic with exact activations; as_quantized, the mode for speed: against the same scores with a budget eight times preserve's, output differences that part at near-ties allowed")
+    run.add_argument("--quality-mode", choices=QUALITY_MODES, default=DEFAULT_QUALITY_MODE,
+                     help="The quality mode: " + QUALITY_MODE_HELP)
     run.add_argument("--exactness", choices=["reported", "required"],
                      help="reported (default): agreement with plain greedy is shown and the quality budget judges "
                           "the output; required: any difference fails the gate")
@@ -118,6 +159,30 @@ def main(argv=None):
     run.add_argument("--no-journal", action="store_true",
                      help="Write no journal beside the result (by default every engine opened and request served is "
                           "one line of OUT's .journal.jsonl, synced as it completes)")
+
+    precheck = subs.add_parser("precheck", help="In minutes, the gates a candidate most often fails a whole round on: "
+                                                "honesty of short replies and of one long reply, the request history "
+                                                "around them, device memory and (with an adapter) the lower context")
+    engine = precheck.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--package", help="A crit engine package, opened through Core's loader")
+    engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
+    engine.add_argument("--url", help="Base URL of an OpenAI-compatible server the engine runs behind (no lower-context "
+                                      "check: a server cannot be opened again)")
+    precheck.add_argument("--served-model", help="With --url: the model to request")
+    precheck.add_argument("--model", required=True, help="Model directory passed to the adapter")
+    precheck.add_argument("--data", required=True, help="Prepared suite directory for this model")
+    precheck.add_argument("--context", type=int, required=True, metavar="TOKENS",
+                          help="Context the engine is built for (the run's kv_tokens)")
+    precheck.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter")
+    precheck.add_argument("--quality-mode", choices=QUALITY_MODES, default=DEFAULT_QUALITY_MODE,
+                          help=f"The run's quality mode (default {DEFAULT_QUALITY_MODE}): "
+                               "speed bounds honesty as Eval does and lets history part at near-ties; preserve does neither")
+    precheck.add_argument("--no-lower", action="store_true", help="Skip the lower-context reopen")
+    precheck.add_argument("--vram-headroom-gib", type=float, default=None,
+                          help="Device memory to find free after the load (default: settings.toml vram_headroom_gib, "
+                               "else 1)")
+    precheck.add_argument("--chat-template", metavar="FILE", help=CHAT_TEMPLATE_HELP)
+    precheck.add_argument("--out", help="Write the items as JSON here")
 
     context = subs.add_parser("context", help="The max context for a model on a device: the model's positions and "
                                               "the KV cache that fits next to its weights")
@@ -175,9 +240,6 @@ def main(argv=None):
                                                   "transformers, GPU; stop any engine first)")
     reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
     reference.add_argument("--data", required=True, help="Prepared suite directory")
-    reference.add_argument("--quality-mode", choices=["preserve", "as_quantized"], default=None,
-                           help="Accepted from earlier versions and ignored: one run scores what both quality modes "
-                                "need (the scores and their spread)")
     reference.add_argument("--allowance", action="store_true",
                            help="Also score the texts with the activations quantized as the checkpoint declares and "
                                 "store how far that lands from the scores (allowance.json): what the format itself "
@@ -205,16 +267,22 @@ def main(argv=None):
 
     pin = subs.add_parser("pin", help="Record one engine's plain greedy output of every speed case as the data "
                                       "directory's pinned continuation (decode is then measured on that text)")
-    pin.add_argument("--adapter", required=True, help="Python file exporting create_eval_engine(context)")
+    engine = pin.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--package", help="A crit engine package, opened through Core's loader")
+    engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
     pin.add_argument("--model", required=True, help="Model directory passed to the adapter")
     pin.add_argument("--data", required=True, help="Prepared data directory to pin the continuation in")
     pin.add_argument("--config", default="{}", help="JSON configuration overrides for the adapter, text or a file, over the configuration.json packaged beside it")
     pin.add_argument("--context", type=int, metavar="TOKENS", help="Context the engine is built for (the run's kv_tokens)")
 
     ab = subs.add_parser("ab", help="Alternate two engines' speed runs in one session and report paired ratios")
-    ab.add_argument("--adapter", required=True, help="Adapter of engine A")
+    engine = ab.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--package", help="Engine A's crit package, opened through Core's loader")
+    engine.add_argument("--adapter", help="Adapter of engine A")
     ab.add_argument("--config", default="{}", help="JSON configuration overrides of engine A (text or a file), over its packaged configuration.json")
-    ab.add_argument("--adapter-b", help="Adapter of engine B (default: engine A's adapter)")
+    engine = ab.add_mutually_exclusive_group()
+    engine.add_argument("--package-b", help="Engine B's crit package (default: engine A's engine)")
+    engine.add_argument("--adapter-b", help="Adapter of engine B (default: engine A's adapter)")
     ab.add_argument("--config-b", default="{}", help="JSON configuration overrides of engine B (text or a file), over its packaged configuration.json")
     ab.add_argument("--model", required=True)
     ab.add_argument("--data", required=True)
@@ -226,7 +294,9 @@ def main(argv=None):
 
     kernels = subs.add_parser("kernels", help="Trace every kernel of the speed cases (CUPTI, Linux) and rank them "
                                               "per phase by time, launch width and share of peak")
-    kernels.add_argument("--adapter", required=True, help="Python file exporting create_eval_engine(context)")
+    engine = kernels.add_mutually_exclusive_group(required=True)
+    engine.add_argument("--package", help="A crit engine package, opened through Core's loader")
+    engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
     kernels.add_argument("--model", required=True, help="Model directory passed to the adapter")
     kernels.add_argument("--data", required=True, help="Prepared suite directory for this model")
     kernels.add_argument("--out", required=True, help="Kernel report JSON path")
@@ -269,6 +339,15 @@ ENGINE_COMMANDS = {"run", "pin", "ab", "kernels", "reference"}
 
 
 def _command(args):
+    # A crit engine package is measured through Core's own adapter, never one of the package's.
+    if args.command == "ab" and args.package and not (args.package_b or args.adapter_b):
+        args.package_b = args.package   # engine B defaults to engine A
+    refuse_run_adapter(None if getattr(args, "package", None) else getattr(args, "adapter", None), "--adapter")
+    refuse_run_adapter(None if getattr(args, "package_b", None) else getattr(args, "adapter_b", None), "--adapter-b")
+    if getattr(args, "package", None):
+        args.adapter, args.config = package_engine(args.package, args.config, "--config")
+    if getattr(args, "package_b", None):
+        args.adapter_b, args.config_b = package_engine(args.package_b, args.config_b, "--config-b")
     if args.command == "workbench":
         from .workbench import profile, run_harness
         if args.action == "profile":
@@ -316,9 +395,10 @@ def _command(args):
         print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / STORE}"
               + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else "")
               + (f"; the reference's own spread {how['spread']}" if how.get("spread") else "")
-              + {"none": "; the checkpoint declares no quantized activations (as_quantized judges as preserve)",
-                 "unsupported": "; the as_quantized allowance not measured (see above)"}.get(
-                  how.get("allowance"), f"; the as_quantized allowance {how['allowance']}" if how.get("allowance") else ""))
+              + {"none": "; the checkpoint declares no quantized activations: no allowance to measure",
+                 "unsupported": "; the allowance not measured (see above)"}.get(
+                  how.get("allowance"), f"; the allowance (what the declared activation format costs, reported only) "
+                                        f"{how['allowance']}" if how.get("allowance") else ""))
         return 0
     if args.command == "fetch":
         from .quality.packages import fetch as do_fetch, source
@@ -391,6 +471,19 @@ def _command(args):
               + (f", {device['memory_free_bytes'] / 1e9:.1f} of {device['memory_total_bytes'] / 1e9:.1f} GB free"
                  if device.get("memory_free_bytes") and device.get("memory_total_bytes") else ""))
         return 0
+    if args.command == "precheck":
+        from .quality.prepare import read_template
+        from .run.precheck import run_precheck
+        items = run_precheck(args.adapter, args.model, Path(args.data), args.context, args.quality_mode,
+                             config=adapter_config(args.adapter, args.config, "--config") if args.adapter else {},
+                             url=args.url, served_model=args.served_model,
+                             chat_template=read_template(args.chat_template), lower=not args.no_lower,
+                             vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)))
+        if args.out:
+            Path(args.out).write_text(json.dumps({"items": items}, indent=1), encoding="utf-8")
+        failed = [item["name"] for item in items if item["state"] == "failed"]
+        print("precheck: " + ("failed " + ", ".join(failed) if failed else "nothing failed"))
+        return 4 if failed else 0
     if args.command == "status":
         from . import load_json as load
         from .reports.status import render, status_of

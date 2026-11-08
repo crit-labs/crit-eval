@@ -42,6 +42,7 @@ class MockEngine:
             raise RuntimeError("cannot be built below the context it was tuned for")
         self.calls = 0
         self.longest = 0  # the longest prompt served so far
+        self.reads = self.hits = 0   # the expert cache's counters (telemetry), with the expert_cache knob
 
     def info(self):
         return {"name": "mock", "configuration": self.config, "max_context": self.capacity,
@@ -76,6 +77,12 @@ class MockEngine:
             time.sleep(pause)
             on_tokens(tokens[i:i + step])
         rounds = -(-len(tokens) // step)
+        # Test knob: an expert cache whose counters only telemetry() reports, expert_cache {"reads_per_token",
+        # "hit_rate"}: each decoded token reads its experts.
+        cache = self.config.get("expert_cache")
+        if cache:
+            reads = int(cache.get("reads_per_token", 8)) * len(tokens)
+            self.reads, self.hits = self.reads + reads, self.hits + round(reads * float(cache["hit_rate"]))
         # Optional: drafts accepted in each round, for the speed-of-light projection.
         out = {"tokens": tokens, "rounds": rounds, "accepted": [step - 1] * rounds}
         if self.config.get("report_parts"):
@@ -145,6 +152,14 @@ class MockEngine:
         """Decode `continuation` as if it were the engine's own greedy output (drafts accepted while
         they match it, corrections taken from it)."""
         return self._rounds(list(continuation), on_tokens)
+
+    def telemetry(self):
+        """Optional: the engine's own counters since it opened, {"expert_cache": {"reads", "hits", ...}, ...}: an engine
+        whose experts the device cannot all hold reports its expert cache's here when its requests report no
+        expert_reads and expert_hits, and Eval prices the misses at that hit rate. None: nothing to report."""
+        if not self.config.get("expert_cache"):
+            return None
+        return {"expert_cache": {"reads": self.reads, "hits": self.hits}}
 
     def close(self):
         pass

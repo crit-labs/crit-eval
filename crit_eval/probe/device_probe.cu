@@ -309,6 +309,138 @@ double cpu_gflops(int threads, int passes) {
     return best;
 }
 
+// The CPU expert lane: 4-bit expert weights against int8 activations as crit's integer block rows compute them
+// (host-expert-arithmetic host_int.h, interleaved layout: one vector lane per 16-block, exact integer block sums, one
+// FP32 step per block), on vpdpbusd (AVX-512 VNNI), vpmaddubsw (AVX2) or scalar code, whichever this build targets.
+// GB/s of weight bytes (codes and block scales) for `tokens` tokens a matrix, each thread streaming its own share of a
+// buffer far larger than the caches. What a CPU tier computing an expert's rows reaches, which the host memory read
+// rate alone overstates for FP32 rows and several tokens.
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+constexpr const char* kIntIsa = "avx512_vnni";
+#elif defined(__AVX2__)
+constexpr const char* kIntIsa = "avx2";
+#else
+constexpr const char* kIntIsa = "scalar";
+#endif
+constexpr size_t kGroupBytes = 144;   // 16 blocks: 128 bytes of codes, 16 scale bytes
+
+void expert_group(const uint8_t* g, const uint8_t* acts, const float* scales, int tokens, float* acc) {
+#if defined(__AVX512VNNI__) && defined(__AVX512BW__)
+    const __m512i lut = _mm512_broadcast_i32x4(_mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12));
+    __m512i w[4];
+    for (int c = 0; c < 4; ++c) {
+        const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(g + 32 * c));
+        const __m256i lo = _mm256_and_si256(q, _mm256_set1_epi8(15));
+        const __m256i hi = _mm256_and_si256(_mm256_srli_epi16(q, 4), _mm256_set1_epi8(15));
+        w[c] = _mm512_shuffle_epi8(lut, _mm512_inserti64x4(_mm512_castsi256_si512(lo), hi, 1));
+    }
+    alignas(64) float ws[16];
+    for (int i = 0; i < 16; ++i) ws[i] = 0.01f * float(g[128 + i] & 127);
+    const __m512 wv = _mm512_load_ps(ws);
+    for (int t = 0; t < tokens; ++t) {
+        const uint8_t* x = acts + 256 * t;
+        const __m512i zero = _mm512_setzero_si512();
+        const __m512i sum = _mm512_add_epi32(
+            _mm512_add_epi32(_mm512_dpbusd_epi32(zero, _mm512_loadu_si512(x), w[0]),
+                             _mm512_dpbusd_epi32(zero, _mm512_loadu_si512(x + 64), w[1])),
+            _mm512_add_epi32(_mm512_dpbusd_epi32(zero, _mm512_loadu_si512(x + 128), w[2]),
+                             _mm512_dpbusd_epi32(zero, _mm512_loadu_si512(x + 192), w[3])));
+        __m512 a = _mm512_loadu_ps(acc + 16 * t);
+        a = _mm512_fmadd_ps(_mm512_cvtepi32_ps(sum), _mm512_mul_ps(wv, _mm512_loadu_ps(scales + 16 * t)), a);
+        _mm512_storeu_ps(acc + 16 * t, a);
+    }
+#elif defined(__AVX2__)
+    const __m128i lut128 = _mm_setr_epi8(0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12);
+    const __m256i lut = _mm256_setr_m128i(lut128, lut128), ones = _mm256_set1_epi16(1);
+    __m256i w[4][2];
+    for (int c = 0; c < 4; ++c) {
+        const __m256i q = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(g + 32 * c));
+        w[c][0] = _mm256_shuffle_epi8(lut, _mm256_and_si256(q, _mm256_set1_epi8(15)));
+        w[c][1] = _mm256_shuffle_epi8(lut, _mm256_and_si256(_mm256_srli_epi16(q, 4), _mm256_set1_epi8(15)));
+    }
+    for (int t = 0; t < tokens; ++t)
+        for (int h = 0; h < 2; ++h) {
+            __m256i sum = _mm256_setzero_si256();
+            for (int c = 0; c < 4; ++c)
+                sum = _mm256_add_epi32(sum, _mm256_madd_epi16(_mm256_maddubs_epi16(
+                    _mm256_loadu_si256(reinterpret_cast<const __m256i*>(acts + 256 * t + 64 * c + 32 * h)), w[c][h]), ones));
+            __m256 a = _mm256_loadu_ps(acc + 16 * t + 8 * h);
+            a = _mm256_fmadd_ps(_mm256_cvtepi32_ps(sum), _mm256_loadu_ps(scales + 16 * t + 8 * h), a);
+            _mm256_storeu_ps(acc + 16 * t + 8 * h, a);
+        }
+#else
+    for (int t = 0; t < tokens; ++t)
+        for (int b = 0; b < 16; ++b) {
+            int sum = 0;
+            for (int e = 0; e < 16; ++e) {
+                const uint8_t byte = g[32 * (e / 4) + 4 * (b % 8) + e % 4];
+                const int code = b < 8 ? byte & 15 : byte >> 4;
+                sum += (code & 8 ? -(code & 7) : (code & 7)) * int(acts[256 * t + 64 * (e / 4) + 4 * b + e % 4]);
+            }
+            acc[16 * t + b] += float(sum) * scales[16 * t + b];
+        }
+#endif
+}
+
+// GB/s of weights the lane reads for `tokens` tokens on `threads` threads over `bytes` of experts, best of `passes`.
+double host_expert_gbs(int tokens, int threads, size_t bytes, int passes) {
+    const size_t groups = bytes / kGroupBytes;
+    std::vector<uint8_t> weights(groups * kGroupBytes);
+    for (size_t i = 0; i < weights.size(); ++i) weights[i] = uint8_t((i * 2654435761u) >> 13);
+    double best = 0.0;
+    for (int pass = 0; pass < passes; ++pass) {
+        const double seconds = timed_threads(threads, [&](int t) {
+            std::vector<uint8_t> acts(size_t(256) * 8, 129);
+            std::vector<float> scales(16 * 8, 0.01f), acc(16 * 8, 0.0f);
+            const size_t begin = groups * t / threads, end = groups * (t + 1) / threads;
+            for (size_t gi = begin; gi < end; ++gi)
+                expert_group(weights.data() + gi * kGroupBytes, acts.data(), scales.data(), tokens, acc.data());
+            g_sink += uint64_t(acc[0]);
+        });
+        if (seconds > 0) best = std::max(best, double(groups * kGroupBytes) / seconds / 1e9);
+    }
+    return best;
+}
+
+// The lane at 3 tokens while expert-sized pinned copies (2.76 MB) run over the host link: both read host memory, so
+// each runs below its rate alone. Fills cpu and link GB/s measured over the same window.
+void host_expert_with_link(int threads, size_t bytes, double* cpu, double* link) {
+    *cpu = *link = 0.0;
+    const size_t piece = 2764800, pieces = 64;
+    void* host = nullptr;
+    void* device = nullptr;
+    if (cudaHostAlloc(&host, piece * pieces, cudaHostAllocDefault) != cudaSuccess) { cudaGetLastError(); return; }
+    if (cudaMalloc(&device, piece * 8) != cudaSuccess) { cudaGetLastError(); cudaFreeHost(host); return; }
+    std::memset(host, 1, piece * pieces);
+    std::atomic<bool> stop{false};
+    std::atomic<double> moved{0.0};
+    std::thread copier([&] {
+        cudaStream_t stream;
+        cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking);
+        for (size_t i = 0; !stop.load(); ++i) {
+            cudaMemcpyAsync(static_cast<uint8_t*>(device) + piece * (i % 8), static_cast<uint8_t*>(host) + piece * (i % pieces),
+                            piece, cudaMemcpyHostToDevice, stream);
+            if (i % 8 == 7) {
+                cudaStreamSynchronize(stream);
+                double seen = moved.load();
+                while (!moved.compare_exchange_weak(seen, seen + double(piece) * 8)) {}
+            }
+        }
+        cudaStreamSynchronize(stream);
+        cudaStreamDestroy(stream);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));   // the copies run before the lane starts
+    const double before = moved.load();
+    const auto start = Clock::now();
+    *cpu = host_expert_gbs(3, threads, bytes, 1);
+    const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+    *link = (moved.load() - before) / seconds / 1e9;
+    stop.store(true);
+    copier.join();
+    cudaFree(device);
+    cudaFreeHost(host);
+}
+
 // Raw tensor-core rates: mma.sync throughput per input and accumulator format, every SM busy, operands in registers.
 // Kinds: 0 bf16->f32, 1 f16->f32, 2 f16->f16, 3 e4m3->f32, 4 e2m1 x e2m1 block-scaled (nvfp4) -> f32,
 // 5 e2m1 x e4m3 (kind::f8f6f4) -> f32.
@@ -559,13 +691,23 @@ int main(int argc, char** argv) {
     }
     const int threads = int(std::max(1u, std::thread::hardware_concurrency()));
     const size_t host_bytes = size_t(1) << 30;
-    char host[512];
+    // The expert lane on one thread per physical core (half the hardware threads where they pair), and beside the
+    // link with one core left to issue the copies.
+    const int cores = std::max(1, threads > 1 ? threads / 2 : 1);
+    const size_t lane_bytes = size_t(512) << 20;
+    double with_cpu = 0.0, with_link = 0.0;
+    host_expert_with_link(std::max(1, cores - 1), lane_bytes, &with_cpu, &with_link);
+    char host[1024];
     std::snprintf(host, sizeof host,
                   "\"host_threads\": %d, \"host_memory_gbs\": {\"read\": %.1f, \"write\": %.1f, \"copy\": %.1f, "
-                  "\"read_one_thread\": %.1f}, \"cpu_gflops\": {\"fp32\": %.1f, \"fp32_one_thread\": %.1f}, \"cpu_isa\": \"%s\"",
+                  "\"read_one_thread\": %.1f}, \"cpu_gflops\": {\"fp32\": %.1f, \"fp32_one_thread\": %.1f}, \"cpu_isa\": \"%s\", "
+                  "\"host_expert_gbs\": {\"tokens_1\": %.1f, \"tokens_3\": %.1f, \"tokens_8\": %.1f, \"threads\": %d, "
+                  "\"with_link_cpu\": %.1f, \"with_link_link\": %.1f}, \"host_expert_isa\": \"%s\"",
                   threads, host_memory_gbs(0, host_bytes, threads, 5), host_memory_gbs(1, host_bytes, threads, 5),
                   host_memory_gbs(2, host_bytes, threads, 5), host_memory_gbs(0, host_bytes, 1, 5),
-                  cpu_gflops(threads, 3), cpu_gflops(1, 3), kIsa);
+                  cpu_gflops(threads, 3), cpu_gflops(1, 3), kIsa,
+                  host_expert_gbs(1, cores, lane_bytes, 3), host_expert_gbs(3, cores, lane_bytes, 3),
+                  host_expert_gbs(8, cores, lane_bytes, 3), cores, with_cpu, with_link, kIntIsa);
     cublasLtHandle_t lt;
     if (cublasLtCreate(&lt)) {
         std::printf("{\"error\": \"cublasLtCreate failed\"}\n");

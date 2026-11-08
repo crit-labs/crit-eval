@@ -58,10 +58,14 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
         # A request whose decode is still moving away from the one before it (a cache adapting to the case) stands as
         # one more warmup, up to the protocol's bound (protocol speed.steady_state).
         warm, added = warmups, 0
+        # The case's first request (protocol speed.fresh_decode): with a pinned continuation the first free generation,
+        # which runs before the replays; a staged run's is its first stage's.
+        first = before.get("first_request")
         if continuation is not None:
             for _ in range(2):
-                tokens, _ = timed_generate(engine, prompt, n)
+                tokens, sample = timed_generate(engine, prompt, n)
                 outputs.append(tokens)
+                first = first or first_request(sample)
         i = 0
         while i < warm + repetitions + extra:
             if i >= warm + repetitions and not disagree(samples, outputs, tolerance):
@@ -82,6 +86,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             i += 1
         if continuation is None:
             own += warm
+        first = first or first_request(samples[0] if samples else {})
         other = load.cores()
         check_disturbed(case["id"], samples, disturbed_spread, other)
         summary = _summary([s for s in samples if not s["warmup"]])
@@ -90,6 +95,8 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
         cases[case["id"]] = {
             "status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n, **summary,
             "repeatable": all(o == outputs[0] for o in outputs),
+            # How many outputs the repeatable gate compares: a case decoded once repeats nothing.
+            "outputs": len(outputs),
             # The distinct replies in order when they differ, for the fork judge (protocol forks).
             **({"variants": distinct(outputs)} if any(o != outputs[0] for o in outputs) else {}),
             # Measured repetitions that decoded different replies, and how far their decode spread (protocol
@@ -97,6 +104,8 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             "output_varies": output_varies(samples),
             "stop_crossed": bool(crossed), "first_stop_index": crossed[0] if crossed else None,
             "tokens": tokens, "samples": samples,
+            # The prompt's first request, before any warmup or replay (protocol speed.fresh_decode).
+            "first_request": first,
             # The warmups the case took to reach steady speed and how far its speed moved meanwhile.
             "steady_state": steady_state(samples, steady, added),
             # The longest and p99 gaps between streamed chunks after the first token (protocol speed.stalls).
@@ -139,11 +148,22 @@ def output_varies(samples):
     return {"replies": len(groups), "spread": headroom.spread([s["decode_tps"] for s in measured if s.get("decode_tps")])}
 
 
+def first_request(sample):
+    """The timings of a case's first request that protocol speed.fresh_decode reports."""
+    keys = ("decode_tps", "request_ms", "ttft_ms", "output_tokens", "tokens_per_round", "round_ms")
+    return {key: sample.get(key) for key in keys} if sample.get("decode_tps") else None
+
+
 def fresh_decode(measured):
     """protocol speed.fresh_decode: the geometric mean of each measured case's first request's decode tok/s
-    (fresh_decode_score), None unless every case has one."""
-    first = [(c.get("samples") or [{}])[0].get("decode_tps") for c in measured]
-    return {"fresh_decode_score": metrics.geometric_mean(first) if first and all(first) else None}
+    (fresh_decode_score), None unless every case has one, and repeat_speedup, the settled decode score over it: how
+    much faster the engine decodes a prompt it has just served than a new one. A case's first request is its
+    first_request (the pinned path's first free generation), else its first sample."""
+    first = [((c.get("first_request") or (c.get("samples") or [{}])[0]) or {}).get("decode_tps") for c in measured]
+    fresh = metrics.geometric_mean(first) if first and all(first) else None
+    settled = metrics.geometric_mean([c["decode_tps"] for c in measured]) if measured else None
+    return {"fresh_decode_score": fresh,
+            "repeat_speedup": round(settled / fresh, 3) if fresh and settled else None}
 
 
 def speed_summary(cases, protocol, warmups, repetitions, text):

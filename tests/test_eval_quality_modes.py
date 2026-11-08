@@ -1,6 +1,7 @@
-"""Quality modes: the checkpoint's own activation quantization (crit_eval.limits.schemes.activations, quantize_activations)
-and the as_quantized reference that applies it (crit_eval.quality.reference), on hand-built values and a tiny NVFP4 model
-written here (needs torch, transformers, safetensors and tokenizers)."""
+"""Quality modes (the drift budget each judges by, their defaults and the inputs that name them), and the allowance
+pass: the checkpoint's own activation quantization (crit_eval.limits.schemes.activations, quantize_activations) and the
+reference pass that applies it, reported only (crit_eval.quality.reference, declared_activations), on hand-built values
+and a tiny NVFP4 model written here (needs torch, transformers, safetensors and tokenizers)."""
 import importlib.util
 import json
 from pathlib import Path
@@ -111,19 +112,76 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(activations(Stored(modelopt, {"quant_method": "modelopt"}), "model.layers.0.mlp.up_proj"),
                          ("nvfp4", 4.0))
 
-    def test_as_quantized_judges_by_eight_times_the_preserve_budget(self):
-        # protocol quality.mode_thresholds: as_quantized is the mode for speed; its budget is a floor that keeps out a
+    def test_a_run_that_names_no_mode_judges_in_speed(self):
+        # protocol quality.modes: speed is every entry point's default; every result states its mode, and a mode
+        # no longer named is refused. A mode is the drift the engine may trade for speed, not the checkpoint's format.
+        import inspect
+        from crit_eval import cli, load_json, EVAL_DIR
+        from crit_eval.limits import headroom
+        from crit_eval.run import precheck, runner
+        self.assertEqual((fixed.QUALITY_MODES, fixed.DEFAULT_QUALITY_MODE), (("preserve", "speed"), "speed"))
+        self.assertEqual(inspect.signature(runner.run).parameters["quality_mode"].default, "speed")
+        self.assertEqual(inspect.signature(precheck.run_precheck).parameters["quality_mode"].default, "speed")
+        served = ["--url", "http://127.0.0.1:9/v1", "--model", "m", "--data", "d", "--context", "8"]
+        for argv in (["run", *served, "--out", "o"], ["precheck", *served]):
+            parsed = {}
+            with patch.object(cli, "_command", lambda args: parsed.update(vars(args)) or 0):
+                cli.main(argv)
+            self.assertEqual(parsed["quality_mode"], "speed", argv[0])
+            with patch.object(cli, "_command", lambda args: parsed.update(vars(args)) or 0):
+                cli.main(argv + ["--quality-mode", "preserve"])
+            self.assertEqual(parsed["quality_mode"], "preserve", argv[0])
+        self.assertEqual(headroom.quality_mode({"requirements": {"quality_mode": "speed"}}), "speed")
+        protocol = load_json(EVAL_DIR / "protocol.json")
+        self.assertIn("speed, the default", protocol["quality"]["modes"])
+        self.assertIn("it is not about how that checkpoint is quantized or stored", protocol["quality"]["modes"])
+
+    def test_the_old_name_and_a_missing_mode_are_refused_on_every_input(self):
+        # No mode is read for another: the old name, or none, fails as any unknown mode does.
+        import contextlib
+        import io
+        from crit_eval import cli, load_json, EVAL_DIR
+        from crit_eval.limits import headroom
+        from crit_eval.run import precheck, quality_checks, runner
+        served = ["--url", "http://127.0.0.1:9/v1", "--model", "m", "--data", "d", "--context", "8"]
+        for argv in (["run", *served, "--out", "o"], ["precheck", *served]):
+            with self.subTest(command=argv[0]), contextlib.redirect_stderr(io.StringIO()) as err, \
+                    self.assertRaises(SystemExit):
+                cli.main(argv + ["--quality-mode", "as_quantized"])
+            self.assertIn("invalid choice: 'as_quantized'", err.getvalue())
+        with self.assertRaisesRegex(SystemExit, "quality mode must be one of preserve, speed"):
+            runner.run(None, "m", "d", "o", quality_mode="as_quantized")
+        with self.assertRaisesRegex(SystemExit, "quality mode must be one of preserve, speed"):
+            precheck.run_precheck(None, "m", "d", 8, quality_mode="as_quantized")
+        protocol = load_json(EVAL_DIR / "protocol.json")
+        self.assertEqual(set(protocol["quality"]["mode_thresholds"]) - {"rule"}, {"speed"})
+        self.assertEqual(set(protocol["quality"]["honesty"]["modes"]), {"speed"})
+        self.assertEqual(protocol["forks"]["modes"], ["speed"])
+        self.assertNotIn("as_quantized", json.dumps(protocol))
+        with self.assertRaisesRegex(ValueError, "quality mode 'as_quantized' has no budget in the protocol: preserve or speed"):
+            quality_checks.quality_thresholds(protocol, mode="as_quantized")
+        for requirements in ({}, {"quality_mode": "as_quantized"}, {"exactness": "reported"}):
+            with self.assertRaisesRegex(ValueError, "a result states the quality mode it was judged in, preserve or speed"):
+                headroom.quality_mode({"requirements": requirements})
+
+    def test_speed_judges_by_eight_times_the_preserve_budget(self):
+        # protocol quality.mode_thresholds: speed's budget is a floor that keeps out a
         # broken engine, eight times preserve's; a run's own limits lay over either mode's.
         from crit_eval import load_json, EVAL_DIR
+        from crit_eval.reports import metrics
         from crit_eval.run import quality_checks
         protocol = load_json(EVAL_DIR / "protocol.json")
-        preserve = quality_checks.quality_thresholds(protocol)
+        # The mode is always named: no function assumes one.
+        with self.assertRaises(TypeError):
+            quality_checks.quality_thresholds(protocol)
+        with self.assertRaises(TypeError):
+            metrics.mode_thresholds(protocol["quality"])
+        preserve = quality_checks.quality_thresholds(protocol, mode="preserve")
         self.assertEqual(preserve, {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5})
-        self.assertEqual(quality_checks.quality_thresholds(protocol, mode="preserve"), preserve)
-        quantized = quality_checks.quality_thresholds(protocol, mode="as_quantized")
+        quantized = quality_checks.quality_thresholds(protocol, mode="speed")
         self.assertEqual(quantized, {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0})
         self.assertAlmostEqual(quantized["ppl_ratio_max"] - 1, 8 * (preserve["ppl_ratio_max"] - 1))
-        self.assertEqual(quality_checks.quality_thresholds(protocol, {"kld_p99_max": 0.8}, "as_quantized"),
+        self.assertEqual(quality_checks.quality_thresholds(protocol, {"kld_p99_max": 0.8}, mode="speed"),
                          {**quantized, "kld_p99_max": 0.8})
 
     def test_a_run_judges_by_the_spread_of_every_text_the_rule_names(self):
@@ -150,14 +208,14 @@ class ActivationTests(unittest.TestCase):
             fixed.write(data, {"reference": 3}, {"t": ([-0.5], [[1]], [[-0.5]])})
             allowance = {"activations": ["nvfp4"], "sets": {"long-1/prompt": {"kld_mean": 0.05}}}
             self.assertIsNone(fixed.load_allowance(data, {"reference": 3}))
-            fixed.write_allowance(data, {"reference": 3, "allowance": "as_quantized"}, allowance)
+            fixed.write_allowance(data, {"reference": 3, "allowance": "declared_activations"}, allowance)
             self.assertEqual(fixed.load_allowance(data, {"reference": 3}), allowance)
             self.assertIsNone(fixed.load_allowance(data, {"reference": 4}))   # another reference's
             self.assertTrue((Path(data) / fixed.STORE / fixed.ALLOWANCE).is_file())
 
 
 @unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers, safetensors and tokenizers")
-class AsQuantizedReferenceTests(unittest.TestCase):
+class DeclaredActivationsReferenceTests(unittest.TestCase):
     def test_the_reference_quantizes_every_declared_input_as_the_checkpoint_does(self):
         import torch
         from transformers import AutoConfig, AutoModelForCausalLM
@@ -166,7 +224,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             folder, tensors, config = nvfp4_checkpoint(Path(temp))
             exact = scored(folder, sequences())
-            with patch_mode("as_quantized"):
+            with declared_activations():
                 quantized = scored(folder, sequences())
             # The twin: transformers' model with the decoded weights and every declared input quantized alike.
             from crit_eval.quality.checkpoints import _text_config, open_checkpoint
@@ -190,11 +248,10 @@ class AsQuantizedReferenceTests(unittest.TestCase):
                     self.assertEqual(got, [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
                     self.assertNotEqual(got, plain)
 
-    def test_one_reference_run_stores_the_scores_and_the_as_quantized_allowance(self):
+    def test_one_reference_run_stores_the_scores_and_the_allowance(self):
         # protocol quality.allowance: a checkpoint that declares quantized activations is scored a second time with
-        # them quantized, and only how far that lands from the exact scores is kept, per set and path; scores an
-        # earlier crit-eval stored for the as_quantized mode give the same allowance without the second run, and a
-        # checkpoint with plain weights declares none.
+        # them quantized, and only how far that lands from the exact scores is kept, per set and path; a checkpoint
+        # with plain weights declares none.
         from crit_eval.quality import reference
         from crit_eval.reports import metrics
         from test_eval_formats import sequences
@@ -216,7 +273,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
             self.assertEqual(sorted(allowance["sets"]), ["conversations/prompt", "conversations/served",
                                                          "long-23/prompt", "long-23/served"])
             # What it holds: the quantized run against the exact scores, as an engine's rows would be judged.
-            quantized = reference.StreamingReference(folder, "cpu", quality_mode="as_quantized")
+            quantized = reference.StreamingReference(folder, "cpu", declared_activations=True)
             rows = dict(zip(texts, quantized.score_texts([ids for ids, _ in texts.values()], 4, None,
                                                          Path(temp) / "scratch", log=lambda m: None)))
             stored = fixed.load(measured, identity)
@@ -228,17 +285,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
             self.assertTrue(any(line.startswith("reference allowance conversations/served") for line in logged))
             self.assertEqual(reference.store_allowance(folder, measured, texts, 4, None, identity, layout, ["nvfp4"],
                                                        log=lambda m: None, device="cpu"), "stored")
-            # An earlier crit-eval's as_quantized store of the same texts: the same allowance, no second run.
-            derived = Path(temp) / "derived"
-            reference.store_texts(exact, texts, 4, None, derived, "m", log=lambda m: None)
-            fixed.write(derived, {**identity, "quality_mode": "as_quantized"},
-                        {name: tuple(part.tolist() for part in row) for name, row in rows.items()},
-                        fixed.LEGACY_AS_QUANTIZED)
-            with patch.object(reference.StreamingReference, "score_texts", side_effect=AssertionError("ran again")):
-                self.assertEqual(reference.store_allowance(folder, derived, texts, 4, None, identity, layout,
-                                                           ["nvfp4"], log=lambda m: None, device="cpu"), "derived")
-            self.assertEqual(fixed.load_allowance(derived, identity)["sets"], allowance["sets"])
-            # A declared form crit does not emulate: recorded, so an as_quantized run says why it has no allowance.
+            # A declared form crit does not emulate: recorded, so the allowance says why it is missing.
             refused = Path(temp) / "refused"
             reference.store_texts(exact, texts, 4, None, refused, "m", log=lambda m: None)
             from crit_eval.limits.schemes import SchemeError
@@ -246,7 +293,7 @@ class AsQuantizedReferenceTests(unittest.TestCase):
                                                        SchemeError("int4 activations"), log=lambda m: None),
                              "unsupported")
             self.assertEqual(fixed.load_allowance(refused, identity)["unsupported"], "int4 activations")
-            # Plain weights declare nothing: an empty allowance, as_quantized judges as preserve.
+            # Plain weights declare nothing: an empty allowance (both modes judge against the exact scores anyway).
             plain = Path(temp) / "original"
             self.assertEqual(reference.StreamingReference(plain, "cpu").declared_activations(), [])
             self.assertEqual(reference.store_allowance(plain, refused, texts, 4, None, {**identity, "model_sha256": "p"},
@@ -302,9 +349,9 @@ class AsQuantizedReferenceTests(unittest.TestCase):
                                                                           "input_activations": NVFP4_INPUTS}},
                                             "ignore": ["lm_head"]}
             (folder / "config.json").write_text(json.dumps(saved))
-            with patch_mode("as_quantized"), patch.object(reference.StreamingReference, "stream_experts", True):
+            with declared_activations(), patch.object(reference.StreamingReference, "stream_experts", True):
                 streamed = scored(folder, sequences())
-            with patch_mode("as_quantized"), patch.object(reference.StreamingReference, "stream_experts", False):
+            with declared_activations(), patch.object(reference.StreamingReference, "stream_experts", False):
                 whole = scored(folder, sequences())
             exact = scored(folder, sequences())
             # The twin: the decoded weights in transformers' eager experts loop, every matrix's input quantized alike.
@@ -384,19 +431,17 @@ def nvfp4_checkpoint(root):
     return folder, tensors, config
 
 
-class patch_mode:
-    """Score with StreamingReference in quality mode `mode` (test_eval_formats.scored opens it in preserve)."""
-
-    def __init__(self, mode):
-        self.mode = mode
+class declared_activations:
+    """Score with StreamingReference quantizing the declared activations, the allowance's pass
+    (test_eval_formats.scored opens it with exact activations)."""
 
     def __enter__(self):
         from crit_eval.quality import reference
         self.original = reference.StreamingReference.__init__
-        mode, original = self.mode, self.original
+        original = self.original
 
-        def opened(self, model, device="cuda", quality_mode="preserve"):
-            original(self, model, device, mode)
+        def opened(self, model, device="cuda", declared_activations=False):
+            original(self, model, device, True)
         reference.StreamingReference.__init__ = opened
 
     def __exit__(self, *exc):

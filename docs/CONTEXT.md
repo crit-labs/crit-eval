@@ -87,9 +87,11 @@ unmeasured.
   the points' TTFT floors.
 - **Lower-context gate:** on a certified run (`--certify`, after the engine at the requirement closes)
   and with `--stage full` (just before the full build opens), the speed cases run on an engine
-  opened at a quarter of the requirement (never below the longest speed case). A case fails when
-  it decodes slower, or reaches its first token later, than on the full build by more than 5% or
-  its own run-to-run spread, whichever is larger. Failing to open or run there fails too.
+  opened at a quarter of the requirement (never below the longest speed case), each after one warm-up
+  request. A case fails when it decodes slower, or reaches its first token later, than on the full build
+  by more than 5% or its own run-to-run spread, whichever is larger. The first token is judged on the
+  engine's own first-token time where it reports one at both contexts (`ttft_judged`), so the server's
+  time outside the engine does not decide the gate. Failing to open or run there fails too.
 
 `--only context` runs the curve and retrieval; `--only speed` also runs the lower-context gate.
 Beside the capacity gate, `context.device_memory` records the device memory left free with the engine

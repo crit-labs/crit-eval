@@ -39,8 +39,8 @@ in DECODERS.
 
 activations(checkpoint, base) says how the checkpoint's own inference quantizes the activations a quantized matrix
 multiplies (its declared input activations: compressed-tensors input_activations with base.input_global_scale or
-base.input_scale, ModelOpt base.input_scale), and quantize_activations applies it in FP32, the reference's
-quality_mode as_quantized (crit_eval.quality.reference).
+base.input_scale, ModelOpt base.input_scale), and quantize_activations applies it in FP32 in the reference's
+allowance pass (crit_eval.quality.reference, reported only; both quality modes judge against exact activations).
 """
 import json
 import math

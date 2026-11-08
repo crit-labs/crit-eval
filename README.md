@@ -8,7 +8,7 @@
 
 ### Speed and quality measurement tool to compare inference engines honestly.
 
-[![Version 0.5.3](docs/assets/badge-version.svg)](CHANGELOG.md)
+[![Version 0.6.0](docs/assets/badge-version.svg)](CHANGELOG.md)
 [![License Apache-2.0](docs/assets/badge-license.svg)](LICENSE)
 [![Python 3.11+](docs/assets/badge-python.svg)](pyproject.toml)
 
@@ -56,8 +56,9 @@ crit-eval status result.json
 `fetch` gets the checkpoint's [reference package](docs/MEASUREMENTS.md#quality) from `PACKAGES` (a folder or an
 https base URL) when it has one; without it,
 `crit-eval reference` scores the reference once on your GPU (the `reference` extra installs torch and
-transformers for that). Inside crit the same commands are `crit eval ...`. An engine without a server
-plugs in through a Python [adapter](docs/ADAPTER.md) instead of `--url`.
+transformers for that). Inside crit the same commands are `crit eval ...`. A crit engine package runs in process
+with `--package DIR`, through Core's own adapter; another engine without a server plugs in through a Python
+[adapter](docs/ADAPTER.md) instead of `--url`.
 
 ---
 
@@ -95,7 +96,7 @@ plugs in through a Python [adapter](docs/ADAPTER.md) instead of `--url`.
 | **prefill** | `status.kpis.prefill` | Prompt tokens per second on the two long prompts |
 | **ttft** | `status.kpis.ttft` | Milliseconds to the first token over every workload |
 | **long-context decode and ttft** | `status.kpis.context` | The same scores along a curve of prompts up to the required context (200,000 tokens by default; the required context itself on a certified run) |
-| **perplexity** | `status.kpis.perplexity` | The engine's perplexity over the reference's: the worst quality set (prompt and served tokens, each long length) against its limit; per set in `quality.sets` |
+| **perplexity** | `status.kpis.perplexity` | The engine's perplexity over the reference's: the worst served set (served tokens, each long length) against its limit; the prompt positions' ratio is reported per set in `quality.sets`, not judged, in either quality mode ([prompt positions](docs/MEASUREMENTS.md#quality)) |
 | **kl_divergence** | `status.kpis.kl_divergence` | Mean and p99 KL divergence of the engine's token distributions from the reference's: the worst set against its limits; per set in `quality.sets` |
 | limits and gaps | `headroom` | Each KPI's physical limit on this machine, from the probe's best rate per format (cuBLASLt GEMM or raw tensor cores), and what each term (model pass, draft steps, verify pass, draft width, drafter acceptance, prefill, first token) would give at its floor |
 | fixed decode fraction | `headroom.fixed_decode` | Decode over one token per pass at the model files' bytes and the probed bandwidth, per case and overall: a denominator the engine's own report cannot move, above 1 with speculation (reported, not judged) |
@@ -150,8 +151,8 @@ plugs in through a Python [adapter](docs/ADAPTER.md) instead of `--url`.
 | What quality covers | Drift on fixed texts: six conversations (prose, code, math, tool calls and more) and one long text each at 1K, 4K and 32K tokens, as perplexity ratio and KL divergence. It is not a task benchmark: no accuracy on MMLU-style questions, coding tests or agent tasks. |
 | Reference coverage | The reference runs the model through transformers' modeling code in FP32, so it needs an architecture transformers implements and a CUDA GPU with the machine to itself for 5 to 25 minutes. Checkpoints in exl2 or exl3 are refused. Reference packages for three checkpoints are published on Hugging Face ([crit-labs/crit-eval-references](https://huggingface.co/datasets/crit-labs/crit-eval-references)) and fetched by default. |
 | Rounding-sensitive models | Where a model amplifies rounding (MoE routing near-ties, sparse-attention ties, recurrent state), two valid FP32 runs of the reference disagree; quality is then judged against twice the reference's own spread instead of the budget, which is looser for those models. |
-| Speed | One request at a time: `crit-eval` measures single-stream decode, prefill and time to first token, not throughput under concurrent requests or batching. The sampled decode runs one seed per case; `--adaptive-sampled` repeats a noisy case at up to nine seeds, so an engine whose speed swings with the drawn text takes longer to measure that way, an option the result records. |
-| Hardware | NVIDIA GPUs only: the probe builds with nvcc and measures one GPU. Multi-GPU engines are not measured as such. PCIe, host memory and CPU rates are recorded; an engine that declares the bytes it reads from host memory per pass (`host_bytes_per_pass`) gets them priced at those rates, every other engine gets GPU-only limits. On Windows the CPU probe uses AVX2, which under-reports an AVX-512 CPU. |
+| Speed | Single-stream decode, prefill and time to first token are the speed KPIs; an engine that runs several requests at once also gets the concurrency part (closed-loop clients, 1 to 64), whose gate judges that batching changes no reply and that the requests ran together, and whose speedup is reported against the cost model of the engine's placement, not judged. The sampled decode runs one seed per case; `--adaptive-sampled` repeats a noisy case at up to nine seeds, so an engine whose speed swings with the drawn text takes longer to measure that way, an option the result records. |
+| Hardware | NVIDIA GPUs only: the probe builds with nvcc and measures one GPU. Multi-GPU engines are not measured as such. PCIe, host memory and CPU rates are recorded; an engine that declares the bytes it reads from host memory per pass (`host_bytes_per_pass`) gets them priced at those rates, every other engine gets GPU-only limits. An engine whose experts the device cannot all hold is priced at its own expert cache hit rate (`expert_reads` and `expert_hits`, or its `telemetry()`); without one, the expert misses beyond what the device's capacity forces are unmeasured, never assumed, and its floors and ceilings read every other routed expert from the device: optimistic, as `status` says. On Windows the CPU probe uses AVX2, which under-reports an AVX-512 CPU. |
 | Long context | The hub profile measures the long-context curve at its two ends and interpolates the points between; only the full profile measures every point. |
 | Comparability | Results compare only under the same protocol series and profile, on prepared data of the same checkpoint. |
 

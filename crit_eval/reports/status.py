@@ -57,13 +57,19 @@ def _gates(result):
         gates.append({"name": "coverage", "state": "fail" if failed else "unmeasured" if skipped else "pass",
                       "detail": f"{len(measured)}/{len(cases)} speed cases measured"
                                 + "".join(f"; {cid} skipped: {why}" for cid, why in skipped.items())})
-        unrepeatable = [cid for cid in measured if not cases[cid].get("repeatable", True)]
-        # quality mode as_quantized: replies that part at near-ties pass (protocol forks)
+        unrepeatable = [cid for cid in measured if not cases[cid]["repeatable"]]
+        # quality mode speed: replies that part at near-ties pass (protocol forks)
         tied = [cid for cid in unrepeatable if forks_allowed(result) and near_ties(cases[cid].get("forks"))]
         failing = [cid for cid in unrepeatable if cid not in tied]
-        gates.append({"name": "repeatable", "state": "fail" if failing else "pass",
+        # A case decoded once has nothing to repeat: it is not counted as repeating (a staged run's stage 1 decodes
+        # each case once, stage 2 repeats those under long_prompt_tokens).
+        compared = [cid for cid in measured if cases[cid]["outputs"] >= 2]
+        once = [cid for cid in measured if cid not in compared]
+        gates.append({"name": "repeatable", "state": "fail" if failing else "pass" if compared else "unmeasured",
                       "detail": (f"output changes between repetitions: {', '.join(failing)}" if failing
-                                 else f"{len(measured) - len(tied)}/{len(measured)} cases repeat their output")
+                                 else f"{len(compared) - len(tied)}/{len(compared)} cases repeat their output" if compared
+                                 else "every speed case decoded once: no output to repeat")
+                      + (f"; decoded once, not compared: {', '.join(once)}" if once and compared else "")
                       + "".join(f"; {cid} parts at {', '.join(describe(f) for f in cases[cid]['forks'])}"
                                 for cid in unrepeatable if cases[cid].get("forks"))
                       # Their speed is the median over the different replies (protocol speed.output_varies).
@@ -77,6 +83,7 @@ def _gates(result):
     gates.append(_quality_gate(result))
     gates.append(_sampling_gate(result))
     gates += _context_gates(result)
+    gates.append(_concurrency_gate(result))
     if speculative and (exact or {}).get("status") == "unmeasured":
         gates.append({"name": "exactness", "state": "unmeasured", "detail": exact["reason"]})
     elif speculative and _exactness_mode(result) == "required":
@@ -91,9 +98,64 @@ def _gates(result):
 
 
 def forks_allowed(result):
-    """protocol forks: in quality mode as_quantized, an output difference that parts at a near-tie passes the
+    """protocol forks: in quality mode speed, an output difference that parts at a near-tie passes the
     repeatable, request_history and prompt_cache gates."""
-    return headroom.quality_mode(result) == "as_quantized"
+    return headroom.quality_mode(result) == "speed"
+
+
+def _concurrency_gate(result):
+    """protocol concurrency.gate: requests served at once decode what each decodes alone (in quality mode speed up to
+    near-ties), and every measured level qualified: no failed, missing or duplicated request, its clients in flight at
+    once and its requests run together (two or more replies streaming at once). How much more a level serves is the
+    speedup KPI (_concurrency_kpi), never the gate: what batching can gain depends on the engine's placement (an
+    engine whose expert misses cross the host link brings them anew with every row). A level whose replies each came
+    in one chunk shows no overlap either way: whether its requests ran together is unmeasured."""
+    found = result.get("concurrency")
+    if found is None:
+        return {"name": "concurrency", "state": "unmeasured", "detail": "concurrency not run"}
+    if found["status"] != "measured":
+        return {"name": "concurrency", "state": "unmeasured", "detail": found["reason"]}
+    levels = found["levels"]
+    if not any(int(clients) >= 2 for clients in levels):
+        return {"name": "concurrency", "state": "unmeasured",
+                "detail": "no level of 2 or more clients measured" + "".join(
+                    f"; {clients} clients skipped ({why})" for clients, why in found["skipped"].items())}
+    problems, notes, open_ = [], [], []
+    for clients, row in levels.items():
+        if not row["qualified"]:
+            problems.append(f"{clients} clients not qualified ({'; '.join(row['errors'])[:200]})")
+        elif int(clients) >= 2 and row["ran_together"] is False:
+            problems.append(f"{clients} clients did not run together: at most {row['streaming_peak']} of their "
+                            f"{clients} replies streamed at a time, so the server ran its requests one after another")
+        elif int(clients) >= 2 and row["ran_together"] is None:
+            open_.append(f"{clients} clients: no reply streamed over an interval (each came in one chunk), so whether "
+                         f"the {clients} requests ran together is unmeasured")
+    compared = matched = 0
+    for clients, row in levels.items():
+        consistency = row["consistency"]
+        compared, matched = compared + consistency["compared"], matched + consistency["matched"]
+        for key, d in consistency["differences"].items():
+            fork = d.get("fork")   # judged in quality mode speed only (protocol forks)
+            if forks_allowed(result) and near_ties([fork]):
+                notes.append(f"{clients} clients, request {key} parts at {describe(fork)}")
+            else:
+                problems.append(f"{clients} clients, request {key} ({d['case']}) differs from its serial reply at token "
+                                f"{d['first_difference']}" + (f", {describe(fork)}" if fork else ""))
+    together = [f"{c} clients {row['streaming_peak']} of {c}" for c, row in levels.items()
+                if int(c) >= 2 and row["ran_together"]]
+    detail = (f"{matched}/{compared} batched replies equal their serial ones"
+              + (f"; requests ran together, replies streaming at once at the peak: {', '.join(together)}"
+                 if together else "")
+              + "".join("; " + p for p in problems + open_) + "".join("; " + n for n in notes))
+    if problems:
+        return {"name": "concurrency", "state": "fail", "detail": detail}
+    if open_:
+        return {"name": "concurrency", "state": "unmeasured", "detail": detail}
+    if not compared:
+        # A batched reply equal to its serial one is half the gate: with none compared it has nothing to pass on.
+        return {"name": "concurrency", "state": "unmeasured",
+                "detail": "no batched reply compared with a serial one (no serial replies of the pool's speed cases)"}
+    return {"name": "concurrency", "state": "pass", "detail": detail}
 
 
 def _sampling_gate(result):
@@ -137,7 +199,8 @@ def _quality_gate(result):
         detail += f"; served replies scored alike within {honesty['max_abs_logprob_diff']:.1e}"
     if honesty.get("passed") is False and honesty.get("max_abs_logprob_diff", 0.0) > honesty.get("tolerance", 0.0):
         detail += ("; " + HONESTY_HINT)
-    elif honesty:
+    elif honesty and honesty.get("passed") is None:
+        # Only a check that judged nothing is "not checked": a passed one said so above.
         detail += f"; honesty not checked: {honesty.get('reason') or 'no honesty set fits the context'}"
     if quality.get("skipped"):
         detail += " (skipped: " + "; ".join(f"{name}, {why}" for name, why in quality["skipped"].items()) + ")"
@@ -153,9 +216,6 @@ def _quality_gate(result):
             f"{name} (" + ", ".join(f"{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}"
                                     for k in quality["sets"][name]["allowance_raised"]) + ")"
             for name in allowed)
-    rejudged = [name for name, s in quality["sets"].items() if s.get("rejudged")]
-    if rejudged:
-        detail += "; judged again by " + quality["sets"][rejudged[0]]["rejudged"] + ": " + ", ".join(rejudged)
     if development:
         # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).
         return {"name": "quality", "state": "unmeasured",
@@ -178,7 +238,11 @@ def _prompt_cache_gate(result):
         return {"name": "prompt_cache", "state": "unmeasured", "detail": followup.get("reason") or "not measured"}
     again = followup.get("again")
     if again is None:
-        return {"name": "prompt_cache", "state": "unmeasured", "detail": "the follow-up turns did not run again"}
+        reached = (result.get("stages") or {}).get("reached")
+        return {"name": "prompt_cache", "state": "unmeasured",
+                "detail": "the follow-up turns did not run again"
+                          + (f": a stage 3 part, and this run stopped after stage {reached}"
+                             if reached is not None and reached < 3 else "")}
     differ = {turn: row["first_difference"] for turn, row in again["turns"].items() if not row["identical"]}
     tied = {turn for turn in differ if forks_allowed(result) and near_ties([again["turns"][turn].get("fork")])}
     cached = [str(row.get("cached_tokens")) for row in followup["turns"]]
@@ -231,6 +295,17 @@ def _retrieval_gate(result, required):
                         f"every fact found at {', '.join(f'{int(k):,}' for k in judged)} tokens (up to the required {required:,})")}]
 
 
+def _fit_text(fit):
+    """The memory the requirement needs against what the load left free (context.fit), for the capacity gate's detail:
+    the KV cache at the engine's kv_bytes_per_token, or why that is unmeasured."""
+    free = ("" if fit["free_after_load_bytes"] is None else
+            f"; {fit['free_after_load_bytes'] / 1e9:.2f} GB free after the load")
+    if fit["unmeasured"]:
+        return free + "; the KV cache at the requirement is unmeasured: " + fit["unmeasured"]
+    return (free + f"; the KV cache at the requirement needs {fit['kv_bytes_at_requirement'] / 1e9:.2f} GB "
+                   f"({fit['kv_bytes_per_token']:,.0f} bytes per token, the engine's)")
+
+
 def _context_gates(result):
     """Capacity, retrieval and lower context."""
     context = result["context"]
@@ -243,14 +318,9 @@ def _context_gates(result):
     points, lower = context.get("points"), context.get("lower")
     if context.get("certified") is False and ((points or {}).get(str(required)) or {}).get("status") != "measured":
         # protocol stages certify: only the candidate that will ship serves the requirement itself.
-        fit = context.get("fit") or {}
         capacity = {"name": "capacity", "state": "unmeasured",
                     "detail": f"the required {required:,} tokens are served by the certification only (crit eval run "
-                              "--certify, the candidate that will ship)"
-                              + (f"; {fit['free_after_load_bytes'] / 1e9:.2f} GB free after the load, the KV cache "
-                                 f"at the requirement needs {fit['kv_bytes_at_requirement'] / 1e9:.2f} GB"
-                                 if fit.get("free_after_load_bytes") is not None and fit.get("kv_bytes_at_requirement")
-                                 else "")}
+                              "--certify, the candidate that will ship)" + _fit_text(context["fit"])}
     elif points is None:
         capacity = {"name": "capacity", "state": "unmeasured", "detail": "context checks not run"}
     else:
@@ -328,7 +398,7 @@ def _generality_gate(result, protocol, baseline):
         return [{"name": "generality", "state": "unmeasured", "detail": f"baseline not comparable: {compared['reason']}"}]
     held_change = score / before["decode_score"] - 1
     # Held-out prompts decode greedily, so they compare with the greedy suite.
-    suite_change = compared.get("greedy_decode_score", compared.get("decode_score"))
+    suite_change = compared["greedy_decode_score"]
     failures = []
     if held_change < -tolerance:
         failures.append(f"held-out decode {held_change:+.1%} (more than {tolerance:.0%} slower)")
@@ -426,6 +496,16 @@ def _quality_kpis(quality, thresholds):
     return perplexity, kl_divergence
 
 
+def _ppl_text(ppl):
+    """The worst perplexity ratio the budget bounds, with the set it is over: only sets whose limits hold
+    ppl_ratio_max count, so the prompt positions' ratios (reported, not judged: protocol
+    quality.prompt_perplexity) are never read as passing it."""
+    if ppl["worst_ratio"] is None:
+        return "PPL not judged on any set (the prompt positions' ratios are reported only)"
+    return (f"PPL ×{ppl['worst_ratio']:.4f} ({ppl['worst_set']}, limit {ppl['limit']}; the prompt positions' PPL is "
+            "reported, not judged)")
+
+
 def _activations_kpi(found):
     if not found:
         return None
@@ -436,23 +516,30 @@ def _activations_kpi(found):
             "reachable": {k: v for k, v in found["reachable"].items() if k != "cases"} if found["reachable"] else None}
 
 
-def _render_mode(p, t, ct):
+def _render_mode(p):
     """The quality mode the result was judged in, and what the other mode's limits are: the trade, stated once."""
-    mode = p.get("quality_mode") or "preserve"
-    if mode == "as_quantized":
-        return ["  quality mode as_quantized: quality judged against the checkpoint's exact activations with the "
-                "mode's own budget (protocol quality.mode_thresholds), near-tie output differences allowed (protocol "
-                "forks); prefill and first-token limits at its stored format"]
-    if p.get("ceiling_activations") in (None, "stored") or not p.get("stored_ceiling"):
-        return ["  quality mode preserve: quality judged against the checkpoint's exact activations"]
-    trade = f"prefill {p['stored_ceiling']:,.0f} tok/s"
-    if t.get("stored_floor_ms"):
-        trade += f", first token {t['stored_floor_ms']:,.0f} ms"
-    if ct.get("stored_floor_ms"):
-        trade += f", long-context first token {ct['stored_floor_ms']:,.0f} ms"
-    return [f"  quality mode preserve: quality judged against the checkpoint's exact activations, limits at "
-            f"{p['ceiling_activations']} prompt activations; running the checkpoint's own activation quantization "
-            f"(quality mode as_quantized) would allow {trade}"]
+    mode = p["quality_mode"]
+    activations = p.get("ceiling_activations")
+    if mode == "speed":
+        at = ("its stored format" if activations in (None, "stored") else
+              f"{activations} prompt activations, the fastest the mode admits on this device")
+        return ["  quality mode speed: drift from the checkpoint's exact scores judged by "
+                "the mode's own budget (protocol quality.mode_thresholds), near-tie output differences allowed "
+                f"(protocol forks); prefill and first-token limits at {at}"]
+    line = "  quality mode preserve: drift from the checkpoint's exact scores judged by preserve's budget"
+    offered = p.get("speed_trade")
+    if not offered:
+        return [line + (f", limits at {activations} prompt activations"
+                        if activations not in (None, "stored") else "")]
+    trade = f"prefill {offered['prefill']:,.0f} tok/s"
+    if offered.get("ttft"):
+        trade += f", first token {offered['ttft']:,.0f} ms"
+    if offered.get("context_ttft"):
+        trade += f", long-context first token {offered['context_ttft']:,.0f} ms"
+    at = "the stored format's" if offered["activations"] == "stored" else offered["activations"]
+    return [line + (f", limits at {activations} prompt activations" if activations not in (None, "stored") else "")
+            + f"; quality mode speed would price its limits at {at} prompt activations: "
+            f"{trade}"]
 
 
 def _render_activations(a, stored):
@@ -566,6 +653,16 @@ def _term_rate(t):
     return f" ({'; '.join(bits)})" if bits else ""
 
 
+def _first_time(result):
+    """The greedy suite's first-time and settled decode (protocol speed.fresh_decode): {fresh, settled, speedup}, or
+    None without both."""
+    greedy = result.get("speed") or {}
+    fresh, settled = greedy.get("fresh_decode_score"), greedy.get("decode_score")
+    if not fresh or not settled:
+        return None
+    return {"fresh": fresh, "settled": settled, "speedup": settled / fresh}
+
+
 def _case_errors(sampled, protocol):
     """Each sampled case's relative standard error, repetitions and the repetitions the protocol's target_se would take
     (speed.run_sampled_speed records them; a result that does not record them has them derived from its samples)."""
@@ -589,20 +686,20 @@ def _one_seed(sampled):
 
 def _stalls_kpi(speed):
     """Each greedy speed case's longest and p99 gap between streamed chunks after its first token, in ms and in its
-    median rounds (protocol speed.stalls; reported, not judged). None for results from before the stalls; cases
-    whose engine streamed no chunks to time are named as unmeasured."""
-    cases = {cid: c for cid, c in (speed or {}).get("cases", {}).items() if c.get("status") == "measured"}
-    if not cases or not any("stalls" in c for c in cases.values()):
+    median rounds (protocol speed.stalls; reported, not judged). None without a measured case; cases whose engine
+    streamed no chunks to time are named as unmeasured."""
+    cases = {cid: c for cid, c in (speed or {}).get("cases", {}).items() if c["status"] == "measured"}
+    if not cases:
         return None
-    return {"cases": {cid: c["stalls"] for cid, c in cases.items() if c.get("stalls")},
-            "unmeasured": [cid for cid, c in cases.items() if not c.get("stalls")]}
+    return {"cases": {cid: c["stalls"] for cid, c in cases.items() if c["stalls"]},
+            "unmeasured": [cid for cid, c in cases.items() if not c["stalls"]]}
 
 
 def _tool_calls_kpi(speed):
     """The agent speed cases' tool calls, valid, invalid and truncated (protocol speed.tool_calls; reported, not
-    judged). None for results from before the count."""
+    judged). None when no measured case defines tools."""
     rows = {cid: c["tool_calls"] for cid, c in (speed or {}).get("cases", {}).items()
-            if c.get("status") == "measured" and c.get("tool_calls")}
+            if c["status"] == "measured" and c["tool_calls"]}
     if not rows:
         return None
     measured = [r for r in rows.values() if r.get("status") == "measured"]
@@ -636,33 +733,45 @@ def _render_stalls(s):
 
 
 def _concurrency_kpi(result):
-    """The concurrency part's figures per level (protocol concurrency; reported, not judged): the aggregate rate, the
+    """The concurrency part's figures per level (protocol concurrency; the concurrency gate judges them): the aggregate rate, the
     requests in flight at the peak, the first token and per-request decode, the share of replies equal to the serial
     ones and the aggregate over the batched ceiling. None when it did not run."""
-    found = result.get("concurrency") or {}
-    if found.get("status") != "measured":
-        return {"status": found["status"], "reason": found.get("reason")} if found.get("status") else None
+    found = result.get("concurrency")
+    if found is None:
+        return None
+    if found["status"] != "measured":
+        return {"status": found["status"], "reason": found["reason"]}
     levels = {}
-    for clients, row in (found.get("levels") or {}).items():
-        floor = row.get("ceiling") or {}
-        levels[clients] = {**{k: row.get(k) for k in ("aggregate_tps", "qualified", "peak_concurrency", "ttft_ms_p50",
-                                                       "ttft_ms_p95", "decode_tps_p50", "fraction_of_ceiling")},
+    for clients, row in found["levels"].items():
+        floor = row["ceiling"] or {}
+        # The speedup over the 1-client level beside the cost model's (protocol concurrency.speedup; reported, not
+        # judged), and the expert misses' hit rate each level's ceiling was priced at.
+        levels[clients] = {**{k: row[k] for k in ("aggregate_tps", "qualified", "peak_concurrency", "streaming_peak",
+                                                   "ran_together", "ttft_ms_p50", "ttft_ms_p95", "decode_tps_p50",
+                                                   "fraction_of_ceiling", "speedup", "expected_speedup",
+                                                   "fraction_of_expected", "expected_missing")},
                            "ceiling_tps": floor.get("ceiling_tps"), "bound": floor.get("bound"),
-                           "consistency": (row.get("consistency") or {}).get("fraction"),
+                           "hit_rate": floor.get("hit_rate"), "hit_rate_source": floor.get("hit_rate_source"),
+                           "unmeasured": floor.get("unmeasured"),
+                           "consistency": row["consistency"]["fraction"],
                            "first_differences": sorted({d["first_difference"] for d in
-                                                        ((row.get("consistency") or {}).get("differences") or {}).values()
-                                                        if d.get("first_difference") is not None})}
-    return {"status": "measured", "max_concurrent_requests": found.get("max_concurrent_requests"),
-            "requests_per_client": found.get("requests_per_client"), "output_tokens": found.get("output_tokens"),
-            "levels": levels, "skipped": found.get("skipped") or {}}
+                                                        row["consistency"]["differences"].values()
+                                                        if d["first_difference"] is not None})}
+    return {"status": "measured", "max_concurrent_requests": found["max_concurrent_requests"],
+            "requests_per_client": found["requests_per_client"], "output_tokens": found["output_tokens"],
+            "ceiling_basis": found["ceiling_basis"], "speculative": bool((result.get("engine") or {}).get("speculative")),
+            # The run's single-stream hit rate the expectations are priced at: recorded for a model with weights off
+            # the device only.
+            "hit_rate": found.get("hit_rate"), "hit_rate_source": found.get("hit_rate_source"),
+            "levels": levels, "skipped": found["skipped"]}
 
 
 def _render_concurrency(c):
-    if c.get("status") != "measured":
-        return [f"  concurrency unmeasured ({c.get('reason')})"]
+    if c["status"] != "measured":
+        return [f"  concurrency unmeasured ({c['reason']})"]
     lines = [f"  concurrency {len(c['levels'])} levels up to {max(map(int, c['levels']), default=0)} clients "
              f"(server runs {c['max_concurrent_requests']} at once; {c['requests_per_client']} requests of "
-             f"{c['output_tokens']} tokens per client); reported, not judged"]
+             f"{c['output_tokens']} tokens per client)"]
     for clients, row in c["levels"].items():
         line = (f"    {int(clients):>3} clients: " + (f"{row['aggregate_tps']:,.1f} tok/s aggregate" if row["aggregate_tps"]
                                                       else "not qualified")
@@ -673,19 +782,57 @@ def _render_concurrency(c):
             line += f"; first token p50 {row['ttft_ms_p50']:,.0f} ms, p95 {row['ttft_ms_p95']:,.0f} ms"
         if row.get("decode_tps_p50"):
             line += f"; decode p50 {row['decode_tps_p50']:,.1f} tok/s per request"
-        if row.get("consistency") is not None:
+        if int(clients) >= 2:
+            line += f", {row['streaming_peak']} of {int(clients)} replies streaming at once"
+        if row["consistency"] is not None:
             line += f"; {_pct(row['consistency'])} of replies equal the serial ones"
             if row["first_differences"]:
                 line += " (first differences at tokens " + ", ".join(map(str, row["first_differences"])) + ")"
         lines.append(line)
-    lines += [f"    {int(clients):>3} clients: skipped ({why})" for clients, why in c.get("skipped", {}).items()]
+    lines += [f"    {int(clients):>3} clients: skipped ({why})" for clients, why in c["skipped"].items()]
+    lines += _render_speedup(c)
     return lines
 
 
+def _render_speedup(c):
+    """The speedup KPI's line (protocol concurrency.speedup; reported, not judged): each level's aggregate over one
+    client's beside the cost model's expectation for the engine's placement and the fraction of it reached, and the
+    hit rate each level's ceiling priced the expert misses at."""
+    parts, rates = [], []
+    for clients, row in sorted(c["levels"].items(), key=lambda item: int(item[0])):
+        if row["hit_rate_source"]:
+            rates.append(f"{int(clients)} clients " + (f"{row['hit_rate']:.0%} ({row['hit_rate_source']})"
+                                                         if row["hit_rate"] is not None else "unmeasured"))
+        if int(clients) < 2 or row["speedup"] is None:
+            continue
+        text = f"{int(clients)} clients {row['speedup']:.2f}x"
+        if row["expected_speedup"]:
+            text += (f" of {row['expected_speedup']:.2f}x expected ({_pct(row['fraction_of_expected'])}"
+                     + (f", {row['bound']} bound" if row["bound"] else "") + ")")
+        parts.append(text)
+    if not parts:
+        return []
+    line = ("    speedup over one client's aggregate (reported, not judged): " + ", ".join(parts)
+            + "; expected: the batched ceiling at N rows over one row's, the cost model of the engine's placement"
+            + (f", at the run's single-stream {c['hit_rate']:.0%} expert cache hit rate ({c['hit_rate_source']})"
+               if c["hit_rate"] is not None else ""))
+    missing = next((row["expected_missing"] for clients, row in c["levels"].items()
+                    if int(clients) >= 2 and row["speedup"] is not None and not row["expected_speedup"]), None)
+    if missing:
+        line += f"; no expectation: {missing}"
+    if rates:
+        line += "; ceilings' expert cache hit rates: " + ", ".join(rates)
+    if any(row["unmeasured"] for row in c["levels"].values()):
+        line += ("; with the expert misses unmeasured the ceilings price only those the device's capacity forces, "
+                 "every other routed expert as read from the device: optimistic")
+    if c["speculative"]:
+        line += "; the ceilings count one token per row per step, which speculation exceeds"
+    return [line]
+
+
 def headline_decode(kpis):
-    """The headline decode KPI of a status: the sampled suite's, else the greedy suite's (results before the KPI
-    names decode_sampled and decode_greedy call it decode)."""
-    return kpis.get("decode_sampled") or kpis.get("decode_greedy") or kpis.get("decode") or {}
+    """The headline decode KPI of a status: the sampled suite's, else the greedy suite's."""
+    return kpis["decode_sampled"] or kpis["decode_greedy"]
 
 
 def _context_kpi(result):
@@ -715,40 +862,24 @@ def _context_kpi(result):
                                                 "ttft_score_ms_at_required")} if lower.get("context") else None}
 
 
-def _rejudged(quality, protocol):
-    """A stored quality result judged again by this protocol's rules (the drift budget the run measured with stays):
-    a set's prompt positions without the perplexity ratio (protocol quality.prompt_perplexity), so a status rendered
-    later from an older result gives the verdict a measurement today would. Sets whose verdict changes say so
-    (rejudged)."""
-    if not quality or quality.get("status") != "scored" or "prompt_perplexity" not in protocol["quality"]:
-        return quality
-    sets = {}
-    for name, s in quality["sets"].items():
-        if name.endswith("/prompt") and "ppl_ratio_max" in (s.get("limits") or {}):
-            limits = {k: v for k, v in s["limits"].items() if k != "ppl_ratio_max"}
-            failures = metrics.judge(s, limits)
-            s = {**s, "limits": limits, "failures": failures, "passed": not failures,
-                 "budget_used": metrics.budget_used(s, limits), "raised": [k for k in s.get("raised", []) if k in limits],
-                 "allowance_raised": [k for k in s.get("allowance_raised", []) if k in limits],
-                 **({"rejudged": protocol["protocol"]} if (not failures) != s["passed"] else {})}
-            for key in ("raised", "allowance_raised"):
-                if not s[key]:
-                    s.pop(key)
-        sets[name] = s
-    honesty = quality.get("honesty") or {}
-    return {**quality, "sets": sets, "passed": all(s["passed"] for s in sets.values()) and honesty.get("passed") is not False}
+def _hit_rate_text(off):
+    """Where a placement-priced pass's expert misses come from (protocol headroom.tiers), as text."""
+    source = off["hit_rate_source"]
+    if source == "unmeasured":
+        return (", the expert cache's misses unmeasured (no expert_reads and expert_hits): only those the device's "
+                "capacity forces are priced, an optimistic floor")
+    named = {"engine": "the engine's own, its requests' expert_reads and expert_hits",
+             "engine telemetry": "the engine's telemetry() counters", "device capacity": "the misses the device's capacity "
+             "forces, above the engine's own", "on device": "every expert on the device"}[source]
+    return f" at a {off['hit_rate']:.0%} expert cache hit rate ({named})"
 
 
 def _above_ceiling(d):
     """Why a decode above its ceiling does not break a bound: the assumptions the ceiling rests on that the engine did
-    not report (its expert cache hits, its drafts), or None when the score is within the ceiling or nothing explains
-    it."""
+    not report (its drafts), or None when the score is within the ceiling or nothing explains it."""
     if not d.get("ceiling") or not d.get("fraction_of_ceiling") or d["fraction_of_ceiling"] <= 1.0:
         return None
     unconfirmed = []
-    if (d.get("host_pass") or {}).get("hit_rate_source") == "even routing":
-        unconfirmed.append(f"it prices the expert cache at even routing's {d['host_pass']['hit_rate']:.0%} hit rate "
-                           "(report expert_reads and expert_hits per request, crit_telemetry on a server)")
     if d.get("ceiling_basis") == "one token per pass":
         unconfirmed.append("it counts one token per model pass, as for an engine that does not speculate (report "
                            "the drafts each round accepts, crit_telemetry accepted on a server)")
@@ -756,17 +887,19 @@ def _above_ceiling(d):
 
 
 def build(result, protocol, baseline=None):
-    result = {**result, "quality": _rejudged(result.get("quality"), protocol)} if result.get("quality") else result
     room = result.get("headroom") or {}
     speed = result.get("speed") or {}
     projection = room.get("projection") or {}
     prefill = room.get("prefill") or {}
     # From crit-eval-v7 decode is the sampled suite's, the decode real requests get; its ceilings, the goals and
-    # stop records follow it. The greedy suite's decode stays beside it as greedy_decode.
+    # stop records follow it. The greedy suite's decode stays beside it as decode_greedy.
     suite, decoded = headroom.decode_suite(result)
     decode = {"score": decoded.get("decode_score"), "suite": suite, "sampling": decoded.get("sampling"),
               # Each case's first request, before its warmups (protocol speed.fresh_decode; reported, not judged).
               "fresh_score": decoded.get("fresh_decode_score"),
+              # The greedy suite runs each prompt first, so its first requests are the engine's first time on them:
+              # first-time and settled decode side by side (protocol speed.fresh_decode).
+              "first_time": _first_time(result),
               "sampling_source": decoded.get("sampling_source") if suite == "sampled" else None,
               "tokens_per_round": decoded.get("tokens_per_round") if suite == "sampled" else None,
               "complete": decoded.get("complete"),
@@ -784,9 +917,7 @@ def build(result, protocol, baseline=None):
               "acceptance_bound": projection.get("acceptance_bound_score"),
               # "one token per pass": an engine that does not speculate, its ceiling every pass at its floor.
               "ceiling_basis": projection.get("basis"),
-              # Results from before the acceptance bound use the drafter's speed of light as the ceiling.
-              "ceiling": projection.get("ceiling_score") or projection.get("speed_of_light_score"),
-              "fraction_of_ceiling": projection.get("fraction_of_ceiling") or projection.get("fraction_of_speed_of_light"),
+              "ceiling": projection.get("ceiling_score"), "fraction_of_ceiling": projection.get("fraction_of_ceiling"),
               "pass_ms": room.get("step_ms"), "pass_floor_ms": room.get("pass_floor_ms"),
               "pass_efficiency": room.get("pass_efficiency"),
               # Decode over one token per pass at the model files' bytes and the probed bandwidth, a denominator the
@@ -796,9 +927,10 @@ def build(result, protocol, baseline=None):
                                                                     or {}).items()},
               "fixed_bytes_per_pass": (room.get("fixed_decode") or {}).get("bytes_per_pass"),
               # The bytes a pass reads from host memory and how they are priced (protocol headroom.tiers).
-              "host_pass": {k: (room.get("host_pass") or {}).get(k) for k in ("link", "cpu", "source", "hit_rate",
-                                                                             "hit_rate_source")}
-              if room.get("host_pass") else None,
+              # A declared host_bytes_per_pass carries no hit rate; the placement's tiers carry theirs.
+              "host_pass": ({k: room["host_pass"].get(k) for k in ("link", "cpu", "source", "hit_rate",
+                                                                   "hit_rate_source", "unmeasured")}
+                            if room.get("host_pass") else None),
               "tiers_scenario": (room.get("tiers") or {}).get("scenario")}
     spreads = room.get("noise") or {}
     prefill_kpi = {"score": prefill.get("score"), "ceiling": prefill.get("ceiling_score"),
@@ -849,7 +981,8 @@ def build(result, protocol, baseline=None):
     greedy_kpi = ({"score": speed.get("decode_score"), "complete": speed.get("complete")}
                   if suite == "sampled" else None)
     # Prefill's and the first tokens' limits are the quality mode's: preserve prices them at 16-bit prompt
-    # activations (or what quality shows passing), as_quantized at the stored format (headroom.mode_limits).
+    # activations (or what quality shows passing), the speed mode at the fastest it admits, the stored format wherever
+    # the device runs that fastest (headroom.mode_limits).
     mode, limits = headroom.quality_mode(result), headroom.mode_limits(result)
     prefill_kpi.update(quality_mode=mode, stored_ceiling=prefill_kpi["ceiling"],
                        ceiling_activations=limits["activations"] if limits else "stored")
@@ -872,6 +1005,19 @@ def build(result, protocol, baseline=None):
         first.update(stored_floor_ms=first.get("floor_ms"), floor_ms=limits["context_ttft"],
                      fraction_of_floor=limits["context_ttft"] / first["score_ms"])
         context_kpi["ttft"] = first
+    if mode == "preserve":
+        # The trade, stated once: the limits the speed mode would price for this result (headroom.mode_limits in
+        # that mode; its stored-format limits where it returns none), when they are above preserve's.
+        speed_limits = headroom.mode_limits({**result, "requirements": {**(result.get("requirements") or {}),
+                                                                          "quality_mode": "speed"}})
+        stored_context = (((context_kpi or {}).get("ttft") or {}).get("stored_floor_ms")
+                          or ((context_kpi or {}).get("ttft") or {}).get("floor_ms"))
+        offered = ({key: speed_limits[key] for key in ("activations", "prefill", "ttft", "context_ttft")}
+                   if speed_limits else
+                   {"activations": "stored", "prefill": prefill_kpi["stored_ceiling"],
+                    "ttft": ttft_kpi["stored_floor_ms"], "context_ttft": stored_context})
+        if offered["prefill"] and prefill_kpi["ceiling"] and offered["prefill"] > prefill_kpi["ceiling"]:
+            prefill_kpi["speed_trade"] = offered
     kpis = {"end_to_end": end_to_end, "decode_sampled": decode if suite == "sampled" else None,
             "decode_greedy": greedy_kpi if suite == "sampled" else decode, "prefill": prefill_kpi, "ttft": ttft_kpi,
             "context": context_kpi, "heldout": heldout_kpi, "followup": followup_kpi,
@@ -880,9 +1026,7 @@ def build(result, protocol, baseline=None):
             "perplexity": perplexity, "kl_divergence": kl_divergence, "stalls": _stalls_kpi(speed),
             "tool_calls": _tool_calls_kpi(speed), "concurrency": _concurrency_kpi(result)}
     missing = list(room.get("missing", []))
-    # Older results call the gaps levers, tag them and add end-to-end gains; none of that is shown.
-    gaps = [{k: v for k, v in gap.items() if k not in ("polished_kpi", "below_noise", "end_to_end_gain")}
-            for gap in room.get("gaps", room.get("levers", []))]
+    gaps = [dict(gap) for gap in room.get("gaps", [])]
     notes = [f"{cid}: the model's end token appears at output token {c['first_stop_index']} (stops are disabled)"
              for cid, c in speed.get("cases", {}).items() if c.get("stop_crossed")]
     exactness_note = _exactness_note(result)
@@ -892,12 +1036,12 @@ def build(result, protocol, baseline=None):
     if drop:
         notes.append(drop)
     if ((result.get("context") or {}).get("points") or {}):
-        ctext = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
+        ctext = result["context"]["decode_text"]
         notes.append(f"long-context points replay {ctext.get('case')}'s pinned continuation {ctext['sha256'][:12]}, after copies "
                      "of its prompt" if ctext["source"] == "pinned" else
                      "long-context points decode each engine's own reply to the retrieval archive's request"
                      + (f" ({ctext['reason']})" if ctext.get("reason") else ""))
-    text = speed.get("decode_text")
+    text = speed["decode_text"] if speed else None
     if text:
         notes.append(f"decode measured on the pinned continuation {text['sha256'][:12]}" if text["source"] == "pinned"
                      else f"decode measured on the engine's own output ({text.get('reason')})")
@@ -929,7 +1073,7 @@ def _limits(result):
     prefill, ttft = room.get("prefill") or {}, room.get("ttft") or {}
     mode = headroom.mode_limits(result) or {}
     rows = [("decode", headroom.decode_suite(result)[1].get("decode_score"),
-             projection.get("ceiling_score") or projection.get("speed_of_light_score")),
+             projection.get("ceiling_score")),
             ("prefill", prefill.get("score"), mode.get("prefill") or prefill.get("ceiling_score")),
             ("ttft", ttft.get("score_ms") or speed.get("ttft_score_ms"), mode.get("ttft") or ttft.get("floor_ms"))]
     if (result.get("context") or {}).get("points"):
@@ -980,8 +1124,9 @@ def stop_record_headroom(result, baseline=None):
 
 
 def changes(result, baseline):
-    """Relative change of each headline KPI from a baseline result of the same prepared data, suite and protocol
-    series (protocol_series)."""
+    """Relative change of each headline KPI from a baseline result of the same prepared data, suite, protocol series
+    (protocol_series) and quality mode: a mode sets the drift budget, the forks, the honesty bound and the prefill
+    limits a result is judged by, so KPIs judged in different modes do not compare."""
     if (baseline.get("model_sha256"), baseline.get("suite_sha256")) != (result.get("model_sha256"),
                                                                         result.get("suite_sha256")):
         return {"comparable": False, "reason": "different prepared data or suite"}
@@ -989,6 +1134,9 @@ def changes(result, baseline):
         return {"comparable": False, "reason": f"measured with {baseline.get('protocol')}"}
     if baseline.get("profile") != result.get("profile"):
         return {"comparable": False, "reason": f"measured under the {baseline.get('profile') or 'full'} profile"}
+    mode, baseline_mode = headroom.quality_mode(result), headroom.quality_mode(baseline)
+    if baseline_mode != mode:
+        return {"comparable": False, "reason": f"judged in quality mode {baseline_mode}, this result in {mode}"}
 
     def ratio(now, before):
         return now / before - 1 if now and before else None
@@ -1056,17 +1204,20 @@ def _major(result):
 
 
 def context_text_identity(result):
-    """The long-context points' pinned continuation sha256, or "generated" (own output; results from before
-    the points replayed one)."""
-    text = (result.get("context") or {}).get("decode_text") or {"source": "generated"}
-    return text.get("sha256") if text.get("source") == "pinned" else "generated"
+    """The long-context points' pinned continuation sha256, "generated" when each engine decoded its own reply,
+    or None when the curve did not run."""
+    text = (result.get("context") or {}).get("decode_text")
+    return None if text is None else text["sha256"] if text["source"] == "pinned" else "generated"
 
 
 def decode_text_identity(result):
-    """The pinned continuation's sha256, or "generated" when each engine decoded its own output (results from
-    before pinned continuations decoded their own output)."""
-    text = (result.get("speed") or {}).get("decode_text") or {"source": "generated"}
-    return text.get("sha256") if text.get("source") == "pinned" else "generated"
+    """The pinned continuation's sha256, "generated" when each engine decoded its own output, or None when the
+    speed part did not run."""
+    speed = result.get("speed")
+    if not speed:
+        return None
+    text = speed["decode_text"]
+    return text["sha256"] if text["source"] == "pinned" else "generated"
 
 
 def _pct(value):
@@ -1133,9 +1284,13 @@ def render(status):
     if off and (off.get("link") or off.get("cpu")):
         where = "over the host link" if off.get("link") else "computed on the CPU"
         decode += (f"; {((off.get('link') or 0) + (off.get('cpu') or 0)) / 1e9:.2f} GB per pass from host memory, {where} ("
-                   + (f"the {d.get('tiers_scenario')} placement's tiers at a {off['hit_rate']:.0%} expert cache hit rate, "
-                      f"{off.get('hit_rate_source')}" if off.get("source") == "placement" else "the engine's host_bytes_per_pass")
+                   + (f"the {d.get('tiers_scenario')} placement's tiers" + _hit_rate_text(off)
+                      if off.get("source") == "placement" else "the engine's host_bytes_per_pass")
                    + ")")
+    elif off and off.get("hit_rate_source") == "unmeasured":
+        decode += (f"; expert misses from host memory unmeasured (the {d.get('tiers_scenario')} placement keeps experts "
+                   "off the device, and the engine reports no expert_reads and expert_hits): the pass floor reads every "
+                   "routed expert from the device, an optimistic floor")
     if d.get("fixed_fraction") is not None:
         decode += (f"; {_pct(d['fixed_fraction'])} of one token per pass at the model files' "
                    f"{d['fixed_bytes_per_pass'] / 1e9:.2f} GB per pass and the probed bandwidth (fixed denominator, "
@@ -1165,12 +1320,11 @@ def render(status):
     if d["complete"] is False:
         decode += "; incomplete (skipped cases)"
     lines.append(decode)
-    if d.get("fresh_score") and d.get("score") and abs(d["fresh_score"] / d["score"] - 1) > 0.1:
-        lines.append(f"  fresh    {d['fresh_score']:.1f} tok/s on each case's first request, before its warmups "
-                     f"({d['fresh_score'] / d['score'] - 1:+.0%}): the engine decodes a repeated prompt "
-                     + ("faster" if d["fresh_score"] < d["score"] else "slower")
-                     + " than a new one (reported, not judged)")
-    greedy = k.get("decode_greedy") if k.get("decode_sampled") else k.get("greedy_decode")
+    first = d.get("first_time")
+    if first:
+        lines.append(f"  repeat   {first['fresh']:.1f} tok/s the first time on each prompt, {first['settled']:.1f} "
+                     f"settled at temperature 0: {first['speedup']:.2f}x on a repeated prompt (reported, not judged)")
+    greedy = k["decode_greedy"] if k["decode_sampled"] else None
     if greedy:
         lines.append(f"  greedy   {_num(greedy['score'], '.1f')} tok/s decode at temperature 0"
                      + ("; incomplete (skipped cases)" if greedy.get("complete") is False else ""))
@@ -1201,7 +1355,7 @@ def render(status):
     elif basis.get("cases") and p.get("score"):
         prefill += "; run-to-run spread unmeasured (a prefill case measured once)"
     lines.append(prefill)
-    lines += _render_mode(p, t, (k.get("context") or {}).get("ttft") or {})
+    lines += _render_mode(p)
     if p.get("activations"):
         lines += _render_activations(p["activations"], p.get("stored_ceiling", p["ceiling"]))
     if p.get("terms"):
@@ -1269,8 +1423,7 @@ def render(status):
             "evidence") == "development" else ""
         lines.append(f"  quality  {'pass' if kld['passed'] else 'FAIL'}{evidence}: {used}worst KLD mean {kld['worst_mean']:.1e} "
                      f"({kld['worst_mean_set']}, limit {kld['limits']['mean']}), p99 {kld['worst_p99']:.1e} "
-                     f"(limit {kld['limits']['p99']}), PPL ×{ppl['worst_ratio']:.4f} (limit {ppl['limit']}), "
-                     f"top-1 {kld['lowest_top1']:.3f}")
+                     f"(limit {kld['limits']['p99']}), {_ppl_text(ppl)}, top-1 {kld['lowest_top1']:.3f}")
         lines += _render_attribution(kld.get("attribution"), kld.get("budget_used_set"))
     else:
         lines.append("  quality  unmeasured")
@@ -1351,22 +1504,16 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
     """The status of the result at `path` under this protocol. A result of another protocol series keeps the status
     stored in it when it was measured. device_path: a `crit eval probe` result whose rates price prefill and time to
     first token instead of the result's own device; data: the data directory the result was measured on, whose model
-    arithmetic prices them for a result that does not record it (results before crit-eval-v0.1.0). Either prices
-    prefill and time to first token again (crit_eval.limits.headroom.price_prompts), with the ceilings by prompt activation
-    format; a result that records its arithmetic but not those ceilings gets them from its own device. kernels_path: a
-    kernel trace (crit eval kernels) of the engine, joined to the prefill floor's terms (headroom.prefill_terms)."""
+    arithmetic prices them instead of the arithmetic the result records. Either prices prefill and time to first
+    token again (crit_eval.limits.headroom.price_prompts), with the ceilings by prompt activation format.
+    kernels_path: a kernel trace (crit eval kernels) of the engine, joined to the prefill floor's terms
+    (headroom.prefill_terms)."""
     result = load_json(path)
     if result.get("aborted"):
         raise SystemExit(f"{path} is an aborted round with no status: {result['aborted']['detail']}")
     if _major(result) != _major(protocol):
         raise SystemExit(f"{path} was measured with {result.get('protocol')}; its status is the one stored in it")
     baseline = load_json(baseline_path) if baseline_path else None
-    # Judged again by today's rules before the prompt activations' evidence is read from them.
-    rejudged = False
-    for value in (result, baseline):
-        if value is not None and value.get("quality"):
-            value["quality"] = _rejudged(value["quality"], protocol)
-            rejudged |= any(s.get("rejudged") for s in value["quality"].get("sets", {}).values())
     if data is not None:
         from ..quality.prepare import PREPARED
         prepared = load_json(Path(data) / PREPARED)
@@ -1375,8 +1522,7 @@ def status_of(path, protocol, baseline_path=None, device_path=None, data=None, k
         result["ceiling"] = prepared.get("ceiling")
     device = load_json(device_path) if device_path else None
     room = result.get("headroom")
-    if room is not None and (device is not None or data is not None or (result.get("ceiling") and "activations" not in room)
-                             or (rejudged and result.get("ceiling"))):
+    if room is not None and (device is not None or data is not None):
         rates, sources = best_rates(device if device is not None else result.get("device"))
         result["headroom"] = headroom.price_prompts(result, rates, sources, protocol["speed"].get("prefill_cases", []),
                                                     [baseline] if baseline else [])
