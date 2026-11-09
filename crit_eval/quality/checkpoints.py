@@ -59,6 +59,26 @@ def _read_spans(reads, threads=None, random=True):
             list(pool.map(read, jobs))
 
 
+def _mapped(tensor, read):
+    """read(bytes [rows, row bytes]) over a mapping of the bytes of `tensor` (a crit_core.model TensorInfo), viewed
+    as its dtype; None when there is no tensor or it is empty or of a dtype torch lacks. The file is mapped per call:
+    the pages read stay in the page cache, not in this process, and no open mapping keeps the file from being moved
+    or deleted (Windows)."""
+    import numpy as np
+    import torch
+    name = next((name for name, short in TORCH_DTYPES.items() if short == getattr(tensor, "dtype", None)), None)
+    if tensor is None or name is None or not tensor.nbytes:
+        return None
+    rows = tensor.shape[0] if tensor.shape else 1
+    mapped = np.memmap(tensor.shard, dtype=np.uint8, mode="r", offset=tensor.data_begin,
+                       shape=(rows, tensor.nbytes // rows))
+    picked = torch.from_numpy(np.array(read(mapped)))
+    del mapped
+    if not picked.numel():   # numpy strides an empty array 0, which no view as a wider dtype takes
+        picked = torch.empty(picked.shape, dtype=torch.uint8)
+    return picked.view(getattr(torch, name))
+
+
 def _view(flat, start, nbytes, dtype, shape):
     """Bytes [start, start + nbytes) of uint8 `flat` as a tensor of `dtype` and `shape`; copied first when they do
     not start at a multiple of the dtype's size, as a view of another dtype requires."""
@@ -164,27 +184,10 @@ class Checkpoint(TensorCheckpoint):
             for tensor in shard.tensors:
                 self.info[tensor.name] = tensor
 
-    def _mapped(self, key, read):
-        """read(bytes [rows, row bytes]) over a mapping of tensor `key`'s bytes, viewed as its dtype; None when the
-        tensor is empty or of a dtype torch lacks. The file is mapped per call: the pages read stay in the page
-        cache, not in this process, and no open mapping keeps the file from being moved or deleted (Windows)."""
-        import numpy as np
-        import torch
-        tensor = self.info.get(key)
-        name = next((name for name, short in TORCH_DTYPES.items() if short == getattr(tensor, "dtype", None)), None)
-        if tensor is None or name is None or not tensor.nbytes:
-            return None
-        rows = tensor.shape[0] if tensor.shape else 1
-        mapped = np.memmap(tensor.shard, dtype=np.uint8, mode="r", offset=tensor.data_begin,
-                           shape=(rows, tensor.nbytes // rows))
-        picked = torch.from_numpy(np.array(read(mapped)))
-        del mapped
-        return picked.view(getattr(torch, name))
-
     def raw(self, key):
         if key in self.placed:
             return self.placed[key]
-        tensor = self._mapped(key, lambda data: data)
+        tensor = _mapped(self.info.get(key), lambda data: data)
         if tensor is None:
             from safetensors import safe_open
             with safe_open(str(self.where[key]), "pt", device="cpu") as handle:
@@ -284,24 +287,39 @@ class Checkpoint(TensorCheckpoint):
 
 
 class StateDictCheckpoint(TensorCheckpoint):
-    """PyTorch state dicts (crit_core.model.TorchCheckpoint), memory-mapped by torch.load once Core has read
-    their pickles without running them; weights_only keeps torch's own loader to tensors as well."""
+    """PyTorch state dicts (crit_core.model.TorchCheckpoint), read from the bytes Core located in torch.save's
+    uncompressed entries when it read their pickles without running them. Each read maps its file for itself (as
+    Checkpoint.raw does), so no mapping outlives it and the files can be moved or deleted (Windows) however long a
+    reference keeps the object; a lookup reads only its rows. A tensor the bytes do not give as a view (empty, or of a
+    dtype outside TORCH_DTYPES) is read by torch.load (weights_only, which keeps torch's own loader to tensors as
+    well), its file mapped for that read alone."""
 
     def __init__(self, weights, quantization=None):
-        import torch
         self.quantization = dict(quantization or {})
         self.where = {}
+        self.info = {}
         for shard in weights.shards:
-            state = torch.load(shard.path, map_location="cpu", weights_only=True, mmap=True)
             for tensor in shard.tensors:
-                self.where[tensor.name] = state[tensor.name]
+                self.where[tensor.name] = shard.path
+                self.info[tensor.name] = tensor
 
     def raw(self, key):
-        return self.where[key]
+        tensor = _mapped(self.info[key], lambda data: data)
+        return self._loaded(key) if tensor is None else tensor.reshape(self.info[key].shape)
+
+    def rows(self, key, index):
+        tensor = self.info[key]
+        picked = _mapped(tensor, lambda data: data[index.numpy()]) if tensor.shape else None
+        return super().rows(key, index) if picked is None else picked.reshape(len(index), *tensor.shape[1:])
+
+    def _loaded(self, key):
+        import torch
+        state = torch.load(self.where[key], map_location="cpu", weights_only=True, mmap=True)
+        return state[key].clone()
 
     def header(self, key):
-        tensor = self.where[key]
-        return SimpleNamespace(dtype=TORCH_DTYPES[str(tensor.dtype).removeprefix("torch.")], shape=tuple(tensor.shape))
+        tensor = self.info[key]   # the entry Core read from the pickle, in safetensors' dtype names
+        return SimpleNamespace(dtype=tensor.dtype, shape=tuple(tensor.shape))
 
 
 class OnnxCheckpoint(TensorCheckpoint):

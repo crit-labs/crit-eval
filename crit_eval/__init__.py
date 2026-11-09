@@ -18,7 +18,7 @@ if _registry is not None:
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.6.0"
+__version__ = "0.6.1"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.
@@ -47,6 +47,10 @@ def protocol_series(identifier):
 # The context a user wants engines built for, unless settings.toml's context_tokens says otherwise; the model's
 # positions and the device's memory may allow less.
 DEFAULT_CONTEXT_TOKENS = 200_000
+# The crit project whose settings.toml holds the machine's settings, when crit names it: crit run and crit eval set it to
+# the project they use (crit run's --project; crit's checkout, or for a crit installed without one the folder it runs
+# in), so an installed crit's Eval reads the same settings as its runs.
+PROJECT_VARIABLE = "CRIT_PROJECT"
 
 
 def checkouts():
@@ -60,10 +64,12 @@ def checkouts():
 
 def machine_settings():
     """Memory thresholds from settings.toml (vram_headroom_gib, ram_headroom_gib, context_reserve_gib), the wanted context
-    (context_tokens) and the reference package source (eval_packages, crit_eval.quality.packages): crit-eval's checkout's,
-    else the crit checkout's (checkouts); without one crit-eval uses the protocol's defaults and
-    DEFAULT_CONTEXT_TOKENS."""
-    path = next((root / "settings.toml" for root in checkouts() if (root / "settings.toml").is_file()), None)
+    (context_tokens) and the reference package source (eval_packages, crit_eval.quality.packages): the crit project's
+    that crit names (PROJECT_VARIABLE), else crit-eval's checkout's, else the crit checkout's (checkouts); without one
+    crit-eval uses the protocol's defaults and DEFAULT_CONTEXT_TOKENS."""
+    named = os.environ.get(PROJECT_VARIABLE)
+    roots = [Path(named)] if named else checkouts()
+    path = next((root / "settings.toml" for root in roots if (root / "settings.toml").is_file()), None)
     if path is None:
         return {}
     import tomllib

@@ -355,5 +355,20 @@ class GgufConformanceTests(unittest.TestCase):
                         self.assertEqual(got, [logprobs[i - 1, ids[i]].item() for i in range(first, len(ids))])
 
 
+@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_GGUF_TOOLS (a converter checkout), torch, transformers, safetensors, "
+                                    "tokenizers and gguf")
+class GgufHeldFileTests(unittest.TestCase):
+    def test_a_dropped_reference_holds_no_file_of_its_gguf(self):
+        from test_eval_formats import assert_holds_no_file, tiny
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "convert.py").write_text(CONVERT)
+            out = root / "gguf" / "tiny-F32.gguf"   # a lone .gguf in a folder of its own
+            out.parent.mkdir()
+            subprocess.run([sys.executable, str(root / "convert.py"), GGUF_TOOLS, str(tiny(root / "hf")), "--outfile",
+                            str(out), "--outtype", "f32"], check=True, capture_output=True)
+            assert_holds_no_file(self, out)
+
+
 if __name__ == "__main__":
     unittest.main()

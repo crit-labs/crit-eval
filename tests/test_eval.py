@@ -4303,8 +4303,8 @@ class ReferenceTests(unittest.TestCase):
         # compressed-tensors' groups by targets (DeepSeek V4 W4A16-FP8): FP8 blocks for attention, listed first, and
         # packed int4 for the experts; an expert decodes with 4 bits as if its group were the only one.
         import torch
-        from crit_eval.quality import checkpoints
         from crit_eval.limits import schemes
+        from test_eval_formats import MemoryCheckpoint
         torch.manual_seed(0)
         fp8 = {"format": "float-quantized", "targets": [r"re:.*attn\.(wq_a|wkv)$"],
                "weights": {"num_bits": 8, "type": "float", "strategy": "block", "block_structure": [128, 128]}}
@@ -4316,11 +4316,9 @@ class ReferenceTests(unittest.TestCase):
                    base + ".weight_shape": torch.tensor([4, 256])}
 
         def decoded(*groups):
-            ckpt = object.__new__(checkpoints.StateDictCheckpoint)
-            ckpt.where = tensors
-            ckpt.quantization = {"quant_method": "compressed-tensors", "format": "mixed-precision",
-                                 "config_groups": {f"group_{i}": g for i, g in enumerate(groups)}}
-            return ckpt.dense(base, "cpu")
+            return MemoryCheckpoint(tensors, {"quant_method": "compressed-tensors", "format": "mixed-precision",
+                                              "config_groups": {f"group_{i}": g for i, g in enumerate(groups)}}
+                                    ).dense(base, "cpu")
         self.assertEqual(schemes._ct_args({"config_groups": {"a": fp8, "b": int4}}, base), int4["weights"])
         self.assertEqual(schemes._ct_args({"config_groups": {"a": fp8, "b": int4}}, "layers.0.attn.wq_a"),
                          fp8["weights"])
@@ -4335,15 +4333,10 @@ class ReferenceTests(unittest.TestCase):
         # compressed-tensors divides the group scales by weight_global_scale; ModelOpt multiplies by weight_scale_2.
         import torch
         from crit_eval.limits import schemes
-        from crit_eval.quality import checkpoints
+        from test_eval_formats import MemoryCheckpoint as checkpoint
         torch.manual_seed(0)
         packed = torch.randint(0, 256, (4, 16), dtype=torch.uint8)
         scale = (torch.rand(4, 2) * 4 + .5).to(torch.float8_e4m3fn)
-
-        def checkpoint(tensors):
-            ckpt = object.__new__(checkpoints.StateDictCheckpoint)
-            ckpt.where, ckpt.quantization = tensors, {}
-            return ckpt
         ct = checkpoint({"w.weight_packed": packed, "w.weight_scale": scale, "w.weight_global_scale": torch.tensor(4.0)})
         mo = checkpoint({"w.weight": packed, "w.weight_scale": scale, "w.weight_scale_2": torch.tensor(0.25)})
         a, b = ct.dense("w", "cpu"), mo.dense("w", "cpu")
@@ -4401,8 +4394,9 @@ class ReferenceTests(unittest.TestCase):
         import torch
         from safetensors.torch import save_file
         from transformers import Qwen4ExpForCausalLM, Qwen4ExpTextConfig
-        from crit_eval.quality import attention, checkpoints, reference
+        from crit_eval.quality import attention, reference
         from crit_eval.limits import schemes
+        from test_eval_formats import MemoryCheckpoint
         torch.manual_seed(0)
         config = Qwen4ExpTextConfig(
             vocab_size=128, hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2,
@@ -4432,9 +4426,7 @@ class ReferenceTests(unittest.TestCase):
                     stored = {base + ".weight": torch.randint(0, 256, (rows, cols // 2), dtype=torch.uint8),
                               base + ".weight_scale": (torch.rand(rows, cols // 16) + .5).to(torch.float8_e4m3fn),
                               base + ".weight_scale_2": torch.tensor(0.01), base + ".input_scale": torch.tensor(1.0)}
-                    view = object.__new__(checkpoints.StateDictCheckpoint)
-                    view.where, view.quantization = stored, {}
-                    decoded[proj] = schemes.dense(view, base, "cpu")
+                    decoded[proj] = schemes.dense(MemoryCheckpoint(stored), base, "cpu")
                     tensors.update(stored)
                 experts.gate_up_proj[e] = torch.cat([decoded["gate_proj"], decoded["up_proj"]])
                 experts.down_proj[e] = decoded["down_proj"]

@@ -14,15 +14,32 @@ from pathlib import Path
 import shutil
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from crit_eval.limits import ceiling  # noqa: E402
+from crit_eval.quality.checkpoints import TORCH_DTYPES, TensorCheckpoint  # noqa: E402
 
 
 def _has(*names):
     return all(importlib.util.find_spec(name) for name in names)
+
+
+class MemoryCheckpoint(TensorCheckpoint):
+    """Tensors held in memory ({key: tensor}) as the stored tensors of a checkpoint, decoded as the reference decodes
+    a model's (crit_eval.limits.schemes)."""
+
+    def __init__(self, tensors, quantization=None):
+        self.where, self.quantization = dict(tensors), dict(quantization or {})
+
+    def raw(self, key):
+        return self.where[key]
+
+    def header(self, key):
+        tensor = self.where[key]
+        return SimpleNamespace(dtype=TORCH_DTYPES[str(tensor.dtype).removeprefix("torch.")], shape=tuple(tensor.shape))
 
 
 HAS_REFERENCE = _has("torch", "transformers", "safetensors", "tokenizers")
@@ -77,6 +94,47 @@ def scored(folder, sequences, top_k=5):
         rows = StreamingReference(folder, device="cpu").score_texts([ids for ids, _ in sequences], top_k, None, scratch,
                                                                     log=lambda *_: None)
     return [tuple(part[first - 1:].tolist() for part in row) for (_, first), row in zip(sequences, rows)]
+
+
+def held_files(folder):
+    """(mapped, open) files under `folder`, from this process's /proc/self/maps and /proc/self/fd (Linux)."""
+    root = os.path.realpath(folder) + os.sep
+    with open("/proc/self/maps") as maps:
+        mapped = {line.split(None, 5)[-1].strip() for line in maps if root in line}
+    opened = set()
+    for fd in os.listdir("/proc/self/fd"):
+        try:
+            target = os.readlink(f"/proc/self/fd/{fd}")
+        except OSError:   # the listing's own descriptor, closed by now
+            continue
+        if target.startswith(root):
+            opened.add(target)
+    return sorted(mapped), sorted(opened)
+
+
+def assert_holds_no_file(test, model):
+    """A reference that scored `model` (a folder, or a lone weight file in a folder of its own) and was dropped with
+    garbage collection off, its objects alive in their reference cycles and its checkpoint still held, keeps none of
+    the model's files mapped or open: /proc says so where there is one, and the folder can be deleted, which Windows
+    refuses while one of its files is mapped or open."""
+    import gc
+    from crit_eval.quality.reference import StreamingReference
+    folder = model if model.is_dir() else model.parent
+    collecting = gc.isenabled()
+    gc.disable()
+    try:
+        with tempfile.TemporaryDirectory() as scratch:
+            reference = StreamingReference(model, device="cpu")
+            reference.score_texts([ids for ids, _ in sequences()], 5, None, scratch, log=lambda *_: None)
+            checkpoint = reference.checkpoint   # alive whether or not the reference is in a cycle
+            del reference
+            if os.path.isdir("/proc/self/fd"):
+                test.assertEqual(held_files(folder), ([], []))
+            shutil.rmtree(folder)
+            del checkpoint
+    finally:
+        if collecting:
+            gc.enable()
 
 
 @unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers, safetensors and tokenizers")
@@ -162,19 +220,28 @@ class FormatTests(unittest.TestCase):
             self.assertEqual(scored(folder, sequences()), expected)
             self.assertEqual(ceiling.model_ceiling(folder), ceiling.model_ceiling(self.small))
 
+    def test_a_dropped_reference_holds_no_file_of_its_model(self):
+        import torch
+        from safetensors.torch import load_file
+        safetensors, state_dict = self.root / "held-safetensors", self.root / "held-torch"
+        shutil.copytree(self.small, safetensors)
+        shutil.copytree(self.small, state_dict, ignore=shutil.ignore_patterns("*.safetensors"))
+        torch.save(load_file(self.small / "model.safetensors"), state_dict / "pytorch_model.bin")
+        for folder in (safetensors, state_dict):
+            with self.subTest(folder.name):
+                assert_holds_no_file(self, folder)
+
     def test_block_fp8_scales_decode_as_transformers_does(self):
         # DeepSeek and Qwen FP8 checkpoints: one weight_scale_inv per 128 x 128 block, FP32 or E8M0.
         import torch
         from transformers.integrations.finegrained_fp8 import Fp8Dequantize
-        from crit_eval.quality.checkpoints import StateDictCheckpoint
         torch.manual_seed(0)
         weight = (torch.randn(256, 384) * 100).to(torch.float8_e4m3fn)
         for scale in (torch.rand(2, 3) * 0.01,
                       torch.pow(2.0, torch.randint(-12, -4, (2, 3)).float()).to(torch.float8_e8m0fnu)):
             with self.subTest(scale.dtype):
-                checkpoint = object.__new__(StateDictCheckpoint)
-                checkpoint.where = {"m.weight": weight, "m.weight_scale_inv": scale}
-                checkpoint.quantization = {"quant_method": "fp8", "weight_block_size": [128, 128]}
+                checkpoint = MemoryCheckpoint({"m.weight": weight, "m.weight_scale_inv": scale},
+                                              {"quant_method": "fp8", "weight_block_size": [128, 128]})
                 expected = Fp8Dequantize(None)._dequantize_one(weight, scale, torch.float32)
                 self.assertTrue(torch.equal(checkpoint.dense("m", "cpu"), expected))
 
@@ -182,14 +249,12 @@ class FormatTests(unittest.TestCase):
         # modelopt MIXED_PRECISION's MXFP8 layers: one E8M0 scale byte per 32 inputs of each row, no block size in
         # the config (its group_size is per layer).
         import torch
-        from crit_eval.quality.checkpoints import StateDictCheckpoint
         torch.manual_seed(0)
         weight = (torch.randn(48, 128) * 100).to(torch.float8_e4m3fn)
         scale = torch.randint(118, 124, (48, 4), dtype=torch.uint8)
-        checkpoint = object.__new__(StateDictCheckpoint)
-        checkpoint.where = {"m.weight": weight, "m.weight_scale": scale}
-        checkpoint.quantization = {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
-                                   "quantized_layers": {"m": {"quant_algo": "MXFP8", "group_size": 32}}}
+        checkpoint = MemoryCheckpoint({"m.weight": weight, "m.weight_scale": scale},
+                                      {"quant_method": "modelopt", "quant_algo": "MIXED_PRECISION",
+                                       "quantized_layers": {"m": {"quant_algo": "MXFP8", "group_size": 32}}})
         expected = weight.float() * torch.pow(2.0, scale.float() - 127).repeat_interleave(32, -1)
         self.assertTrue(torch.equal(checkpoint.dense("m", "cpu"), expected))
 
@@ -197,7 +262,6 @@ class FormatTests(unittest.TestCase):
         # ModelOpt's CSF scale encoding (Qwen3.8-Flash-Next-FP4-Local's experts): per 16-row slab one base byte per
         # row, then 4-bit codes low nibble first; scales outside a row's window are exceptions (24-bit position, byte).
         import torch
-        from crit_eval.quality.checkpoints import StateDictCheckpoint
         torch.manual_seed(0)
         rows, groups = 32, 8
         packed = torch.randint(0, 256, (rows, groups * 8), dtype=torch.uint8)
@@ -215,12 +279,10 @@ class FormatTests(unittest.TestCase):
         exceptions = (where | (scale.reshape(-1)[where].to(torch.int64) << 24)).to(torch.int64)
         exceptions = torch.where(exceptions >= 1 << 31, exceptions - (1 << 32), exceptions).to(torch.int32)
         common = {"m.weight": packed, "m.weight_scale_2": torch.tensor(0.5)}
-        plain, csf = (object.__new__(StateDictCheckpoint) for _ in range(2))
-        plain.where = {**common, "m.weight_scale": scale.view(torch.float8_e4m3fn)}
-        csf.where = {**common, "m.weight_scale.nvfp4_csf_fixed": fixed,
-                     "m.weight_scale.nvfp4_csf_exceptions": exceptions}
-        for checkpoint in (plain, csf):
-            checkpoint.quantization = {"quant_method": "modelopt"}
+        plain = MemoryCheckpoint({**common, "m.weight_scale": scale.view(torch.float8_e4m3fn)},
+                                 {"quant_method": "modelopt"})
+        csf = MemoryCheckpoint({**common, "m.weight_scale.nvfp4_csf_fixed": fixed,
+                                "m.weight_scale.nvfp4_csf_exceptions": exceptions}, {"quant_method": "modelopt"})
         self.assertTrue(torch.equal(csf.dense("m", "cpu"), plain.dense("m", "cpu")))
 
     @unittest.skipUnless(_has("gptqmodel"), "needs gptqmodel")
