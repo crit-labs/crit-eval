@@ -9,6 +9,25 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-11-09
+
+### Changed
+
+- The machine's settings (`settings.toml`: the headroom, `context_reserve_gib`, `context_tokens` and `eval_packages`)
+  come from the crit project crit names in `CRIT_PROJECT` when it names one: crit run's `--project`, and for
+  `crit eval` crit's checkout or, for a crit installed without a checkout, the folder it runs in. A crit run's Eval
+  thereby reads the settings its run reads, also from an installed crit, where crit-eval found no checkout and used
+  the defaults. A named project without `settings.toml` has none; without a named project crit-eval reads its own
+  checkout's, else the crit checkout's, as before. The protocol and suite are unchanged.
+
+### Fixed
+
+- The reference's PyTorch state-dict checkpoint keeps no file mapped. It kept each file's `torch.load(mmap=True)`
+  state dict for as long as the object lived, and a dropped reference waits for garbage collection, so Windows could
+  not delete or move the model's files meanwhile. It reads each tensor from the bytes Core located, mapping the file
+  for that read alone, and a lookup reads only its rows. The GGUF and ONNX checkpoints already kept no file mapped or
+  open between reads.
+
 ## [0.6.0] - 2026-11-08
 
 ### Overview
@@ -792,7 +811,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...HEAD
+[0.6.1]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/crit-labs/crit-eval/compare/v0.5.1...v0.5.2

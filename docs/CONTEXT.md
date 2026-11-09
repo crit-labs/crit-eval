@@ -47,6 +47,10 @@ draft copies and device-resident tables. A run freezes the max context as its `k
 its request names the device ([run records](https://github.com/crit-labs/crit/blob/main/docs/RUN_RECORDS.md#request)); an explicit
 `kv_tokens` overrides it.
 
+`settings.toml` is the crit project's that crit names in `CRIT_PROJECT`: crit run's `--project`, and for `crit eval`
+crit's checkout or, for a crit installed without a checkout, the folder it runs in. Without one, crit-eval reads its
+own checkout's, else the crit checkout's of the crit-core it imports, else none (the defaults).
+
 ## Checks at the required context
 
 `crit eval run --context TOKENS` gives the required context; without it crit-eval computes it from
