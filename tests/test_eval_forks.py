@@ -1,4 +1,4 @@
-"""protocol forks: output differences judged as near-ties in quality mode as_quantized."""
+"""protocol forks: output differences judged as near-ties in quality mode speed."""
 import json
 from pathlib import Path
 import unittest
@@ -45,7 +45,7 @@ class ForkTests(unittest.TestCase):
     def test_judge_forks_fills_speed_history_and_followup(self):
         engine = Scorer([(7, -0.6), (8, -1.1)])
         prepared = {"speed": [{"id": "chat", "prompt_ids": [1, 2]}], "followup": [{"turn": 2, "prompt_ids": [3]}]}
-        r = result("as_quantized",
+        r = result("speed",
                    speed={"cases": {"chat": {"status": "measured", "repeatable": False, "variants": [[7, 1], [8, 1]]}}},
                    history={"cases": {"chat": {"identical": False, "first_difference": 0, "fresh": [7], "after": [8]}}},
                    followup={"again": {"turns": {"2": {"identical": False, "first_difference": 0, "first": [8],
@@ -60,24 +60,26 @@ class ForkTests(unittest.TestCase):
         self.assertEqual(len(engine.calls), 3)  # judged once, also when a resumed round runs it again
         self.assertTrue(all("near-tie" in line for line in logged))
 
-    def test_gates_pass_near_ties_in_as_quantized_only(self):
+    def test_gates_pass_near_ties_in_speed_only(self):
         tie = {"position": 3, "tokens": [7, 8], "gap": 0.5, "near_tie": True}
         decisive = {"position": 3, "tokens": [7, 9], "gap": 2.9, "near_tie": False}
 
         def gates(mode, fork):
-            speed = {"cases": {"chat": {"status": "measured", "repeatable": False, "forks": [fork]}}}
+            speed = {"decode_text": {"source": "generated", "reason": "a fixture"}, "cases": {"chat": {
+                "status": "measured", "repeatable": False, "outputs": 2, "forks": [fork], "stalls": None,
+                "tool_calls": None}}}
             history = {"cases": {"chat": {"identical": False, "first_difference": 3, "fork": fork}}}
             followup = {"status": "measured", "turns": [{"turn": 2, "cached_tokens": 100}],
                         "again": {"turns": {"2": {"identical": False, "first_difference": 3, "fork": fork}}}}
             found = {g["name"]: g for g in status._gates(result(mode, speed, history, followup))}
             return {name: found[name]["state"] for name in ("repeatable", "request_history", "prompt_cache")}, found
 
-        states, found = gates("as_quantized", tie)
+        states, found = gates("speed", tie)
         self.assertEqual(states, {"repeatable": "pass", "request_history": "pass", "prompt_cache": "pass"})
         self.assertIn("near-tie at token 3", found["request_history"]["detail"])
-        self.assertEqual(set(gates("as_quantized", decisive)[0].values()), {"fail"})
+        self.assertEqual(set(gates("speed", decisive)[0].values()), {"fail"})
         self.assertEqual(set(gates("preserve", tie)[0].values()), {"fail"})
-        self.assertEqual(set(gates("as_quantized", None)[0].values()), {"fail"})  # an unjudged difference fails
+        self.assertEqual(set(gates("speed", None)[0].values()), {"fail"})  # an unjudged difference fails
 
 
 if __name__ == "__main__":

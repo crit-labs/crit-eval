@@ -41,7 +41,7 @@ class FollowupTests(unittest.TestCase):
         if first["status"] == "measured":
             first["again"] = history.compare_followup(
                 first, history.run_followup(engine, info, prepared, self.protocol, lambda m: None))
-        gate = next(g for g in status._gates({"requirements": {"exactness": "reported"}, "context": {"tokens": None,
+        gate = next(g for g in status._gates({"requirements": {"exactness": "reported", "quality_mode": "preserve"}, "context": {"tokens": None,
                     "reason": "-", "missing": []}, "followup": first}) if g["name"] == "prompt_cache")
         return first, gate
 

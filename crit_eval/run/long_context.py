@@ -77,7 +77,9 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
                         tokens, sample = timed_generate(engine, prompt, n)
                     else:
                         reply, unmapped = sample.pop("reply", None), sample.pop("reply_unmapped", None)
-                        long_reply = ({"point": point, "prompt_ids": list(prompt), "reply": reply} if reply else
+                        # scored after the prompt the server rendered (ChatEngine.served_ids), not the frame's ids
+                        long_reply = ({"point": point, "prompt_ids": reply.pop("prompt_ids", None) or list(prompt),
+                                       "reply": reply} if reply else
                                       {"point": point, "reason": unmapped or "the engine returned no log-probabilities"})
                 else:
                     tokens, sample = timed_generate(engine, prompt, n)
@@ -161,7 +163,10 @@ def _spread(case, key):
 def compare_lower(at_max, at_lower, lower, settings):
     """Each speed case at a lower context against the same case at the required context. A case is slower
     when its decode falls, or its first token comes later, by more than the tolerance: the protocol's, or the
-    case's own run-to-run spread in either measurement when that is larger."""
+    case's own run-to-run spread in either measurement when that is larger. Where the engine reports its own
+    first-token time at both contexts, the first token is judged on it (`ttft_judged` "engine"): the time outside
+    the engine (HTTP, the server's templating and tokenizer, a reopened host's cold caches) is the same server at
+    both contexts and says nothing about what the lower context did to the engine; `ttft_change` keeps the whole."""
     cases, slower = {}, {}
     for case_id, high in at_max["cases"].items():
         low = at_lower["cases"].get(case_id) or {}
@@ -185,10 +190,15 @@ def compare_lower(at_max, at_lower, lower, settings):
             row.update(engine_ttft_ms=engine, engine_ttft_ms_at_required=engine_at_required,
                        outside_engine_ms=parts["outside_engine_ms"],
                        outside_engine_ms_at_required=parts_at_required["outside_engine_ms"])
+        judged = row["ttft_change"]
+        row["ttft_judged"] = "whole"
+        if row.get("engine_ttft_ms") and row.get("engine_ttft_ms_at_required"):
+            row["engine_ttft_change"] = judged = row["engine_ttft_ms"] / row["engine_ttft_ms_at_required"] - 1
+            row["ttft_judged"] = "engine"
         kinds = []
         if row["decode_change"] is not None and row["decode_change"] < -row["decode_tolerance"]:
             kinds.append("decode")
-        if row["ttft_change"] is not None and row["ttft_change"] > row["ttft_tolerance"]:
+        if judged is not None and judged > row["ttft_tolerance"]:
             kinds.append("ttft")
         if kinds:
             slower[case_id] = kinds

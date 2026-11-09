@@ -2,7 +2,7 @@
 layout (crit_eval.architectures.gguf_qwen4exp), with the n-gram table read by rows (GgufCheckpoint.row_source).
 
 The conformance test converts a tiny transformers Qwen4Exp with GGUF's reference converter and needs a checkout of it
-whose converter and gguf-py know qwen4exp (CRIT_LLAMA_CPP=/path/to/the/checkout) plus torch, transformers with
+whose converter and gguf-py know qwen4exp (CRIT_GGUF_TOOLS=/path/to/the/checkout) plus torch, transformers with
 qwen4_exp, safetensors, tokenizers and a gguf package that knows qwen4exp (the checkout's gguf-py on PYTHONPATH will
 do); without them it is skipped."""
 from dataclasses import replace
@@ -48,10 +48,10 @@ def _checkout_knows_qwen4exp(checkout):
     return converter.is_file() and constants.is_file() and '"qwen4exp"' in constants.read_text(encoding="utf-8")
 
 
-LLAMA_CPP = os.environ.get("CRIT_LLAMA_CPP")
+GGUF_TOOLS = os.environ.get("CRIT_GGUF_TOOLS")
 HAS_QWEN4EXP = _transformers_has_qwen4exp()
 HAS_CONVERTER = (base.HAS_CONVERTER and HAS_QWEN4EXP and _gguf_knows_qwen4exp()
-                 and _checkout_knows_qwen4exp(LLAMA_CPP))
+                 and _checkout_knows_qwen4exp(GGUF_TOOLS))
 
 # The PLE constants of the release (unsloth's Qwen3.8-Flash-Next GGUFs): seed 1234, ngram_vocab_size_base 20,000,000.
 SIZES = [20000003, 20000023, 20000033, 20000047, 20000059, 20000063, 20000069, 20000077, 20000081, 20000093,
@@ -183,10 +183,10 @@ TINY = dict(hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_
 # The converter reads config.json through transformers when it can, whose qwen4_exp renames the released
 # "full_attention" layer types to "indexed_attention", and then writes no compress ratio for them (refused above);
 # read as written, as a converter without transformers' qwen4_exp does. "split" converts as converters before the
-# shared-input merges (llama.cpp #31028) did, which wrote the published GGUFs: each half its own tensor.
+# shared-input merges (the converter's #31028) did, which wrote the published GGUFs: each half its own tensor.
 CONVERT = """import json, runpy, sys
-llama, form = sys.argv[1], sys.argv[2]
-sys.path[:0] = [llama, llama + "/gguf-py"]
+checkout, form = sys.argv[1], sys.argv[2]
+sys.path[:0] = [checkout, checkout + "/gguf-py"]
 import conversion.base as base
 base.TextModel.get_vocab_base_pre = lambda self, tokenizer: "qwen2"   # tiny test vocabularies have no known hash
 base.ModelBase.load_hparams = staticmethod(lambda folder, *args, **kwargs:
@@ -195,14 +195,14 @@ if form == "split":
     import conversion.qwen4exp
     conversion.qwen4exp.Qwen4ExpTextModel._SHARED_INPUT_MERGES = ()
 sys.argv = ["convert_hf_to_gguf.py"] + sys.argv[3:]
-runpy.run_path(llama + "/convert_hf_to_gguf.py", run_name="__main__")
+runpy.run_path(checkout + "/convert_hf_to_gguf.py", run_name="__main__")
 """
 MERGED = ("hc_attn_down_inject", "hc_ffn_down_inject", "attn_qkv_gate", "ssm_beta_alpha")
 # The converter's elementwise transforms round once each way: norms 1 + w (PLE's too), A_log -exp(A_log).
 ROUNDED = base.ROUNDED + ("norm_key.weight", "norm_query.weight", "norm_conv.weight")
 
 
-@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_LLAMA_CPP (a converter checkout whose converter and gguf-py know "
+@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_GGUF_TOOLS (a converter checkout whose converter and gguf-py know "
                                     "qwen4exp), torch, transformers with qwen4_exp, safetensors, tokenizers and a gguf "
                                     "package that knows qwen4exp")
 class Qwen4ExpConformanceTests(base.GgufConformanceTests):
@@ -240,7 +240,7 @@ class Qwen4ExpConformanceTests(base.GgufConformanceTests):
         folder = self.root / f"gguf-qwen4exp-{form}"
         folder.mkdir()
         out = folder / f"qwen4exp-{form}-F32.gguf"
-        subprocess.run([sys.executable, str(self.root / "convert-qwen4exp.py"), LLAMA_CPP, form, str(hf), "--outfile",
+        subprocess.run([sys.executable, str(self.root / "convert-qwen4exp.py"), GGUF_TOOLS, form, str(hf), "--outfile",
                         str(out), "--outtype", "f32"], check=True, capture_output=True)
         return out
 

@@ -30,7 +30,7 @@ def reference_origin(data, store=fixed.STORE):
 QUALITY_KEYS = ("ppl_ratio_max", "kld_mean_max", "kld_p99_max")
 
 
-def quality_thresholds(protocol, budget=None, mode="preserve"):
+def quality_thresholds(protocol, budget=None, *, mode):
     """The protocol's drift budget for quality mode `mode` (quality.mode_thresholds, else quality.thresholds), with a
     run's own limits (partial is fine) laid over it."""
     budget = budget or {}
@@ -93,7 +93,7 @@ def set_limits(thresholds, spread, factor):
     return limits, raised
 
 
-def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, mode="preserve"):
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.run.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.quality.fixed.load, None when the data has none). Each set is judged on
@@ -180,7 +180,10 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
             buckets[name] = {label: {key: value[key] for key in ("targets", "ppl_ratio", "kld_mean", "kld_p99",
                                                                   "top1_agreement")}
                              for label, value in metrics.bucketed(reference_rows, found, labels[name]).items()}
-            log(f"quality {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, PPL x{row['ppl_ratio']:.4f}, "
+            # A ratio no limit bounds says so: on the prompt positions it is reported, never a pass or a failure.
+            ppl = f"PPL x{row['ppl_ratio']:.4f}" + ("" if "ppl_ratio_max" in limits else
+                                                     " (reported, not judged: protocol quality.prompt_perplexity)")
+            log(f"quality {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, {ppl}, "
                 f"top-1 {row['top1_agreement']:.3f} over {row['targets']:,} positions"
                 + ("" if not failures else " - " + "; ".join(failures)))
         judged += time.perf_counter() - judging
@@ -202,12 +205,12 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
 
 
 def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
-                    context_tokens=None):
+                    context_tokens=None, *, mode):
     """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
     exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
     {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
     uses and the share of the full engine's that the variant's exactness takes away. Shares need not add up: the
-    terms interact."""
+    terms interact. mode: the run's quality mode, judged as the run judges it (run_quality)."""
     rule = protocol["quality"].get("attribution") or {}
     if quality.get("status") != "scored":
         return {"status": "unmeasured", "reason": "quality was not scored"}
@@ -222,7 +225,7 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
         engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
         try:
             scored = run_quality(engine, info, prepared, protocol, lambda line: log(f"attribution {name}: {line}"),
-                                 reference, thresholds, spread)
+                                 reference, thresholds, spread, mode=mode)
         finally:
             engine.close()
         sets = {set_name: s["budget_used"] for set_name, s in (scored.get("sets") or {}).items()}
@@ -254,11 +257,11 @@ def clearly_failed(set_name, sets, thresholds, rule):
     return None
 
 
-def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=True, mode="preserve"):
+def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=True, *, mode):
     """protocol quality.honesty: the engine's greedy reply over the chat API to every text of the honesty sets (an
     engine's reply(prompt, max_new_tokens, top_k)), then the same reply tokens scored as the continuation: the served
     and the scored log-probabilities must agree within tolerance, top-k alternatives included, and the top-k lists
-    hold the same tokens but those within tolerance of the k-th. In a quality mode honesty.modes names (as_quantized)
+    hold the same tokens but those within tolerance of the k-th. In a quality mode honesty.modes names (speed)
     the two paths may round apart: its tolerance bounds each position and its mean_tolerance each reply's mean
     difference of the reply tokens' log-probabilities. extra: (id, prompt ids, served reply) of replies already served
     with their log-probabilities (the long-context curve's first point), judged the same way, their tokens scored once;

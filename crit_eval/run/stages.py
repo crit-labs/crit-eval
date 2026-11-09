@@ -80,14 +80,14 @@ def staged_settings(settings, rule, certify):
             "requirement": bool(certify)}
 
 
-def stage_requests(prepared, protocol, required, info, settings, sampled=True, exactness=True, heldout=False,
+def stage_requests(prepared, protocol, required, info, settings, sampled=True, exactness=True, heldout=True,
                    lower=True, certify=False):
     """{stage: {timing part: [(prompt tokens, output tokens, scored rows, one token per pass)]}}: the requests each
     stage adds over the one before it, and under "certify" the request at the requirement. settings: the staged
-    context settings (staged_settings). sampled, exactness, heldout and lower: whether those parts can run on this
-    engine (an engine without sampling has no sampled suite, a served one no lower context, a run without a
-    baseline no held-out prompts). The lower context's requests are a certified run's (under "certify"), after
-    stage 3."""
+    context settings (staged_settings). sampled, exactness, heldout and lower: whether those parts run on this engine
+    (an engine without sampling has no sampled suite, a served one no lower context, a run leaving out the heldout
+    part no held-out prompts). The held-out prompts are stage 1's, so every candidate's first Eval measures them; the
+    lower context's requests are a certified run's (under "certify"), after stage 3."""
     rule = protocol["stages"]
     held = held_cases(prepared, info)
     each = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in held]
@@ -100,6 +100,12 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
     history = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in shortest_case(prepared, info)]
     out[1] = {"speed": each, "quality": quality(quality_sets(prepared, short)), "history": history,
               "history_again": history}
+    if heldout:
+        # Each held-out prompt at its nominal length: the run draws 80-100% of it (protocol jitter), so this prices
+        # the longest it can be.
+        out[1]["heldout"] = [(len(p["prompt_ids"]), p["output_tokens"], 0, False) for p in prepared.get("heldout") or []
+                             if len(p["prompt_ids"]) + p["output_tokens"] <= info["max_context"]
+                             for _ in range(int(protocol["heldout"]["repetitions"]))]
     repeated = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in short_cases(prepared, info, rule)]
     out[2]["speed"] = repeated * int(rule["repetitions"])
     turns, n = prepared.get("followup") or [], int(protocol["followup"]["output_tokens"])
@@ -125,10 +131,6 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
     if exactness and info.get("speculative"):
         out[3]["exactness"] = [(len(c["prompt_ids"]), c["output_tokens"], 0, True)
                                for c in exactness_cases(prepared, info, rule)]
-    if heldout:
-        out[3]["heldout"] = [(len(p["prompt_ids"]), p["output_tokens"], 0, False) for p in prepared.get("heldout") or []
-                             if len(p["prompt_ids"]) + p["output_tokens"] <= info["max_context"]
-                             for _ in range(int(protocol["heldout"]["repetitions"]))]
     if lower and certify:
         out["certify"]["lower_context"] = list(each)
     return {stage: {part: rows for part, rows in parts.items() if rows} for stage, parts in out.items()}
@@ -200,14 +202,20 @@ def creep(result, required):
             "extrapolated": required > longest}
 
 
-def memory_fit(after_load, info, ceiling, required):
+# Why context.fit leaves the KV cache at the requirement unmeasured: the model's geometry gives its heads and layers,
+# not the precision the engine stores them at, nor the other caches (a draft layer's) it keeps per token.
+KV_UNMEASURED = "the engine reports no kv_bytes_per_token (the KV bytes one more token of context takes in its caches)"
+
+
+def memory_fit(after_load, info, required):
     """protocol stages 1 context.fit: the device memory free after the engine opened at the requirement against the
-    KV cache the requirement needs. An engine that allocates its cache when it opens already holds it; one that
-    allocates as the context fills needs it free. Reported, not judged: certification serves the requirement."""
+    KV cache the requirement needs at the KV bytes per token the engine reports (info kv_bytes_per_token, in a crit
+    engine its KV plugin's count of its own pools); without it that cache is unmeasured (KV_UNMEASURED). An engine that
+    allocates its cache when it opens already holds it; one that allocates as the context fills needs it free.
+    Reported, not judged: certification serves the requirement."""
     free = (after_load or {}).get("free_bytes")
-    per_token = info.get("kv_bytes_per_token") or (ceiling or {}).get("kv_bytes_per_token")
-    source = "engine" if info.get("kv_bytes_per_token") else "model" if per_token else None
+    per_token = info.get("kv_bytes_per_token") or None
     need = per_token * required if per_token and required else None
-    return {"free_after_load_bytes": free, "kv_bytes_per_token": per_token, "kv_bytes_per_token_source": source,
-            "kv_bytes_at_requirement": need,
-            "fits_if_allocated_late": None if free is None or need is None else free >= need}
+    return {"free_after_load_bytes": free, "kv_bytes_per_token": per_token, "kv_bytes_at_requirement": need,
+            "fits_if_allocated_late": None if free is None or need is None else free >= need,
+            "unmeasured": None if per_token else KV_UNMEASURED}

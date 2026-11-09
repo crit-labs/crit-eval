@@ -9,6 +9,194 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-11-08
+
+### Overview
+
+crit-eval 0.6.0 starts protocol series crit-eval-v0.6, with protocol crit-eval-v0.6.0. The protocol changes since
+0.5.3: the quality modes are `preserve` and `speed`, the default (`as_quantized` is gone), and the speed mode's prefill
+and first-token limits are the fastest prompt arithmetic it admits; the concurrency part becomes a gate (batched
+replies equal serial ones, and requests run together); a staged run measures the held-out prompts in stage 1; and no
+limit rests on an assumed expert cache hit rate or on KV bytes per token the engine did not report. A crit engine
+package is measured through Core's eval-v1 adapter (`--package`), and `crit eval precheck` checks in minutes the gates
+whole rounds most often fail on. Results do not compare with 0.5.x ones, and data prepared under 0.5.x is prepared
+again; the reference scores carry over.
+
+### Added
+
+- `--package DIR` on `run`, `precheck`, `pin`, `kernels` and `ab` (`--package-b`): a crit engine package (its
+  plugins and the configuration that selects them) is measured through Core's eval-v1 adapter
+  (`crit_core/eval_adapter.py`), which opens it through Core's loader, with `--config` over the package's
+  configuration.json. A crit package carries no adapter of its own.
+- `--adapter` (and `ab`'s `--adapter-b`) refuses a file inside a crit run folder: a crit engine is its plugins,
+  measured with `--package DIR` through Core's loader as crit serve runs it; an engine outside crit keeps
+  `--adapter`.
+- The concurrency gate (protocol `concurrency.gate`): the concurrency part, reported until now, fails an engine whose
+  batched replies differ from its serial ones (in quality mode `speed` at a fork that is not a near-tie, judged on
+  the engine as protocol `forks` judges one), a level that did not qualify (a failed, missing or duplicated request,
+  fewer requests in flight at once than clients), or a level of 2 or more clients whose requests did not run
+  together: one reply streaming at a time (`streaming_peak`, `ran_together`; clients see every request they sent in
+  flight whether the server queues it or not, so only overlapping replies show the server ran them together). A level
+  whose replies each came in one chunk shows no overlap either way, and leaves the gate unmeasured. How much more a
+  level serves is a KPI, not the gate: each level's `speedup` (its aggregate over the 1-client level's) beside
+  `expected_speedup`, the cost model's for the engine's placement (the batched ceiling at N rows over the ceiling at
+  one row, both at the run's single-stream expert cache hit rate), and `fraction_of_expected`; `status` prints them on
+  a line of their own and `compare` beside each level's aggregate. An engine whose expert misses come from host memory
+  brings them anew with every row, so it serves little more at N rows than at one, and the expectation says so.
+  Without the ceilings, or for an engine whose experts the device cannot all hold with no hit rate (measured or
+  declared by `host_bytes_per_pass`), the expectation is unmeasured with the reason (`expected_missing`). Results
+  measured before this change are no longer read: re-measure them.
+- First-time and settled decode side by side (protocol `speed.fresh_decode`, reported, not judged): `status` shows
+  the greedy suite's decode on each prompt's first request beside its settled decode and the repeat speedup, every
+  run, not only past a 10% difference, and each suite records `repeat_speedup`. With a pinned continuation a case's
+  first request is its first free generation, which runs before the replays; before, the first replay after two
+  generations stood in for it.
+- `crit eval probe` measures the CPU expert lane (`host_expert_gbs`): integer block rows at 1, 3 and 8 tokens an
+  expert on one thread per core, and at 3 tokens beside expert-sized link copies. The placement prices misses
+  computed on the CPU at the lane's rate, and a CPU/link split at the two rates measured together, instead of the
+  host memory read rate, which FP32 rows never reach. A probe from before reads as outdated.
+- `crit eval precheck`: in minutes, the gates a candidate most often fails a whole round on, each once: honesty of the
+  short texts and of one long reply at the curve's first point, the request history around them (forks judged in
+  `speed`), the device memory after the load and, with an adapter, the speed cases at the lower context
+  (`crit_eval.run.precheck`). One engine spent most of its candidates on rounds that failed one of these at the end.
+
+### Changed
+
+- crit-eval needs crit-core 0.17.0 (`crit-core>=0.17.0`, still no upper bound): `--package` measures a crit engine
+  package through Core's eval-v1 adapter (`crit_core/eval_adapter.py`), which crit-core 0.17.0 ships.
+- Protocol crit-eval-v0.6.0: its content changed after the 0.5.x releases, which all ran crit-eval-v0.5.0. Both are
+  pinned beside the other released protocols, so a change under a released id fails the tests.
+- Quality modes `preserve` and `speed`; `speed` is the default of `crit eval run`, `crit eval precheck`, `runner.run`
+  and `precheck.run_precheck`. Protocol keys `quality.mode_thresholds.speed`, `quality.honesty.modes.speed`,
+  `forks.modes: ["speed"]`. Every result states its mode: `fixed.mode_of` refuses one that states none or another
+  (`as_quantized` included), and `metrics.mode_thresholds` a mode the protocol has no budget for.
+- protocol `quality.modes` and docs/MEASUREMENTS.md define a mode as the drift from the selected checkpoint traded for
+  speed; the speed budget is the same for every checkpoint however stored.
+- In `speed`, the prefill and first-token limits are the fastest prompt arithmetic the mode admits on the quantized
+  matrices (the stored format's own, FP8 or 16-bit, `headroom.MODE_ACTIVATIONS`) or a faster one quality shows passing,
+  so never below preserve's. Unchanged where the stored format is the fastest the device prices. On a device without
+  4-bit tensor cores the probe widens NVFP4 to the BF16 rate (`ceiling.best_rates`), so before this change the mode for
+  speed was priced there at W4A16, below preserve's FP16 accumulation; it is now priced at FP8 prompt activations.
+- A preserve result's status names what `speed` would price for it (`kpis.prefill.speed_trade`, from that mode's own
+  limits, shown when above preserve's) instead of the stored format's ceiling.
+- The closed track takes either quality mode judged by that mode's protocol budget unchanged; a `--quality-budget`
+  other than it, looser or tighter, fails `track.closed.quality_mode`. Results compare within one mode: `crit eval
+  compare` warns on results of different modes, and prompt-activation quality evidence counts only from results judged
+  in the same mode.
+- The reference's allowance pass is `StreamingReference(declared_activations=True)` (its identity
+  `"allowance": "declared_activations"`, `"activations": "declared"`), not a quality mode.
+- `quality_checks.quality_thresholds`, `run_quality`, `run_attribution` and `run_honesty` take the quality mode as a
+  required keyword (`mode=`), and `metrics.mode_thresholds` as a required argument: nothing assumes preserve.
+- A prompt set's perplexity ratio is reported, not judged, on every line that shows it: protocol
+  `quality.prompt_perplexity` (since crit-eval-v0.2.1) judges `SET/prompt` by KLD alone in either quality mode, and
+  the run's log, `crit eval compare`'s set rows and the status's quality line now say so, the status naming the served
+  set its worst judged ratio is over. README's perplexity KPI is the worst served set's, as status computes it.
+- The device memory a run records (protocol `context.device_memory`) takes the smaller of nvidia-smi's free memory
+  and the served engine process's own (crit serve's `/health` `device_free_bytes`, cudaMemGetInfo in that process),
+  keeping both: under the Windows display driver nvidia-smi counts only resident memory, and read a candidate with
+  0.29 GiB left to allocate as 0.97 GiB free.
+- The lower-context gate of a certified run gives each speed case one warm-up on the reopened engine, as the
+  engine at the requirement had been warmed by the parts before it, and judges the first token on the engine's
+  own first-token time where the engine reports it at both contexts (`ttft_judged` "engine", `engine_ttft_change`):
+  a candidate whose engine was as fast at both contexts failed on 2.5-4 ms of server time on 31 ms first tokens.
+- The batched ceiling prices a model whose weights the device cannot all hold: the resident weights off the device
+  (at most those a step reads) and the touched experts the device cannot hold (the capacity bound) come from host
+  memory every step, and so do those the engine's expert cache misses at its hit rate: a level's own where its
+  requests report `expert_reads`/`expert_hits` (`level requests`: a served cohort's `crit_telemetry`, Core's
+  in-process cohort rows; this prices the level's ceiling and `fraction_of_ceiling`), else the run's single-stream
+  rate (the decode suite's requests, else the engine's `telemetry()` counters, else the rate its
+  `host_bytes_per_pass` implies; this prices every level's expectation). The host bytes take the faster of the host
+  link (bytes over the probed link rate) and the CPU (the longer of bytes over host memory's read rate and the rows'
+  arithmetic on their share of them over the probed CPU rate), recorded as `host_path`, `host_ms` and
+  `host_paths_ms`; the step's `bound` may be `link` or `cpu`.
+- No limit rests on an assumed expert cache hit rate. The "even routing" fallback (the device's share of the experts)
+  is gone: a decode pass's, a prompt's and a long-context point's expert misses are priced at the engine's measured
+  hit rate, and at least at the device capacity bound (the touched experts the device cannot hold: every off-device
+  expert for a prompt long enough to touch them all). Without a measured rate the misses beyond the bound are
+  unmeasured: the floor holds the bound alone, every other routed expert read from the device, an optimistic floor
+  and ceiling that `status` names as such; `headroom.missing` names what would price them. `headroom.tiers` records
+  `engine_hit_rate_source` and `device_expert_share` (in place of `even_hit_rate`); `headroom.host_pass` and the
+  prompt floors' `host` their `hit_rate_source` (`engine`, `engine telemetry`, `device capacity`, `on device`,
+  `unmeasured`).
+- crit-eval reads an engine's own counters, `telemetry()` (an adapter's, Core's engine; crit serve's `/health`
+  `engine_telemetry` at its root), before and after each speed suite: `result.telemetry` holds each suite's expert
+  cache reads, hits and hit rate, which price the expert misses where the requests report none. A window covers every
+  request of its suite (warmups and prefills included, and on a server whatever else it served meanwhile; a served
+  engine's counters are those of its last status report, which may lag the last request) and is recorded only when
+  its suite completes. The round's journal records the calls.
+- A staged run measures the held-out prompts in stage 1 (and so in every later stage), right after the speed cases,
+  so a candidate's first staged Eval measures them and the first certified Eval's generality gate has a baseline that
+  did. Stage 3 no longer runs them (through 0.5.3 it ran them only against a baseline that measured them). Stage 1's
+  budget check for its later speed cases reserves their time.
+- The repeatable gate compares only cases decoded more than once (`speed.cases.*.outputs`): a case decoded once (a
+  staged run's stage 1, a long case in stage 2) is not compared, and with none compared the gate is unmeasured instead
+  of passing; a run that compares some cases names those decoded once.
+- `status` and `compare` read only the current result format: results measured before this change (and fields of
+  earlier crit-eval versions: `levers`, the KPI name `decode`, `greedy_decode`, a decode ceiling from
+  `speed_of_light_score` alone, speed cases without `stalls`, `tool_calls`, `outputs` or `repeatable`) fail with the
+  normal error. `status` no longer judges a stored quality result again by the prompt_perplexity rule (results from
+  before crit-eval-v0.2.1; the quality gate's "judged again by" note is gone) and no longer prices prefill again for a
+  result that records its arithmetic but not the ceilings by prompt activation: it prices again only with `--device`
+  or `--data`. Re-measure such results.
+- The GGUF conformance tests (tests/test_eval_gguf*.py) read the GGUF converter's checkout from `CRIT_GGUF_TOOLS`. The
+  variable named after the project that hosts the converter is not read any more: a test environment that sets only
+  that one skips them.
+- The MLX format test (tests/test_eval_formats.py) runs MLX's converter from the Python module `CRIT_MLX_CONVERTER`
+  names (`python -m MODULE convert`), and without it is skipped; before, it ran whenever the converter was
+  installed.
+
+### Removed
+
+- The quality mode name `as_quantized`, everywhere: a result, a requirement or a `--quality-mode` that names it, or
+  states no mode, is refused (no alias, no reading as preserve).
+- `crit eval reference --quality-mode` (accepted and ignored) and `score_data(quality_mode=...)`.
+- The reader that derived the allowance from a pre-v0.3.0 second reference store, and fetch's removal of that store.
+- `context.fit`'s `kv_bytes_per_token_source`: the count is always the engine's.
+
+### Fixed
+
+- The reference's safetensors checkpoint keeps no file mapped. It kept a `safe_open` handle per shard for as long as
+  the object lived, and a dropped reference waits for garbage collection, so Windows could not delete or move the
+  model's files meanwhile. It reads each shard's keys once and opens a shard only for a read that needs the handle.
+
+- `context.fit` (stage 1: the memory the required context needs against what the load left free, reported in the
+  capacity gate's detail) took the model's 16-bit K and V as the KV bytes per token when the engine reported none, so
+  an engine storing FP8 pages read as needing twice its cache. It takes the engine's `kv_bytes_per_token` only; without
+  it the KV cache at the requirement is unmeasured (`fit.unmeasured` says why), and the detail says which.
+- The decode, long-context and first-token floors (headroom) took the same 16-bit count when the engine reported none:
+  for the KV the cases read, and for the KV a prompt writes. They leave the KV term out then, which is still a floor,
+  and `missing` asks for `kv_bytes_per_token`.
+- `--attribute-drift` judges each variant in the run's quality mode.
+- A baseline judged in another quality mode is not comparable (`status.changes`: "judged in quality mode X, this
+  result in Y"), so it gives no KPI deltas, no generality gate and no stop record headroom.
+- `crit eval reference` no longer says a checkpoint without declared activations makes the speed mode judge as
+  preserve; the allowance's errors are named the allowance's.
+- The concurrency gate no longer passes on no reply compared. `crit eval run --only concurrency` had no speed part's
+  serial replies, compared 0 batched replies with them and passed; the part now runs each speed case of its pool once
+  alone first (a one-client cohort, `concurrency.serial_source`), and a gate with no reply compared is unmeasured.
+- `crit eval run --only context` measures the long-context curve and retrieval. A staged run budgets its later stages
+  by the rates its speed part measures, and without one it stopped after stage 1, where neither part is: a run that
+  leaves out the speed part now runs the parts it asked for.
+- The memory tiers' resident weights off the device (protocol `headroom.tiers`) come from the engine's measured
+  footprint where it opened at the requirement (free device memory before its load less after it, beside its KV
+  cache at its own bytes per token), not from the planning margins: a dense engine holding every weight and an
+  86,016-token KV cache with 1.7 GB free had 0.70 GB a pass priced as host reads computed on the CPU, and decode
+  above 100% of a ceiling it never had.
+- The honesty check's long reply is scored after the prompt the server rendered. A long-context prompt reaches a server
+  as text decoded from the frame's ids, and its chat template can tokenize that text to other ids (one engine's
+  32,768-token curve prompt rendered 2 tokens shorter); the reply was then scored at shifted positions and failed
+  honesty at a near-tie it never served. crit-eval now renders the sent messages with the model's chat template and
+  scores after those ids when the server's usage counts them (`ChatEngine.served_ids`).
+- `crit eval reference` on CPU tensors with fla installed: transformers sends a modeling module's torch functions to
+  an installed package's device kernels whatever the tensors' device (its hub_kernels integration), so a CPU layer
+  failed inside Triton ("Pointer argument cannot be accessed from Triton (cpu tensor?)"). The reference now keeps CPU
+  layers on the modeling code's torch functions (`crit_eval.quality.reference.torch_paths_on_cpu`, by the first tensor
+  argument's device); device runs are unchanged.
+- The quality gate's detail said "honesty not checked" after a honesty check that passed (or failed on its top-k
+  lists); it says so only when the check judged nothing.
+- The prompt-cache gate of a staged run that stopped before stage 3 says the follow-up turns' repeat is a stage 3 part.
+- A staged run times its fork judging as the `forks` part, as a full run does.
+
 ## [0.5.3] - 2026-11-02
 
 ### Fixed
@@ -51,7 +239,7 @@ with 0.4.x ones, and data prepared under 0.4.x is prepared again; the reference 
 
 ### Added
 
-- Forks in quality mode `as_quantized` (protocol `forks`, [measurements](docs/MEASUREMENTS.md#forks-in-quality-mode-as_quantized)):
+- Forks in quality mode `as_quantized` (protocol `forks`, [measurements](docs/MEASUREMENTS.md#forks-in-quality-mode-speed)):
   an output difference the `repeatable`, `request_history` or `prompt_cache` gate records passes when the two
   replies part at a near-tie. crit-eval scores the shared prefix once through the engine's scoring path, and the other
   reply's token must be among the top 16 within 2 nats of the first. An engine whose arithmetic depends on what it
@@ -604,7 +792,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...v0.5.3
 [0.5.2]: https://github.com/crit-labs/crit-eval/compare/v0.5.1...v0.5.2
 [0.5.1]: https://github.com/crit-labs/crit-eval/compare/v0.5.0...v0.5.1

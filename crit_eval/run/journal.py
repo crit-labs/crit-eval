@@ -29,7 +29,8 @@ JOURNAL = "crit-eval-journal-v1"
 SUFFIX = ".journal.jsonl"
 # Request methods of an engine (docs/ADAPTER.md) the journal records; every other attribute is the engine's own. A
 # served engine's capacity and cohort (the concurrency part, crit_eval.run.concurrency) are each one line.
-METHODS = ("generate", "generate_plain", "generate_sampled", "replay", "score", "reply", "capacity", "cohort", "loads")
+METHODS = ("generate", "generate_plain", "generate_sampled", "replay", "score", "reply", "capacity", "cohort", "loads",
+           "device_free_bytes", "telemetry")
 # Info keys an engine opened for its live requests must answer as the journaled one did.
 SAME_INFO = ("name", "max_context", "speculative", "served")   # a served engine's configuration names its port
 

@@ -1,4 +1,4 @@
-"""protocol forks: in quality mode as_quantized, greedy replies to the same request may part where the engine's
+"""protocol forks: in quality mode speed, greedy replies to the same request may part where the engine's
 arithmetic depends on what it served before (an expert computed on the CPU in one request and on the device in the
 next, a cache in another state, a prompt read from a prompt cache). Rounding can only flip a near-tie, so a
 difference passes the repeatable, request_history and prompt_cache gates when the two replies part where the engine
@@ -49,7 +49,7 @@ class ForkJudge:
 
 def judge_forks(result, engine, prepared, protocol, log):
     """Judges every recorded difference of the speed repetitions, the request history and the repeated follow-up
-    turns on `engine` (quality mode as_quantized), in place: speed cases get forks, history cases and follow-up turns
+    turns on `engine` (quality mode speed), in place: speed cases get forks, history cases and follow-up turns
     a fork."""
     judge = ForkJudge(engine, protocol)
     prompts = {case["id"]: case["prompt_ids"] for case in prepared["speed"]}

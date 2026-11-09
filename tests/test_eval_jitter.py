@@ -138,7 +138,9 @@ class RunTests(unittest.TestCase):
                 self.assertEqual(points[key]["prompt_tokens"] + points[key]["output_tokens"], filled)
                 self.assertEqual(drawn["curve"][key], filled)
             self.assertEqual(again["jitter"], drawn)
-            self.assertNotEqual(other["jitter"]["heldout"], drawn["heldout"])
+            # Another seed draws other lengths: compared over every draw, since two short held-out prompts alone (80-100%
+            # of 30 and 40 tokens) draw the same lengths under another seed about one time in sixty.
+            self.assertNotEqual((other["jitter"]["heldout"], other["jitter"]["curve"]), (drawn["heldout"], drawn["curve"]))
             # The speed suite keeps its lengths.
             self.assertEqual(result["speed"]["cases"]["long"]["prompt_tokens"], 60)
 

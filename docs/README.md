@@ -17,7 +17,7 @@ crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--
 crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR
 crit eval fetch --model MODEL_DIR --data EVAL_DATA_DIR [--packages FOLDER_OR_URL]
 crit eval pack --data EVAL_DATA_DIR --packages FOLDER
-crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] [--quality-mode as_quantized] --out result.json
+crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] [--quality-mode preserve] --out result.json
 crit eval run --url http://127.0.0.1:8000/v1 --model MODEL_DIR --data EVAL_DATA_DIR --context TOKENS --out result.json
 crit eval status result.json [--baseline earlier.json] [--device device.json] [--data EVAL_DATA_DIR] [--kernels kernels.json]
 crit eval compare a.json b.json
@@ -27,18 +27,23 @@ crit eval kernels --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR
 
 Results report facts; crit-eval does not classify or rank. The builder reasons from them:
 
-- **Gates**, the only pass/fail checks: every speed case ran and repeated its output; the same
+- **Gates**, the only pass/fail checks: every speed case ran, and those decoded more than once repeated their
+  output; the same
   greedy requests give the same tokens on the fresh engine and after everything else it served
   (request history); the engine's scores of the served tokens of fixed quality texts (after its own
   prefill, through its decode) stay within the drift budget of the model's checkpoint's in every
-  quality set, including texts of 1K-, 4K- and 32K-token prompts, and its served replies score
+  quality set, including texts of 1K-, 4K- and 32K-token prompts (the run's [quality
+  mode](MEASUREMENTS.md#quality) sets that budget: how much drift from the checkpoint the engine may
+  trade for speed, `speed` by default), and its served replies score
   alike (honesty); follow-up turns run again after everything else answer as they did first,
   whatever the engine served from a prompt cache (prompt_cache); the
   engine serves a request at the required context, answers facts placed at the start, middle
   and end of long prompts up to it verbatim (retrieval) and is not slower at a lower context;
   with `--exactness required`, speculative output equals plain greedy; sampled tokens follow the
-  model's sampling distribution ([sampling](MEASUREMENTS.md#sampling-check)); against a baseline, the
-  held-out prompts keep up (generality). A failing gate blocks qualification whatever the speed.
+  model's sampling distribution ([sampling](MEASUREMENTS.md#sampling-check)); against a baseline (normally the
+  run's first candidate, whose stage 1 measured them), the held-out prompts keep up (generality); requests served at
+  once decode what each decodes alone and ran together (concurrency). A failing gate blocks qualification whatever
+  the speed.
 - **Goals and KPIs:** decode, prefill, time to first token and the long-context scores, each
   against its physical [limit](MEASUREMENTS.md#limits); quality as the share of the drift budget
   the worst set uses. crit-eval states each goal with the fraction of its limit reached and its run-to-run
@@ -48,9 +53,11 @@ Results report facts; crit-eval does not classify or rank. The builder reasons f
 - **Gaps:** what each term (model pass, draft steps, verify pass, draft width, drafter acceptance,
   prefill at its stored-format and at its reachable ceiling, TTFT) would give at its floor, with a
   kernel trace (`status --kernels`) each prefill term too, plus missing inputs that hide a limit.
-- **Concurrency**, reported: a served engine that runs several requests at once gets closed-loop levels of 1 to 64
+- **Concurrency:** a served engine that runs several requests at once gets closed-loop levels of 1 to 64
   clients with each level's aggregate tokens per second against its batched ceiling, its first tokens, its
-  per-request decode and whether its replies equal the serial ones ([concurrency](MEASUREMENTS.md#concurrency)).
+  per-request decode, whether its replies equal the serial ones and its requests ran together (the concurrency
+  gate), and its speedup over one client's beside the cost model's expectation for the engine's placement
+  (reported, not judged; [concurrency](MEASUREMENTS.md#concurrency)).
 
 ## Package layout
 
@@ -117,8 +124,8 @@ vocabulary, merges and special tokens, the chat templates from `tokenizer.chat_t
 `generation_config.json` from the end-of-generation tokens and any `general.sampling.*` defaults.
 crit runs no GGUF runtime for any of it; `reference` needs the `gguf` Python package to decode
 the tensors, one that knows the GGUF's architecture: the gguf 0.19.0 release predates `deepseek4`
-and `qwen4exp`, so DeepSeek V4 and Qwen3.8-Flash-Next GGUFs need gguf-py from a llama.cpp checkout
-that has them (`PYTHONPATH=LLAMA_CPP/gguf-py`, or `pip install LLAMA_CPP/gguf-py`).
+and `qwen4exp`, so DeepSeek V4 and Qwen3.8-Flash-Next GGUFs need the gguf-py of a GGUF converter checkout
+that has them (`PYTHONPATH=CHECKOUT/gguf-py`, or `pip install CHECKOUT/gguf-py`).
 
 ```text
 crit eval prepare --model ~/models/Qwen3.5-27B-IQ3_S.gguf --data DATA
@@ -191,9 +198,10 @@ compressed-tensors and onnxruntime on models those tools wrote, and that the ref
 a model exactly as transformers scores its dequantized twin). The ceiling counts each matrix once
 at its stored format's rate: weight-only integer codes at bf16 (engines widen them for the GEMM),
 8-bit integer weights with per-row scales at fp8 (int8 tensor cores run at the FP8 rate), MXFP4 at
-nvfp4. Refused by name: AWQ GEMV layouts, GPTQModel's planar 5/6/7-bit layout, ONNX graphs from
-onnxruntime-genai's builder, ONNX quantized ops other than MatMulNBits, and EXL2 and EXL3,
-which exllama decodes only in CUDA kernels, so there is no CPU dequantization to check against.
+nvfp4. Refused by name: AWQ GEMV layouts, GPTQModel's planar 5/6/7-bit layout, generative ONNX
+graphs (a `genai_config.json` beside them: fused, renamed layers), ONNX quantized ops other than
+MatMulNBits, and EXL2 and EXL3, which are decoded only in CUDA kernels, so there is no CPU
+dequantization to check against.
 
 `reference` runs the text model's own transformers forward in FP32 and streams its decoder
 layers onto the GPU one at a time ([reference.py](../crit_eval/quality/reference.py)). One pass
@@ -276,13 +284,16 @@ pass and a draft step read, [Serving](https://github.com/crit-labs/crit/blob/mai
 reply's drafts accepted per round, so a served candidate gets the same decode limits as an
 adapter's (any server may stream the same `crit_telemetry` object on an event of its reply: `accepted`, drafts
 accepted per round, and `expert_reads` and `expert_hits`, its device expert cache's reads and hits; without them a
-speculating engine is priced as one token per pass and an offloading one at even routing, and `status` says so when
-its decode lands above that ceiling), and checks exactness on the same engine through plain decoding (`chat-plain-v1`).
+speculating engine is priced as one token per pass, and an offloading one has its expert misses beyond what the
+device's capacity forces unmeasured (crit serve's `/health` `engine_telemetry`, the expert cache's reads and hits,
+prices them too), its floors optimistic, and `status` says which), and checks exactness on the same engine through
+plain decoding (`chat-plain-v1`).
 
 A server whose model card reports `max_concurrent_requests` above 1 (crit serve's, for a package declaring
 `chat-concurrent-v1`) also gets the [concurrency](MEASUREMENTS.md#concurrency) part after every other one: closed-loop
-clients sending the speed and held-out prompts at once. It is reported, not judged, and changes no single-stream
-figure.
+clients sending the speed and held-out prompts at once. The concurrency gate fails a reply that batching changed
+and a level whose requests did not run together (one reply streaming at a time); each level's speedup is reported
+beside the cost model's expectation. It changes no single-stream figure.
 
 Quality needs the engine's own scores of the fixed texts, from the paths it serves with: `POST
 /v1/crit/score` on `crit serve` for packages declaring `chat-score-v1`
@@ -311,9 +322,9 @@ required context.
 
 | Stage | Adds | What it gives |
 |---|---|---|
-| 1 | each speed case once; quality on every set up to 2,048 tokens with the honesty check; the request history on the shortest speed case | decode, prefill and time to first token with its floor (`speed.ttft_floor_ms`, the shortest prompt's); the quality gate; the history gate; the memory the required context needs against what the load left free (`context.fit`); decode projected to the required context from every context measured (`context.creep`) |
+| 1 | each speed case once; the held-out prompts; quality on every set up to 2,048 tokens with the honesty check; the request history on the shortest speed case | decode, prefill and time to first token with its floor (`speed.ttft_floor_ms`, the shortest prompt's); the held-out decode, every later Eval's generality baseline, and the generality gate against a baseline; the quality gate; the history gate; the memory the required context needs at the engine's `kv_bytes_per_token` against what the load left free (`context.fit`; unmeasured without that count); decode projected to the required context from every context measured (`context.creep`) |
 | 2 | the speed cases under 8,192 prompt tokens once more, compared with their stage 1 request (a second and third time when they disagree); the follow-up turns; the longer quality sets and any stage 1 had no room for; the long-context curve's first point (32,768 tokens) and retrieval below it | the repetitions' spread; prompt-cache KPIs; long-text quality and the honesty check's long reply; long-context time to first token, decode and retrieval |
-| 3 | the sampled suite at one seed after a warmup that serves the sampling check; exactness on the two shortest cases; the held-out prompts when a baseline measured them; the follow-up turns again | sampled decode and the sampling gate; exactness; the generality gate; the prompt-cache gate |
+| 3 | the sampled suite at one seed after a warmup that serves the sampling check; exactness on the two shortest cases; the follow-up turns again | sampled decode and the sampling gate; exactness; the prompt-cache gate |
 
 Stage 1 runs on every engine, but not blindly: after its first speed case it prices each further case and quality set
 at the rates measured so far, and leaves out one that would pass the budget (`over_budget`; a speed case left out
@@ -337,6 +348,17 @@ not measured.
 
 `--stage full` runs every part at the protocol's warmups and repetitions, as before stages; `--warmups` and
 `--repetitions` apply to it alone. A profile (`--profile hub`) fixes its own parts and has no stages.
+
+### Pre-check
+
+`crit eval precheck --adapter A|--url U --model M --data D --context N [--quality-mode preserve]` asks, in
+minutes, the gates a candidate most often fails a whole round on, each once: the honesty check on the short honesty
+texts and on one long reply at the curve's first point (scored after the prompt the server rendered), the request
+history around those requests (its forks judged in `speed`), the device memory left after the load and, with
+an adapter, the shortest and longest speed cases on an engine opened again at the lower context against the required
+one (twice the protocol's tolerance: one sample each). It prints what failed, exits 4 when something did, and writes
+the items with `--out`. Its verdicts are hints under the protocol's rules, never a gate; `crit run ... serve --check
+--data D` runs it on a crit candidate.
 
 ## Journal and resume
 
@@ -379,7 +401,9 @@ adaptive sampled repetitions move the sampled decode score; the reference scores
 the model, the texts and the reference version, not the protocol). Scores compare
 within one series: one minor version before 1.0 (0.1.x), one major version from 1.0 on. Versions come with
 crit-eval's releases only, and the release names them: between releases every change to the protocol or the suite
-stays under the protocol id of the coming release, and nothing in a change picks a version. A change that can move a
+stays under the protocol id of the coming release, and nothing in a change picks a version: the changes since the
+0.5.x releases (which all ran `crit-eval-v0.5.0`) ran under `crit-eval-v0.6.0`, the coming release's working id,
+which crit-eval 0.6.0 kept. A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results
@@ -408,7 +432,7 @@ with each score:
 - Exactness covers measured speed cases and is a gate only with `--exactness required`. A drop
   in plain-greedy equality against `--baseline` (status notes it) and any difference between
   repeated identical requests are bugs until a root cause is shown ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)),
-  except, in quality mode `as_quantized`, a difference that parts at a near-tie ([forks](MEASUREMENTS.md#forks-in-quality-mode-as_quantized)).
+  except, in quality mode `speed`, a difference that parts at a near-tie ([forks](MEASUREMENTS.md#forks-in-quality-mode-speed)).
   `requirements` records the drift budget and exactness mode used.
 - A result names what it measured and with what: `crit_eval_version`, `model` (its name, the Hugging
   Face repository and revision when the path shows them, format, architectures and quantization;
@@ -473,7 +497,7 @@ crit eval workbench profile FOLDER [--python PY] [--ncu NCU]
   (atomics, races and reads past a buffer fail it), and with `column_invariant` each column computed alone equal bit
   for bit to the same column in the multi-column call, the property greedy speculation needs. A kernel declared
   `"repeatable": false` in kernel.json (atomics, or a split the workload chooses, for an engine in quality mode
-  `as_quantized`, where near-tie output differences pass) has its repeats judged against the reference within the
+  `speed`, where near-tie output differences pass) has its repeats judged against the reference within the
   tolerance instead of bit for bit (`repeat_relative_error`). Result: FOLDER/check.json;
   the command fails when any row does.
 - **bench** times `candidate()` and `yardstick()` with CUDA events after a quarter second of warm-up, cycling through

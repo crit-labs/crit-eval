@@ -13,7 +13,9 @@ from crit_eval.reports import status  # noqa: E402
 from crit_eval.run import chat, runner, tracks  # noqa: E402
 from test_eval import MOCK, fixture, run_full  # noqa: E402
 
-PRESERVE = {"requirements": {"quality_mode": "preserve"}}
+BUDGETS = tracks.mode_budgets()   # each quality mode's protocol budget
+PRESERVE = {"requirements": {"quality_mode": "preserve", "quality_budget": BUDGETS["preserve"]}}
+SPEED = {"requirements": {"quality_mode": "speed", "quality_budget": BUDGETS["speed"]}}
 GB = 10**9
 
 
@@ -25,12 +27,35 @@ class ClosedTrackTests(unittest.TestCase):
     def test_a_plain_engine_in_preserve_loaded_once_qualifies(self):
         self.assertEqual(self.state(PRESERVE, {}), (True, {"quality_mode": "pass", "one_load": "pass",
                                                            "own_drafter": "pass"}))
-        self.assertEqual(self.state({"requirements": {"quality_mode": "as_quantized"}}, {})[0], False)
         served = {**PRESERVE, "engine_loads": {"first": 1, "last": 1}}
         self.assertEqual(self.state(served, {"served": True})[0], True)
         reloaded = {**PRESERVE, "engine_loads": {"first": 1, "last": 3}}
         self.assertEqual(self.state(reloaded, {"served": True}), (False, {"quality_mode": "pass", "one_load": "fail",
                                                                           "own_drafter": "pass"}))
+
+    def test_either_mode_qualifies_at_its_own_protocol_budget_and_no_other(self):
+        self.assertEqual(BUDGETS, {"preserve": {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5},
+                                   "speed": {"ppl_ratio_max": 1.4, "kld_mean_max": 0.4, "kld_p99_max": 4.0}})
+        self.assertEqual(self.state(SPEED, {})[0], True)
+        self.assertEqual(self.state(PRESERVE, {})[0], True)
+        for result in (SPEED, PRESERVE):
+            mode, budget = result["requirements"]["quality_mode"], result["requirements"]["quality_budget"]
+            for name, change in (("looser", 2.0), ("tighter", 0.5)):
+                with self.subTest(mode=mode, budget=name):
+                    other = {"requirements": {"quality_mode": mode,
+                                              "quality_budget": {**budget, "kld_mean_max": budget["kld_mean_max"] * change}}}
+                    found = tracks.closed(other, {}, 2 * GB, 0.05)
+                    self.assertEqual((found["qualifies"], found["checks"]["quality_mode"]["state"]), (False, "fail"))
+                    self.assertIn("not the mode's protocol budget", found["checks"]["quality_mode"]["detail"])
+        # The other mode's budget is no budget of this mode's.
+        crossed = {"requirements": {"quality_mode": "preserve", "quality_budget": BUDGETS["speed"]}}
+        self.assertEqual(self.state(crossed, {})[0], False)
+        # A result that records no budget cannot be checked; one that states no mode, or one no longer named, is
+        # refused: every result states its mode.
+        self.assertEqual(self.state({"requirements": {"quality_mode": "preserve"}}, {})[1]["quality_mode"], "unmeasured")
+        for requirements in ({"quality_budget": BUDGETS["preserve"]}, {"quality_mode": "as_quantized", "quality_budget": {}}):
+            with self.assertRaisesRegex(ValueError, "preserve or speed"):
+                tracks.closed({"requirements": requirements}, {}, 2 * GB, 0.05)
 
     def test_a_drafter_reads_no_more_than_the_checkpoints_own_draft_layers(self):
         drafting = {"speculative": True, "draft_bytes_per_step": 2 * GB}
@@ -43,14 +68,14 @@ class ClosedTrackTests(unittest.TestCase):
     def test_a_served_engine_reports_its_load_count(self):
         engine = chat.ChatEngine.__new__(chat.ChatEngine)
         engine.deadline = SimpleNamespace(seconds=lambda _: 30)
-        engine.server = SimpleNamespace(get=lambda path, timeout: {"engine": {"engine_loads": 2}})
+        engine.server = SimpleNamespace(health=lambda timeout: {"engine": {"engine_loads": 2}})
         self.assertEqual(tracks.engine_loads(engine), 2)
-        engine.server = SimpleNamespace(get=lambda path, timeout: {"status": "ok"})
+        engine.server = SimpleNamespace(health=lambda timeout: {"status": "ok"})
         self.assertIsNone(tracks.engine_loads(engine))
 
-        def unreachable(path, timeout):
+        def unreachable(timeout):
             raise OSError("no /health")
-        engine.server = SimpleNamespace(get=unreachable)
+        engine.server = SimpleNamespace(health=unreachable)
         self.assertIsNone(tracks.engine_loads(engine))
         self.assertIsNone(tracks.engine_loads(object()))
 
@@ -58,15 +83,30 @@ class ClosedTrackTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
-            result = run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 128}, parts=("speed",),
-                              warmups=0, repetitions=1, log=lambda message: None)
-        closed = result["track"]["closed"]
-        self.assertEqual(set(closed["checks"]), set(tracks.CHECKS))
-        self.assertEqual(closed["checks"]["quality_mode"]["state"], "pass")
-        self.assertEqual(closed["checks"]["one_load"]["state"], "pass")
+            run = lambda name, **options: run_full(MOCK, "unused-model", data, data / name, {"max_context": 128},  # noqa: E731
+                                                   parts=("speed",), warmups=0, repetitions=1,
+                                                   log=lambda message: None, **options)
+            # A run that names no quality mode judges in speed, by its budget: closed track.
+            default = run("default.json")
+            result = run("result.json", quality_mode="preserve")
+            loosened = {mode: run(f"loose-{mode}.json", quality_mode=mode, quality_budget={"kld_mean_max": 1.0})
+                        for mode in ("preserve", "speed")}
+        for found in (default, result):
+            closed = found["track"]["closed"]
+            self.assertEqual(set(closed["checks"]), set(tracks.CHECKS))
+            self.assertEqual(closed["checks"]["quality_mode"]["state"], "pass")
+            self.assertEqual(closed["checks"]["one_load"]["state"], "pass")
+        self.assertEqual(default["requirements"]["quality_mode"], "speed")
+        self.assertIn("judged in speed by its protocol budget",
+                      default["track"]["closed"]["checks"]["quality_mode"]["detail"])
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         text = status.render(status.build(result, protocol, None))
         self.assertIn("track    closed track", text)
+        # A --quality-budget other than the mode's leaves the closed track, in either mode.
+        for mode, found in loosened.items():
+            self.assertEqual(found["requirements"]["quality_mode"], mode)
+            self.assertEqual(found["track"]["closed"]["checks"]["quality_mode"]["state"], "fail", mode)
+            self.assertFalse(found["track"]["closed"]["qualifies"], mode)
 
 
 if __name__ == "__main__":

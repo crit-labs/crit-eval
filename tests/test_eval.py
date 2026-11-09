@@ -37,7 +37,16 @@ def run_full(*args, **options):
 
 SUITE = prepare.suite_identity()  # prepared data must come from the suite Eval runs
 # What every result holds before its parts run (crit_eval.run.runner): the run's requirements and the required context.
-MEASURED = {"requirements": {"exactness": "reported"}, "context": {"tokens": None, "reason": "not given", "missing": []}}
+MEASURED = {"requirements": {"exactness": "reported", "quality_mode": "preserve"}, "context": {"tokens": None, "reason": "not given", "missing": []}}
+# A measured speed case as crit_eval.run.speed records one: the outputs the repeatable gate compared, its stalls
+# and its tool calls (None: none to report).
+CASE = {"status": "measured", "repeatable": True, "outputs": 2, "stalls": None, "tool_calls": None}
+
+
+def speed_part(cases, **more):
+    """A speed part as crit_eval.run.speed.speed_summary records it, `cases` laid over CASE."""
+    return {"decode_text": {"source": "generated", "reason": "a fixture"}, **more,
+            "cases": {cid: {**CASE, **case} for cid, case in cases.items()}}
 
 
 def softmax_logprobs(logits):
@@ -270,6 +279,12 @@ class RunnerTests(unittest.TestCase):
             (data / "v4.json").write_text(json.dumps({**minor, "protocol": "crit-eval-v4"}))
             self.assertNotIn("protocol versions", report.compare([data / "result.json", data / "minor.json"]))
             self.assertIn("protocol versions", report.compare([data / "result.json", data / "v4.json"]))
+            # Results compare within one quality mode.
+            self.assertNotIn("quality modes", table)
+            kept = {**minor, "requirements": {**minor["requirements"], "quality_mode": "preserve"}}
+            (data / "preserve.json").write_text(json.dumps(kept))
+            self.assertIn("judged in different quality modes", report.compare([data / "result.json",
+                                                                               data / "preserve.json"]))
 
     def test_loading_an_adapter_writes_no_bytecode_into_its_package(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -332,6 +347,22 @@ class RunnerTests(unittest.TestCase):
                 self.assertEqual(adapter_config(str(adapter), '{"draft_width": 2}', "--config"),
                                  {"draft_width": 2, "graphs": True})
             self.assertEqual(adapter_config(None, "{}", "--config"), {})
+
+    def test_a_crit_package_is_measured_through_cores_adapter(self):
+        """--package: the package's engine opens through Core's eval-v1 adapter (crit_core/eval_adapter.py), which
+        reads the package's configuration.json under the overrides; a folder that is no plugin package is refused."""
+        import json
+        import crit_core.eval_adapter
+        from crit_eval.cli import package_engine
+        with tempfile.TemporaryDirectory() as directory:
+            package = Path(directory)
+            with self.assertRaisesRegex(SystemExit, "is no crit engine package: it holds plugins/ and configuration.json"):
+                package_engine(str(package), "{}", "--config")
+            (package / "plugins").mkdir()
+            (package / "configuration.json").write_text('{"plugins": {"use": {}}}')
+            adapter, config = package_engine(str(package), '{"draft_width": 2}', "--config")
+            self.assertEqual(adapter, crit_core.eval_adapter.__file__)
+            self.assertEqual(json.loads(config), {"draft_width": 2, "package": str(package.resolve())})
 
     def test_wrong_token_count_is_rejected(self):
         class Short:
@@ -460,11 +491,13 @@ PROTOCOLS = {
     "crit-eval-v8": "f15b05a73387399d950ab3f31fe27dc4eec1b16662a65b91d0f9a583f44ac8ad",  # one long text per length, ...
     "crit-eval-v0.1.0": "a39facfb4d13d4054ab3da3445564606d4a0696f93e5583b8e0a076467858412",  # crit-eval's first release
     "crit-eval-v0.1.2": "a373c9c54f5b00d8d986da7dac0a2480049b0bbef1999d4c9fdd8ac72bc3edad",  # quality modes
-    "crit-eval-v0.2.0": "8baf8ea4edbad3ad1a0ac06dd7775df74a3e216a32696d1c3b5533cf19a9dd1a",  # as_quantized budget x2, spread on every text
+    "crit-eval-v0.2.0": "8baf8ea4edbad3ad1a0ac06dd7775df74a3e216a32696d1c3b5533cf19a9dd1a",  # speed budget x2, spread on every text
     "crit-eval-v0.2.1": "5ec78e08cafea54a1cf3e73233f8c6be6e5151499cf95e0ba711130f5c984792",  # prompt perplexity reported
     "crit-eval-v0.2.2": "3a637b009a7fc2670db2ce714c2b6c9d0dc9393594260e9c2751e8f02713eb0e",  # spread probe on the short texts
-    "crit-eval-v0.3.0": "b6761b006fc61e9a5f9315241bc1fb5437bfb09661665e3628dfb6c63c20dbd7",  # as_quantized by allowance
+    "crit-eval-v0.3.0": "b6761b006fc61e9a5f9315241bc1fb5437bfb09661665e3628dfb6c63c20dbd7",  # speed by allowance
     "crit-eval-v0.4.0": "3f6a56953fe781d6f683970ba5c814ef0451246e73259b98e019934a5e5ddc28",  # stages, certification
+    "crit-eval-v0.5.0": "14a342ae8f2b9f413c7c748f71c8831cab8bec36f607184bfd310f8b2d3472d3",  # releases 0.5.0 to 0.5.3
+    "crit-eval-v0.6.0": "0ccc760244b448454b16b5eeafef260de88b7811f6a2ace55b53c3938695a812",  # release 0.6.0: modes preserve and speed
 }
 
 
@@ -609,7 +642,7 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(out["weight_bytes"], read)
         self.assertIsNone(ceiling.model_ceiling(Path(directory) / "missing"))
 
-    def test_exllama_checkpoints_are_refused_not_counted_without_their_matrices(self):
+    def test_exl2_and_exl3_checkpoints_are_refused_not_counted_without_their_matrices(self):
         trellis = {"model.layers.0.mlp.up_proj.trellis": {"dtype": "I16", "shape": [4, 4, 256],
                                                           "data_offsets": [0, 8192]},
                    "model.norm.weight": {"dtype": "BF16", "shape": [64], "data_offsets": [8192, 8320]}}
@@ -624,7 +657,7 @@ class CeilingTests(unittest.TestCase):
                 write_safetensors(model / "model.safetensors", tensors)
                 config = {"num_hidden_layers": 1, **({"quantization_config": quantization} if quantization else {})}
                 (model / "config.json").write_text(json.dumps(config))
-                with self.assertRaisesRegex(ValueError, f"{method} weights are not read: exllama decodes them only"):
+                with self.assertRaisesRegex(ValueError, f"{method} weights are not read: they are decoded only in CUDA kernels"):
                     ceiling.model_ceiling(model)
 
     def test_prefill_floor_adds_matmul_attention_and_recurrent_time(self):
@@ -645,17 +678,34 @@ class CeilingTests(unittest.TestCase):
 
     def test_ttft_floor_is_the_larger_of_compute_and_one_weight_read(self):
         model = {"matmul_flops_per_token": {"bf16": 1e10}, "attention_flops_per_pair": 0, "recurrent_flops_per_token": 0,
-                 "weight_bytes": 10e9, "kv_bytes_per_token": 1e5}
-        short, missing = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 100)
+                 "weight_bytes": 10e9, "kv_bytes_per_token": 4e5}
+        short, missing = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 100, kv_bytes_per_token=1e5)
         self.assertEqual(missing, [])
         self.assertEqual(short["bound"], "memory")  # 10 ms of reading weights beats 10 ms x 100 / 1,000 of math
         self.assertAlmostEqual(short["total_ms"], (10e9 + 1e5 * 100) / 1e12 * 1000)
-        long, _ = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 10000)
+        long, _ = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 10000, kv_bytes_per_token=1e5)
         self.assertEqual(long["bound"], "compute")
         self.assertAlmostEqual(long["total_ms"], 10000 * 1e10 / 1e14 * 1000)
-        declared, _ = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 100, bytes_per_pass=20e9)
+        declared, _ = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 100, bytes_per_pass=20e9,
+                                            kv_bytes_per_token=1e5)
         self.assertAlmostEqual(declared["memory_ms"], (20e9 + 1e5 * 100) / 1e12 * 1000)
         self.assertIn("device bandwidth (--device)", ceiling.ttft_floor_ms(model, {"bf16": 100}, None, 100)[1])
+
+    def test_ttft_floor_writes_no_kv_but_at_the_engines_count(self):
+        # The model's 16-bit K and V say nothing of the precision the engine stores: without the engine's count the
+        # prompt's KV writes are left out, still a floor, and the TTFT summary asks for the count.
+        model = {"matmul_flops_per_token": {"bf16": 1e10}, "attention_flops_per_pair": 0, "recurrent_flops_per_token": 0,
+                 "weight_bytes": 10e9, "kv_bytes_per_token": 1e5}
+        floor, missing = ceiling.ttft_floor_ms(model, {"bf16": 100}, 1000, 100)
+        self.assertEqual(missing, [])
+        self.assertAlmostEqual(floor["memory_ms"], 10e9 / 1e12 * 1000)
+        speed = {"cases": {"short": {"status": "measured", "prompt_tokens": 100, "ttft_ms": 50.0, "samples": []}}}
+        unread = headroom.ttft_summary({}, speed, model, {"bf16": 100}, 1000)
+        self.assertAlmostEqual(unread["cases"]["short"]["floor"]["memory_ms"], 10e9 / 1e12 * 1000)
+        self.assertEqual(unread["missing"], [headroom.KV_BYTES])
+        given = headroom.ttft_summary({"kv_bytes_per_token": 2e4}, speed, model, {"bf16": 100}, 1000)
+        self.assertAlmostEqual(given["cases"]["short"]["floor"]["memory_ms"], (10e9 + 2e4 * 100) / 1e12 * 1000)
+        self.assertEqual(given["missing"], [])
 
     def test_probe_keeps_the_median_of_each_value(self):
         samples = [{"device": "gpu", "bandwidth_gbs": b, "tflops": {"fp8": f}} for b, f in ((100, 5), (300, 7), (200, 6))]
@@ -784,18 +834,29 @@ class GapTests(unittest.TestCase):
                      "tokens_per_round": 2.0, "round_ms": 20.0, "ttft_ms": 2000.0, "prefill_tps": 4950.0}}}
 
     def test_kv_bytes_raise_the_floor_at_long_context(self):
-        info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 1e9}
-        room = headroom.summarize(info, self.speed(), 16.0, 1000, THRESHOLDS, ceiling={"kv_bytes_per_token": 1e5})
+        info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 1e9, "kv_bytes_per_token": 1e5}
+        room = headroom.summarize(info, self.speed(), 16.0, 1000, THRESHOLDS, ceiling={"kv_bytes_per_token": 4e5})
         self.assertAlmostEqual(room["cases"]["short"]["pass_floor_ms"], (10e9 + 1e5 * 200) / 1e12 * 1000)
         self.assertAlmostEqual(room["cases"]["long"]["pass_floor_ms"], (10e9 + 1e5 * 10000) / 1e12 * 1000)
+        self.assertEqual(room["kv_bytes_per_token"], 1e5)
+        self.assertNotIn(headroom.KV_BYTES, room["missing"])
+
+    def test_the_floor_takes_no_kv_count_but_the_engines(self):
+        # The model's 16-bit K and V say nothing of the precision the engine stores: without the engine's count the
+        # floor leaves the KV term out, still a floor, and names what it lacks.
+        info = {"draft_width": 3, "bytes_per_pass": 10e9, "draft_bytes_per_step": 1e9}
+        room = headroom.summarize(info, self.speed(), 16.0, 1000, THRESHOLDS, ceiling={"kv_bytes_per_token": 1e5})
+        for case in ("short", "long"):
+            self.assertAlmostEqual(room["cases"][case]["pass_floor_ms"], 10e9 / 1e12 * 1000)
+        self.assertIsNone(room["kv_bytes_per_token"])
+        self.assertEqual(room["missing"].count(headroom.KV_BYTES), 1)
 
     def test_a_plain_engine_has_one_token_per_pass_at_its_floor_as_its_decode_ceiling(self):
         speed = self.speed()
         speed["decode_score"] = 50.0
         for case in speed["cases"].values():
             case.update(decode_tps=50.0, tokens_per_round=1.0)
-        room = headroom.summarize({"bytes_per_pass": 10e9}, speed, 20.0, 1000, THRESHOLDS,
-                                  ceiling={"kv_bytes_per_token": 1e5})
+        room = headroom.summarize({"bytes_per_pass": 10e9, "kv_bytes_per_token": 1e5}, speed, 20.0, 1000, THRESHOLDS)
         # Pass floors with the KV read at each case's context (200 and 10,000 tokens): 10.02 and 11 ms.
         ceiling = (1000 / 10.02 * 1000 / 11.0) ** 0.5
         projection = room["projection"]
@@ -918,15 +979,22 @@ class ActivationCeilingTests(unittest.TestCase):
     SOURCES = {"bf16": "raw MMA", "fp16_acc": "raw MMA", "fp8": "cuBLASLt GEMM", "nvfp4": "raw MMA"}
 
     def result(self, declared=None, passed=None, label="new", model="m"):
-        speed = {"cases": {cid: {"status": "measured", "prompt_tokens": n, "ttft_ms": ms, "prefill_tps": n / ms * 1000,
-                                 "output_tokens": 10, "decode_tps": 100.0}
-                           for cid, n, ms in (("short", 100, 20.0), ("long", 10000, 2000.0))}}
+        speed = speed_part({cid: {"prompt_tokens": n, "ttft_ms": ms, "prefill_tps": n / ms * 1000,
+                                  "output_tokens": 10, "decode_tps": 100.0}
+                            for cid, n, ms in (("short", 100, 20.0), ("long", 10000, 2000.0))})
         scores = {"kld_mean": 0.01, "kld_p99": 0.1, "ppl_ratio": 1.01, "top1_agreement": 0.99, "failures": []}
         quality = None if passed is None else {"status": "scored", "passed": passed, "sets": {
             "long-4096/prompt": {**scores, "passed": passed}, "long-4096/served": {**scores, "passed": True}}}
         return {"protocol": CURRENT_PROTOCOL, "model_sha256": model, "label": label, "ceiling": self.CEILING, "bandwidth_gbs": 1000.0, "speed": speed,
                 "engine": {"prompt_activations": declared}, "quality": quality,
-                "headroom": {"gaps": [], "missing": []}}
+                "headroom": {"gaps": [], "missing": []}, "requirements": {"quality_mode": "preserve"}}
+
+    @staticmethod
+    def priced(result, evidence=()):
+        """`result` with the headroom a run records: prefill and time to first token priced at its device's rates, with
+        the ceilings by prompt activation judged by its quality and `evidence`'s (headroom.price_prompts)."""
+        rates, sources = ceiling.best_rates(result["device"])
+        return {**result, "headroom": headroom.price_prompts(result, rates, sources, ["long"], list(evidence))}
 
     def test_activations_are_declared_per_format_or_as_shares(self):
         formats = ["fp8", "nvfp4"]
@@ -982,17 +1050,29 @@ class ActivationCeilingTests(unittest.TestCase):
         self.assertIsNone(headroom.activation_ceilings({**self.result(), "ceiling": {"matmul_flops_per_token": {"bf16": 1}}},
                                                        rates, sources, ["long"]))
 
+    def test_quality_evidence_counts_only_in_the_mode_it_was_judged_in(self):
+        rates, sources = self.RATES, self.SOURCES
+        speed = {**self.result("stored", passed=True, label="speed"), "requirements": {"quality_mode": "speed"}}
+        # A pass under the speed mode's budget shows nothing for preserve's.
+        found = headroom.activation_ceilings(self.result(), rates, sources, ["long"], [speed])
+        self.assertIsNone(found["modes"]["stored"]["state"])
+        mine = {**self.result(), "requirements": {"quality_mode": "speed"}}
+        found = headroom.activation_ceilings(mine, rates, sources, ["long"], [speed])
+        self.assertEqual(found["modes"]["stored"]["state"], "passes")
+
     def test_the_reachable_ceiling_is_a_prefill_gap_and_status_states_the_evidence(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         result = {**MEASURED, **self.result({"nvfp4": "fp16_acc", "fp8": "fp8"}, passed=True)}
         result["device"] = {"tflops": {"bf16": 50.0, "fp8": 400.0}, "mma_tflops": {"bf16": 100.0, "fp16_acc": 200.0,
                                                                                     "nvfp4": 800.0}}
+        older = {**MEASURED, **self.result("stored", passed=False, label="old")}
+        # The run priced the ceilings by activation from its device, the baseline's quality among their evidence.
+        result = self.priced(result, [older])
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "result.json"
             path.write_text(json.dumps(result))
             baseline = Path(directory) / "baseline.json"
-            baseline.write_text(json.dumps({**MEASURED, **self.result("stored", passed=False, label="old")}))
-            # The result records its arithmetic but no ceilings by activation: status prices them from its device.
+            baseline.write_text(json.dumps(older))
             current = status.status_of(path, {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}},
                                        baseline)
         names = [gap["name"] for gap in current["gaps"]]
@@ -1043,9 +1123,10 @@ class ActivationCeilingTests(unittest.TestCase):
         protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
         floor = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
         found = {}
-        for mode in ("preserve", "as_quantized"):
+        for mode in ("preserve", "speed"):
             result = {**MEASURED, **self.result("fp16_acc", passed=True), "device": {"mma_tflops": self.RATES}}
             result["requirements"] = {"quality_mode": mode}
+            result = self.priced(result)
             with tempfile.TemporaryDirectory() as directory:
                 path = Path(directory) / "result.json"
                 path.write_text(json.dumps(result))
@@ -1062,14 +1143,76 @@ class ActivationCeilingTests(unittest.TestCase):
         text = status.render(found["preserve"])
         self.assertIn(f"of its compute ceiling {floor(200e12, 200e12):,.0f} at fp16_acc prompt activations (quality "
                       "mode preserve; the stored format's", text)
-        self.assertIn("would allow prefill " + f"{floor(400e12, 800e12):,.0f} tok/s", text)
-        # as_quantized: the checkpoint's own activations, the stored format.
-        prefill = found["as_quantized"]["kpis"]["prefill"]
+        self.assertIn("would price its limits at the stored format's prompt activations: prefill "
+                      + f"{floor(400e12, 800e12):,.0f} tok/s", text)
+        # speed: the fastest arithmetic it admits, here the stored format (W8A8, W4A4).
+        prefill = found["speed"]["kpis"]["prefill"]
         self.assertEqual(prefill["ceiling_activations"], "stored")
         self.assertAlmostEqual(prefill["ceiling"], floor(400e12, 800e12))
-        self.assertIn("quality mode as_quantized: quality judged against the checkpoint's exact activations with the "
-                      "mode's own budget",
-                      status.render(found["as_quantized"]))
+        self.assertIn("quality mode speed: drift from the checkpoint's exact scores judged "
+                      "by the mode's own budget", status.render(found["speed"]))
+        self.assertIn("limits at its stored format", status.render(found["speed"]))
+        # A result that states no quality mode, or one no longer named, is refused: every result states its mode.
+        for requirements in ({}, {"quality_mode": "as_quantized"}):
+            with self.assertRaisesRegex(ValueError, "a result states the quality mode it was judged in, preserve or speed"):
+                headroom.quality_mode({"requirements": requirements})
+
+    def test_the_speed_mode_prices_prefill_at_the_fastest_arithmetic_it_admits(self):
+        # A device without 4-bit tensor cores (no nvfp4 rate): the stored format cannot be priced, and the mode for
+        # speed is priced at FP8 prompt activations, which it admits on the 4-bit matrices too; preserve stays at its
+        # 16-bit ones. Neither depends on the format being the checkpoint's: the mode is what drift may buy speed.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
+        floor = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
+        rates = {"bf16": 100.0, "fp16_acc": 200.0, "fp8": 400.0}
+        found = {}
+        for mode in ("preserve", "speed"):
+            result = {**MEASURED, **self.result("fp16_acc", passed=True), "device": {"mma_tflops": rates}}
+            result["requirements"] = {"quality_mode": mode}
+            result = self.priced(result)   # the run priced its ceilings by activation from its device
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "result.json"
+                path.write_text(json.dumps(result))
+                found[mode] = status.status_of(path, protocol)["kpis"]["prefill"]
+        self.assertEqual(found["preserve"]["ceiling_activations"], "fp16_acc")
+        self.assertAlmostEqual(found["preserve"]["ceiling"], floor(200e12, 200e12))
+        self.assertEqual(found["speed"]["ceiling_activations"], "fp8")
+        self.assertAlmostEqual(found["speed"]["ceiling"], floor(400e12, 400e12))
+        self.assertGreater(found["speed"]["ceiling"], found["preserve"]["ceiling"])
+        # With the stored format priced and the fastest, speed keeps its limits (headroom.mode_limits).
+        room = {"activations": {"formats": ["fp8", "nvfp4"], "modes": {
+            "fp8": {"ceiling_score": 2.0}, "stored": {"ceiling_score": 3.0}, "fp16_acc": {"ceiling_score": 1.0}}}}
+        self.assertIsNone(headroom.mode_limits({"requirements": {"quality_mode": "speed"}, "headroom": room}))
+        self.assertEqual(headroom.mode_limits({"requirements": {"quality_mode": "preserve"}, "headroom": room})
+                         ["activations"], "fp16_acc")
+
+    def test_a_device_without_4_bit_tensor_cores_prices_the_speed_mode_at_fp8(self):
+        # A real probe of a device with FP8 but no FP4 matrix units (compute capability 8.9): its NVFP4 rate is widened
+        # to BF16 (ceiling.best_rates), so the stored format (W8A8 at 400, W4A16 at 100 TFLOPS) prices below
+        # preserve's FP16 accumulation (200 for both). Speed takes FP8 prompt activations instead: above
+        # preserve, as every arithmetic preserve admits is one speed admits.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": ["long"]}}
+        floor = lambda fp8, nvfp4: 10000 / (10000 * 1e9 * (1 / fp8 + 1 / nvfp4) * 1000) * 1000   # noqa: E731
+        device = {"compute_capability": "8.9", "mma_tflops": {"bf16": 100.0, "fp16_acc": 200.0, "fp8": 400.0}}
+        self.assertEqual(ceiling.best_rates(device)[0]["nvfp4"], 100.0)
+        found = {}
+        for mode in ("preserve", "speed"):
+            result = {**MEASURED, **self.result("fp16_acc", passed=True), "device": device}
+            result["requirements"] = {"quality_mode": mode}
+            result = self.priced(result)
+            with tempfile.TemporaryDirectory() as directory:
+                path = Path(directory) / "result.json"
+                path.write_text(json.dumps(result))
+                found[mode] = status.status_of(path, protocol)
+        prefill = {mode: found[mode]["kpis"]["prefill"] for mode in found}
+        self.assertAlmostEqual(prefill["preserve"]["stored_ceiling"], floor(400e12, 100e12))
+        self.assertAlmostEqual(prefill["preserve"]["ceiling"], floor(200e12, 200e12))
+        self.assertEqual(prefill["speed"]["ceiling_activations"], "fp8")
+        self.assertAlmostEqual(prefill["speed"]["ceiling"], floor(400e12, 400e12))
+        # preserve's trade line names what speed would price, not the slower stored format.
+        self.assertIn(f"would price its limits at fp8 prompt activations: prefill {floor(400e12, 400e12):,.0f} tok/s",
+                      status.render(found["preserve"]))
 
 
 class PrefillTermTests(unittest.TestCase):
@@ -1133,6 +1276,7 @@ class PrefillTermTests(unittest.TestCase):
                                       {"kpi": "ttft", "name": "t", "projected_gain": 0.1}]
         # The engine reports its own prefill and first token (an adapter's generate, crit serve's telemetry).
         result["speed"]["cases"]["long"]["samples"] = [{"warmup": False, "prefill_ms": 900.0, "first_token_ms": 950.0}]
+        result = base.priced(result)   # the prompt gaps the run priced, after its decode gaps
         with tempfile.TemporaryDirectory() as directory:
             path, kernels = Path(directory) / "result.json", Path(directory) / "kernels.json"
             path.write_text(json.dumps(result))
@@ -1337,23 +1481,31 @@ class RepetitionTests(unittest.TestCase):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         self.assertIn("fresh_decode", protocol["speed"])
         calls, case = self.run_case([60.0, 80.0, 96.0, 100.0, 0.0], 1)
-        cases = {"a": case, "b": {**case, "decode_tps": 25.0, "samples": [dict(case["samples"][0], decode_tps=40.0)]}}
+        self.assertEqual(case["first_request"]["decode_tps"], 60.0)   # the prompt's first request
+        cases = {"a": case, "b": {**case, "decode_tps": 25.0, "first_request": None,
+                                  "samples": [dict(case["samples"][0], decode_tps=40.0)]}}
         summary = speed.speed_summary(cases, protocol, 1, 1, "own")
         self.assertAlmostEqual(summary["fresh_decode_score"], (60.0 * 40.0) ** 0.5)
         self.assertAlmostEqual(summary["decode_score"], (100.0 * 25.0) ** 0.5)
+        self.assertAlmostEqual(summary["repeat_speedup"], round((100.0 * 25.0) ** 0.5 / (60.0 * 40.0) ** 0.5, 3))
+        # A pinned run's first request is its first free generation, recorded before the replays.
+        cases["b"]["first_request"] = {"decode_tps": 20.0}
+        self.assertAlmostEqual(speed.speed_summary(cases, protocol, 1, 1, "own")["fresh_decode_score"], (60.0 * 20.0) ** 0.5)
+        from crit_eval.reports import status as report_status
+        self.assertEqual(report_status._first_time({"speed": summary})["speedup"], summary["decode_score"] / summary["fresh_decode_score"])
+        self.assertIsNone(report_status._first_time({"speed": {"decode_score": 10.0}}))
+        cases["b"]["first_request"] = None
         cases["b"]["samples"] = [{"decode_tps": None, "warmup": False}]
         self.assertIsNone(speed.speed_summary(cases, protocol, 1, 1, "own")["fresh_decode_score"])
 
     def test_a_decode_above_its_ceiling_names_the_assumptions_the_engine_did_not_report(self):
         from crit_eval.reports import status as report_status
         decode = {"ceiling": 50.9, "fraction_of_ceiling": 1.88, "ceiling_basis": "one token per pass",
-                  "host_pass": {"hit_rate": 0.29, "hit_rate_source": "even routing"}}
+                  "host_pass": {"hit_rate": 0.8, "hit_rate_source": "engine"}}
         found = report_status._above_ceiling(decode)
-        self.assertIn("even routing's 29% hit rate", found)
         self.assertIn("one token per model pass", found)
         self.assertIsNone(report_status._above_ceiling({**decode, "fraction_of_ceiling": 0.9}))
-        self.assertIsNone(report_status._above_ceiling({**decode, "ceiling_basis": None,
-                                                         "host_pass": {"hit_rate": 0.8, "hit_rate_source": "engine"}}))
+        self.assertIsNone(report_status._above_ceiling({**decode, "ceiling_basis": None}))
 
     def test_repetitions_of_different_replies_are_not_a_disturbance(self):
         # A greedy reply that alternates between two texts, one of them slow (72-75 against 113-126 tok/s). Repetitions of the same reply agree, so the round goes on; the case records how its replies spread.
@@ -1503,8 +1655,8 @@ class ToolCallTests(unittest.TestCase):
                          ("measured", "xml", 1, 0, 0))   # the unclosed call after the end token is not read
         self.assertIsNone(tool_calls.case_tool_calls({**case, "kind": "prose"}, reply, {}, prepared))
         self.assertEqual(tool_calls.case_tool_calls(case, reply, {}, {"stop_ids": []})["status"], "unmeasured")
-        current = status.build({**MEASURED, "speed": {"cases": {"tool-call": {
-            "status": "measured", "kind": "tool-call", "tool_calls": found, "samples": []}}}}, runner.load_json(
+        current = status.build({**MEASURED, "speed": speed_part({"tool-call": {
+            "kind": "tool-call", "tool_calls": found, "samples": []}})}, runner.load_json(
             runner.EVAL_DIR / "protocol.json"))
         self.assertEqual(current["kpis"]["tool_calls"]["valid"], 1)
         self.assertIn("tools    tool calls up to the first end token (xml format): tool-call 1 valid, 0 invalid, "
@@ -1877,7 +2029,7 @@ class SampledSpeedTests(unittest.TestCase):
         self.assertEqual((fixed.seeds, case["repetitions"], found["adaptive"]), ([0, 1], 1, None))
         self.assertEqual((case["decode_se"], case["repetitions_for_target"]), (None, None))   # one seed, no spread
         text = status.render(status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0},
-                                           "speed": {"cases": {}}}, protocol))
+                                           "speed": speed_part({})}, protocol))
         self.assertIn("standard error unmeasured (each case measured at one seed)", text)
         fixed = Engine()
         found = speed.run_sampled_speed(fixed, {"max_context": 1000}, prepared, protocol, 1, 2, lambda m: None)
@@ -1897,7 +2049,7 @@ class SampledSpeedTests(unittest.TestCase):
         even = Engine(uneven=False)
         speed.run_sampled_speed(even, {"max_context": 1000}, prepared, protocol, 1, None, lambda m: None, adaptive=True)
         self.assertEqual(even.seeds, [0, 1, 2])   # within the target once a second seed gives it an error
-        current = status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0}, "speed": {"cases": {}}},
+        current = status.build({**MEASURED, "sampled_speed": {**found, "decode_score": 1.0}, "speed": speed_part({})},
                                protocol)
         text = status.render(current)
         self.assertIn(f"repeated until each case's error reached {rule['target_se']:.0%} or {rule['max_repetitions']} "
@@ -1926,7 +2078,7 @@ class SampledSpeedTests(unittest.TestCase):
             cli.main(["run", "--adapter", "a.py", "--model", "m", "--data", "d", "--out", "o", "--adaptive-sampled"])
             self.assertTrue(parsed["adaptive_sampled"])
         # A sampled decode repeated adaptively compares only with one repeated the same way.
-        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": CURRENT_PROTOCOL,
+        now = {"model_sha256": "m", "suite_sha256": "s", "protocol": CURRENT_PROTOCOL, "requirements": {"quality_mode": "speed"},
                "sampled_speed": {"status": "measured", "decode_score": 110.0, "sampling": {"temperature": 1.0},
                                  "adaptive": {"target_se": 0.03, "max_repetitions": 9}}}
         before = copy.deepcopy(now)
@@ -1993,6 +2145,23 @@ class SampledSpeedTests(unittest.TestCase):
             self.assertIsNone(status.changes(result, default)["decode_score"])
 
 
+class RunFolderAdapterTests(unittest.TestCase):
+    def test_an_adapter_inside_a_crit_run_folder_is_refused(self):
+        from crit_eval import cli
+        with tempfile.TemporaryDirectory() as directory:
+            run = Path(directory) / "run-1"
+            (run / "candidates" / "c1" / "source").mkdir(parents=True)
+            (run / "run.json").write_text("{}", encoding="utf-8")
+            adapter = run / "candidates" / "c1" / "source" / "engine.py"
+            adapter.write_text("", encoding="utf-8")
+            with self.assertRaisesRegex(SystemExit, "inside the crit run folder .*--package DIR"):
+                cli.refuse_run_adapter(str(adapter), "--adapter")
+            outside = Path(directory) / "engine.py"
+            outside.write_text("", encoding="utf-8")
+            cli.refuse_run_adapter(str(outside), "--adapter")   # an engine outside crit keeps --adapter
+            cli.refuse_run_adapter(None, "--adapter")
+
+
 class StatusTests(unittest.TestCase):
     def run_mock(self, directory, device, **config):
         data = Path(directory)
@@ -2017,7 +2186,7 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(gates, {"coverage": "pass", "repeatable": "pass", "request_history": "pass",
                                      "prompt_cache": "unmeasured", "quality": "unmeasured", "sampling": "unmeasured",
                                  "capacity": "unmeasured", "retrieval": "unmeasured", "lower_context": "unmeasured",
-                                 "generality": "unmeasured"})
+                                 "concurrency": "unmeasured", "generality": "unmeasured"})
             self.assertIn("exactness reported: 2/2 cases equal plain greedy", current["notes"])
             self.assertIsNotNone(status.headline_decode(current["kpis"])["speed_of_light"])
             self.assertIsNotNone(current["kpis"]["ttft"]["fraction_of_floor"])
@@ -2093,9 +2262,10 @@ class StatusTests(unittest.TestCase):
             budget = {"ppl_ratio_max": 1.5, "kld_mean_max": 1.0, "kld_p99_max": 10.0}
             result = run_full(MOCK, "unused-model", data, data / "result.json", config, warmups=0, repetitions=2,
                                 log=lambda message: None, quality_budget=budget, exactness="required")
-            # crit eval reference judges the quality sets by the run's budget (QualityTests).
+            # crit eval reference judges the quality sets by the run's budget (QualityTests); a run that names no
+            # quality mode judges in speed.
             self.assertEqual(result["requirements"], {"quality_budget": budget, "exactness": "required",
-                                                      "quality_mode": "preserve"})
+                                                      "quality_mode": "speed"})
             gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
             self.assertEqual(gates["exactness"], "pass")
             with self.assertRaises(SystemExit):
@@ -2159,11 +2329,11 @@ class StatusTests(unittest.TestCase):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         exact = {"cases": {"a": {"identical": False, "first_difference": 7}}}
         base = {**MEASURED, "engine": {"speculative": True},
-                "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
+                "speed": speed_part({"a": {}})}
         reported = status.build({**base, "exactness": {**exact, "mode": "reported"}}, protocol)
         self.assertNotIn("exactness", [g["name"] for g in reported["gates"]])
         self.assertIn("a differs at token 7; the quality budget judges the output", reported["notes"][0])
-        required = status.build({**base, "requirements": {"exactness": "required"},
+        required = status.build({**base, "requirements": {"exactness": "required", "quality_mode": "preserve"},
                                  "exactness": {**exact, "mode": "required"}}, protocol)
         self.assertEqual({g["name"]: g["state"] for g in required["gates"]}["exactness"], "fail")
 
@@ -2182,10 +2352,10 @@ class StatusTests(unittest.TestCase):
         room = {"projection": {"ceiling_score": 250.0, "fraction_of_ceiling": 0.88},
                 "prefill": {"score": 5000.0, "ceiling_score": 14000.0, "fraction_of_ceiling": 5 / 14, "cases": {}},
                 "ttft": {"score_ms": 300.0, "floor_ms": 200.0, "fraction_of_floor": 2 / 3, "cases": {}},
-                "gaps": [{"kpi": "prefill", "name": "prefill", "projected_gain": 1.8, "end_to_end_gain": 0.14}],
+                "gaps": [{"kpi": "prefill", "name": "prefill", "projected_gain": 1.8}],
                 "missing": []}
         result = {**MEASURED, "engine": {"speculative": False}, "headroom": room,
-                  "speed": {"decode_score": 220.0, "complete": True, "cases": {"a": {"status": "measured", "repeatable": True}}}}
+                  "speed": speed_part({"a": {}}, decode_score=220.0, complete=True)}
         current = status.build(result, protocol)
         changes = {goal["kpi"]: round(goal["change"], 3) for goal in current["goals"]}
         self.assertEqual(changes, {"decode": round(250 / 220 - 1, 3), "prefill": 1.8, "ttft": round(200 / 300 - 1, 3)})
@@ -2219,8 +2389,7 @@ class StatusTests(unittest.TestCase):
                     "context": {"decode": {"score": 100.0}, "ttft": {"score_ms": context_ttft}}}
             return {**MEASURED, "engine": {"speculative": False}, "headroom": room,
                     "context": {"tokens": 4096, "decode_text": {"source": "generated"}},
-                    "speed": {"decode_score": 90.0, "ttft_score_ms": 10.0, "complete": True,
-                              "cases": {"a": {"status": "measured", "repeatable": True}}}}
+                    "speed": speed_part({"a": {}}, decode_score=90.0, ttft_score_ms=10.0, complete=True)}
         current = status.build(result(1020.0, 1000.0), protocol, result(1000.0, 1300.0))
         self.assertEqual(current["kpis"]["prefill"]["noise"], 0.05)
         self.assertEqual(current["gaps"][0]["noise"], 0.05)
@@ -2236,19 +2405,17 @@ class StatusTests(unittest.TestCase):
                 "projection": {"ceiling_score": 100.0, "fraction_of_ceiling": 0.9, "speed_of_light_score": 95.0},
                 "prefill": {"score": 800.0, "ceiling_score": 1000.0, "fraction_of_ceiling": 0.8, "cases": {}},
                 "ttft": {"score_ms": 100.0, "floor_ms": 80.0, "fraction_of_floor": 0.8, "cases": {}},
-                "levers": [{"kpi": "decode", "name": "old", "projected_gain": 0.1, "polished_kpi": True}], "missing": []}
+                "gaps": [{"kpi": "decode", "name": "a term", "projected_gain": 0.1}], "missing": []}
         quality = {"status": "scored", "passed": True, "sets": {"conversations": {
             "passed": True, "failures": [], "kld_mean": 1e-5, "kld_p99": 1e-4, "ppl_ratio": 1.0, "top1_agreement": 1.0}}}
         result = {**MEASURED, "engine": {"speculative": False}, "headroom": room, "quality": quality,
-                  "speed": {"decode_score": 90.0, "complete": True, "cases": {"a": {"status": "measured", "repeatable": True}}}}
+                  "speed": speed_part({"a": {}}, decode_score=90.0, complete=True)}
         current = status.build(result, protocol)
-        self.assertFalse({"verdict", "meaning", "next", "levers"} & set(current))
-        self.assertEqual(current["gaps"], [{"kpi": "decode", "name": "old", "projected_gain": 0.1,
-                                            "noise": None}])  # older results
+        self.assertFalse({"verdict", "meaning", "next"} & set(current))
+        self.assertEqual(current["gaps"], [{"kpi": "decode", "name": "a term", "projected_gain": 0.1, "noise": None}])
         text = status.render(current)
         self.assertIn("decode   90.0 tok/s, 90% of its ceiling 100.0", text)
         self.assertIn("prefill  800 tok/s, 80% of its compute ceiling 1,000", text)
-        self.assertNotIn("polished", text)
         self.assertNotIn("next step", text)
         self.assertEqual(current["stop_record_headroom"]["kpis"][0], {"kpi": "decode", "start": None, "reached": 90.0,
                                                                       "limit": 100.0, "built": "", "cause": ""})
@@ -2285,6 +2452,8 @@ class StatusTests(unittest.TestCase):
             # Two repetitions, a third when the mock's timings happened to disagree (protocol speed.extra_repetition).
             self.assertIn(len(speed["cases"]["short"]["samples"]), (2, 3))
             self.assertTrue(speed["cases"]["short"]["repeatable"])
+            # The prompt's first request is the first free generation, before the replays.
+            self.assertTrue(speed["cases"]["short"]["first_request"]["decode_tps"])
             self.assertIn(f"decode measured on the pinned continuation {pinned['sha256'][:12]}", result["status"]["notes"])
             free = run_full(MOCK, "unused-model", data, data / "free.json", {**config, "replay": False}, warmups=0,
                               repetitions=1, log=lambda message: None, parts=("speed",))
@@ -2484,6 +2653,14 @@ class ContextTests(unittest.TestCase):
             self.assertIn("even routing is the pessimistic case", context.render_placement(found))
             self.assertEqual(found["expert_cache_bytes"], expert)
             self.assertIn("misses computed on the CPU", context.render_placement(found))
+            # With the probe's CPU expert lane, the CPU prices misses at the lane's rate (here below the read rate),
+            # and the split at the lane and the link measured together.
+            lane = {"tokens_1": 20, "tokens_3": 15, "tokens_8": 9, "with_link_cpu": 12, "with_link_link": 22}
+            laned = context.placement(model, {**device, "host_expert_gbs": lane}, context.GIB, ram, settings, 8192)
+            floors = laned["plain_pass_floor_ms"]
+            self.assertAlmostEqual(floors["cpu"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 20e6))
+            self.assertAlmostEqual(floors["split"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 34e6))
+            self.assertIn("CPU expert lane (integer block rows): 20 / 15 / 9 GB/s", context.render_placement(laned))
             self.assertTrue(found["host_holds_every_expert"])
             self.assertNotIn("static split", context.render_placement(found))
             # Host memory that holds the experts but not the tables puts the tables on disk; less, the experts too.
@@ -2509,6 +2686,30 @@ class ContextTests(unittest.TestCase):
             tight["host_memory_total_bytes"] = ram + RESIDENT
             self.assertEqual(context.placement(model, tight, context.GIB, ram, settings, 8192)["scenario"], "beyond_host")
             self.assertIsNone(context.placement(model, {}, context.GIB, ram, settings, 8192))
+
+    def test_an_engine_opened_at_the_requirement_prices_resident_weights_by_its_footprint(self):
+        from crit_eval.limits import tiers
+        with tempfile.TemporaryDirectory() as directory:
+            model = safetensors_model(directory, SHAPES, DENSE)
+            ram, kv = 2 * context.GIB, 32 * 8192
+            settings = {**self.settings, "reserve_gib": 1}
+            # The margins (1 GiB headroom and a 1 GiB reserve) leave the resident weights 1,000 bytes short beside
+            # the 8,192-token KV cache: priced as read from host memory on every pass.
+            device = {"bandwidth_gbs": 1000, "memory_free_bytes": 2 * context.GIB + RESIDENT + kv - 1000,
+                      "host_memory_total_bytes": ram + 10 ** 9, "host_memory_gbs": {"read": 50}}
+            found = context.placement(model, device, context.GIB, ram, settings, 8192)
+            self.assertEqual((found["resident_basis"], found["bytes"]["resident_off_device"]), ("margins", 1000))
+            self.assertIsNotNone(tiers.derive(found))
+            # The engine opened at the requirement holds every weight beside its cache: nothing to price off the device.
+            held = context.placement(model, device, context.GIB, ram, settings, 8192, held_bytes=RESIDENT + kv + 4096)
+            self.assertEqual((held["resident_basis"], held["bytes"]["resident_off_device"]), ("measured", 0))
+            self.assertIsNone(tiers.derive(held))
+            self.assertIn("resident weights all on the device", context.render_placement(held))
+            # A footprint that cannot hold them beside its own cache (33 bytes a token) prices the rest.
+            short = context.placement(model, device, context.GIB, ram, settings, 8192, held_bytes=RESIDENT + kv,
+                                      kv_bytes_per_token=33)
+            self.assertEqual(short["bytes"]["resident_off_device"], 8192)
+            self.assertIn("GB the engine holds", context.render_placement(short))
 
     def test_the_expert_cache_gets_the_reserve_prompt_buffers_borrow_from_it(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2673,6 +2874,24 @@ class ContextTests(unittest.TestCase):
         row = long_context.compare_lower(at_max, {"cases": {"code": no_timing}}, 65536, self.settings)["cases"]["code"]
         self.assertEqual(status._ttft_split(row), "")
 
+    def test_the_first_token_is_judged_on_the_engines_own_time_where_it_reports_one(self):
+        # A reopened server's cold caches add time outside the engine; the engine was as fast at both contexts.
+        def case(ttft, engine):
+            return {"status": "measured", "decode_tps": 100.0, "ttft_ms": ttft,
+                    "samples": [{"warmup": False, "decode_tps": 100.0, "ttft_ms": ttft, "prefill_ms": engine}] * 2}
+        at_max = {"cases": {"chat": case(31.3, 27.2)}}
+        out = long_context.compare_lower(at_max, {"cases": {"chat": case(37.5, 27.3)}}, 49152, self.settings)
+        row = out["cases"]["chat"]
+        self.assertGreater(row["ttft_change"], 0.19)
+        self.assertEqual(row["ttft_judged"], "engine")
+        self.assertAlmostEqual(row["engine_ttft_change"], 27.3 / 27.2 - 1)
+        self.assertTrue(out["passed"])
+        out = long_context.compare_lower(at_max, {"cases": {"chat": case(37.5, 30.1)}}, 49152, self.settings)
+        self.assertEqual(out["slower"], {"chat": ["ttft"]})   # 10.7% later in the engine itself
+        no_timing = {"status": "measured", "decode_tps": 100.0, "ttft_ms": 37.5, "samples": []}
+        out = long_context.compare_lower(at_max, {"cases": {"chat": no_timing}}, 49152, self.settings)
+        self.assertEqual((out["cases"]["chat"]["ttft_judged"], out["slower"]), ("whole", {"chat": ["ttft"]}))
+
     def run_mock(self, directory, context_tokens, model="unused-model", device=None, **config):
         data = Path(directory)
         fixture(data)
@@ -2733,6 +2952,25 @@ class ContextTests(unittest.TestCase):
         with patch.object(host, "_nvidia_smi", return_value=None):
             self.assertIsNone(host.device_memory())
 
+    def test_the_engine_processs_own_free_memory_wins_where_it_is_smaller(self):
+        # Under the Windows display driver nvidia-smi counts only resident memory: a served engine that still holds
+        # untouched allocations reads as freer there than its own process can allocate.
+        row = {"index": 0, "free_bytes": 1_040_000_000, "used_bytes": 33_150_000_000, "total_bytes": 34_190_000_000}
+
+        class Served:
+            def __init__(self, free):
+                self.free = free
+
+            def device_free_bytes(self):
+                return self.free
+        found = host.with_engine_reading(row, Served(310_000_000))
+        self.assertEqual((found["free_bytes"], found["free_bytes_nvidia_smi"], found["free_bytes_engine"]),
+                         (310_000_000, 1_040_000_000, 310_000_000))
+        self.assertEqual(host.with_engine_reading(row, Served(2_000_000_000))["free_bytes"], 1_040_000_000)
+        self.assertEqual(host.with_engine_reading(row, Served(None)), row)
+        self.assertEqual(host.with_engine_reading(row, object()), row)   # an adapter reports none
+        self.assertIsNone(host.with_engine_reading(None, Served(1)))
+
     def test_context_gates_fail_when_the_engine_cannot_serve_a_context(self):
         with tempfile.TemporaryDirectory() as directory:
             failing = self.run_mock(directory, 8192, fails_above_context=4096)
@@ -2788,7 +3026,7 @@ class ContextTests(unittest.TestCase):
 
     def test_long_context_scores_compare_only_at_the_same_required_context(self):
         def result(tokens, score):
-            return {"model_sha256": "m", "suite_sha256": "s", "context": {"tokens": tokens},
+            return {"model_sha256": "m", "suite_sha256": "s", "context": {"tokens": tokens}, "requirements": {"quality_mode": "speed"},
                     "headroom": {"context": {"decode": {"score": score}, "ttft": {"score_ms": 1000.0}}}}
         self.assertAlmostEqual(status.changes(result(8192, 110.0), result(8192, 100.0))["context_decode"], 0.1)
         self.assertIsNone(status.changes(result(8192, 110.0), result(4096, 100.0))["context_decode"])
@@ -2836,9 +3074,10 @@ class ContextTextTests(unittest.TestCase):
 
     def test_context_decode_compares_only_on_the_same_text(self):
         pinned = {"context": {"tokens": 32, "decode_text": {"source": "pinned", "sha256": "ab" * 32}}}
-        own = {"context": {"tokens": 32}}
+        own = {"context": {"tokens": 32, "decode_text": {"source": "generated", "reason": "no pinned continuation"}}}
         self.assertEqual(status.context_text_identity(pinned), "ab" * 32)
         self.assertEqual(status.context_text_identity(own), "generated")
+        self.assertIsNone(status.context_text_identity({"context": {"tokens": 32}}))   # the curve did not run
 
 
 class QualityTests(unittest.TestCase):
@@ -2863,14 +3102,15 @@ class QualityTests(unittest.TestCase):
             def score(self, prompt, continuation, top_k, prompt_rows=True):
                 scored.append((list(prompt), list(continuation), prompt_rows))
                 return {"continuation": [{"logprob": -0.5, "top": [[5, -0.5]]}] * len(continuation)}
-        found = quality_checks.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {})
+        found = quality_checks.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {},
+                                           mode="preserve")
         # The conversations only: a long text's reply would prefill its prompt twice more for the same path.
         self.assertEqual([r["id"] for r in found["replies"]], ["tides", "letter"])
         self.assertEqual(len(replied), 2)
         # The long-context curve's reply, served with its log-probabilities already, is scored once and judged alike.
         curve = {"tokens": [5, 5], "logprobs": [-0.5, -0.5], "top": [[[5, -0.5]], [[5, -0.5]]]}
         more = quality_checks.run_honesty(Engine(), {}, {"quality": texts}, protocol, lambda m: None, {}, texts=False,
-                                  extra=[("curve@32768", [9] * 40, curve)])
+                                  extra=[("curve@32768", [9] * 40, curve)], mode="preserve")
         self.assertEqual(([r["id"] for r in more["replies"]], len(replied), scored[-1]),
                          (["curve@32768"], 2, ([9] * 40, [5, 5], False)))
         merged = quality_checks.merge_honesty({"honesty": found, "sets": {}, "timing": {}}, more)
@@ -2879,7 +3119,7 @@ class QualityTests(unittest.TestCase):
         more["failures"], more["passed"] = ["curve@32768: differs"], False
         self.assertFalse(quality_checks.merge_honesty({"honesty": found, "sets": {}}, more)["passed"])
 
-    def test_as_quantized_honesty_bounds_paths_that_round_apart(self):
+    def test_speed_honesty_bounds_paths_that_round_apart(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         texts = [{"id": "tides", "set": "conversations", "prompt_ids": [1, 2, 3]}]
 
@@ -2897,11 +3137,11 @@ class QualityTests(unittest.TestCase):
             return quality_checks.run_honesty(engine(shift), {}, {"quality": texts}, protocol, lambda m: None, {},
                                               mode=mode)
         self.assertFalse(check(0.05, "preserve")["passed"])          # 5e-2 > 1e-3
-        rounded = check(0.05, "as_quantized")
+        rounded = check(0.05, "speed")
         self.assertEqual((rounded["passed"], rounded["tolerance"], rounded["mean_tolerance"]), (True, 2.0, 0.1))
         self.assertAlmostEqual(rounded["replies"][0]["mean_abs_logprob_diff"], 0.025)
-        self.assertFalse(check(0.4, "as_quantized")["passed"])       # mean 0.2 over the bound
-        self.assertFalse(check(2.5, "as_quantized")["passed"])       # one position past 2 nats
+        self.assertFalse(check(0.4, "speed")["passed"])       # mean 0.2 over the bound
+        self.assertFalse(check(2.5, "speed")["passed"])       # one position past 2 nats
 
     def lp(self, token):
         return self.LP[self.TOP.index(token)] if token in self.TOP else self.LP[3]
@@ -2951,9 +3191,9 @@ class QualityTests(unittest.TestCase):
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
         quality = quality_checks.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
-                                     lambda message: None, self.reference(texts), thresholds, spread)
+                                     lambda message: None, self.reference(texts), thresholds, spread, mode="preserve")
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
-                  "protocol": protocol["protocol"], "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}}}
+                  "protocol": protocol["protocol"], "speed": speed_part({"a": {}})}
         return result, status.build(result, protocol)
 
     def gate(self, current):
@@ -3070,7 +3310,7 @@ class QualityTests(unittest.TestCase):
         self.assertIn(f"all exact conversations/served {base:+.0%} (0% with it exact), "
                       f"conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact); half", text)
         missing = quality_checks.run_attribution(None, None, {}, {}, runner.load_json(runner.EVAL_DIR / "protocol.json"),
-                                         lambda m: None, None, {}, None, result["quality"], None)
+                                         lambda m: None, None, {}, None, result["quality"], None, mode="preserve")
         self.assertEqual(missing["status"], "unmeasured")
 
     def test_a_set_far_over_the_budget_stops_the_scoring(self):
@@ -3126,13 +3366,13 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("judged against the reference's own spread: long-600/prompt", self.gate(current)["detail"])
 
-    def test_as_quantized_judges_every_set_by_its_own_budget(self):
-        # protocol quality.mode_thresholds: a drift preserve's budget fails passes as_quantized's, whatever the
+    def test_speed_judges_every_set_by_its_own_budget(self):
+        # protocol quality.mode_thresholds: a drift preserve's budget fails passes speed's, whatever the
         # checkpoint's own quantization drift (the allowance is reported by the reference, not judged).
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         failing = self.measure(self.Engine(self, drift_from=520, shift=0.6))[0]["quality"]["sets"]["long-600/served"]
         self.assertFalse(failing["passed"])
-        budget = quality_checks.quality_thresholds(protocol, mode="as_quantized")
+        budget = quality_checks.quality_thresholds(protocol, mode="speed")
         result, current = self.measure(self.Engine(self, drift_from=520, shift=0.6), thresholds=budget)
         sets = result["quality"]["sets"]
         self.assertTrue(all(s["passed"] for s in sets.values()))
@@ -3161,27 +3401,45 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(prompt["passed"])
         self.assertIn("ppl_ratio_max", result["quality"]["sets"]["long-600/served"]["limits"])
 
-    def test_a_stored_result_is_judged_again_by_todays_rules(self):
-        # A result measured when prompt positions were judged on their perplexity ratio: its status today drops it.
+    def test_every_line_says_a_prompt_ratio_over_the_budget_is_reported_not_judged(self):
+        # A prompt set's PPL over the budget's limit (x1.10 against preserve's x1.05, say) is no pass and no failure,
+        # in either mode: the log, the status line and crit eval compare say it is reported; served sets judge it.
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
-        limits = {"ppl_ratio_max": 1.05, "kld_mean_max": 0.05, "kld_p99_max": 0.5}
-        prompt = {"ppl_ratio": 1.24, "kld_mean": 0.01, "kld_p99": 0.2, "passed": False, "limits": limits,
-                  "failures": ["ppl_ratio 1.24 > 1.05"], "budget_used": 4.8}
-        served = {"ppl_ratio": 0.99, "kld_mean": 0.01, "kld_p99": 0.1, "passed": True, "limits": limits, "failures": [],
-                  "budget_used": 0.2}
-        quality = {"status": "scored", "passed": False, "sets": {"long-600/prompt": prompt, "long-600/served": served},
-                   "honesty": {"passed": True, "max_abs_logprob_diff": 0.0}}
-        again = status._rejudged(quality, protocol)
-        self.assertTrue(again["passed"])
-        self.assertEqual(again["sets"]["long-600/prompt"]["rejudged"], protocol["protocol"])
-        self.assertNotIn("ppl_ratio_max", again["sets"]["long-600/prompt"]["limits"])
-        self.assertNotIn("rejudged", again["sets"]["long-600/served"])
-        gate = status._quality_gate({"quality": again})
-        self.assertEqual(gate["state"], "pass")
-        self.assertIn("judged again by " + protocol["protocol"] + ": long-600/prompt", gate["detail"])
-        # Over the KLD limits it still fails.
-        worse = {**quality, "sets": {**quality["sets"], "long-600/prompt": {**prompt, "kld_mean": 0.2}}}
-        self.assertFalse(status._rejudged(worse, protocol)["passed"])
+        texts = self.texts()
+        spread = {"long-600/prompt": {"kld_mean": 5.0, "kld_p99": 20.0, "ppl_ratio": 1.0}}
+        for mode in ("preserve", "speed"):
+            with self.subTest(mode=mode):
+                thresholds = quality_checks.quality_thresholds(protocol, mode=mode)
+                lines = []
+                quality = quality_checks.run_quality(
+                    self.Engine(self, drift_from=520, shift=2.0 if mode == "preserve" else 8.0, prompt_only=True),
+                    {"max_context": 2048, "served": True}, {"quality": texts}, protocol, lines.append,
+                    self.reference(texts), thresholds, spread, mode=mode)
+                prompt = quality["sets"]["long-600/prompt"]
+                self.assertGreater(prompt["ppl_ratio"], thresholds["ppl_ratio_max"])
+                self.assertTrue(prompt["passed"])
+                line = next(line for line in lines if line.startswith("quality long-600/prompt: KLD"))
+                self.assertIn(f"PPL x{prompt['ppl_ratio']:.4f} (reported, not judged: protocol "
+                              "quality.prompt_perplexity)", line)
+                served = next(line for line in lines if line.startswith("quality long-600/served: KLD"))
+                self.assertNotIn("reported, not judged", served)
+                result = {**MEASURED, "requirements": {**MEASURED["requirements"], "quality_mode": mode},
+                          "engine": {"speculative": False}, "quality": quality, "model_sha256": "m",
+                          "suite_sha256": "s", "protocol": protocol["protocol"], "speed": speed_part({"a": {}})}
+                text = status.render(status.build(result, protocol))
+                worst = status.build(result, protocol)["kpis"]["perplexity"]
+                self.assertTrue(worst["worst_set"].endswith("/served"))
+                self.assertIn(f"PPL ×{worst['worst_ratio']:.4f} ({worst['worst_set']}, limit "
+                              f"{thresholds['ppl_ratio_max']}; the prompt positions' PPL is reported, not judged)", text)
+                with tempfile.TemporaryDirectory() as directory:
+                    path = Path(directory) / "result.json"
+                    row = {**result, "label": "x", "engine": {"name": "e", "speculative": False}, "host": {"platform": "p"}}
+                    path.write_text(json.dumps({k: v for k, v in row.items() if k != "speed"}))
+                    table = report.compare([path])
+                row = next(line for line in table.splitlines() if "Quality: long-600/prompt" in line)
+                self.assertIn(f"PPL ×{prompt['ppl_ratio']:.4f} (reported, not judged)", row)
+                self.assertNotIn("reported", next(line for line in table.splitlines()
+                                                  if "Quality: long-600/served" in line))
 
     def test_drift_in_the_decode_path_fails_the_served_positions(self):
         result, _ = self.measure(self.Engine(self, decode_drift=0.4))
@@ -3222,10 +3480,10 @@ class QualityTests(unittest.TestCase):
         texts = self.texts()
         quiet = lambda message: None  # noqa: E731
         missing = quality_checks.run_quality(self.Engine(self), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
-                                     None, {})
+                                     None, {}, mode="preserve")
         self.assertIn("crit eval reference --model --data", missing["reason"])
         adapter = quality_checks.run_quality(object(), {"max_context": 1000}, {"quality": texts}, protocol, quiet,
-                                     self.reference(texts), {})
+                                     self.reference(texts), {}, mode="preserve")
         self.assertEqual(adapter["status"], "unsupported")
         base = {**MEASURED, "engine": {"speculative": False}}
         for quality in (missing, adapter):
@@ -3237,7 +3495,8 @@ class QualityTests(unittest.TestCase):
     def test_a_baseline_compares_within_its_data_suite_and_major_version_only(self):
         now, _ = self.measure(self.Engine(self))
         now["speed"]["decode_score"] = 110.0
-        before = {"model_sha256": "m", "suite_sha256": "s", "protocol": now["protocol"], "speed": {"decode_score": 100.0},
+        before = {"model_sha256": "m", "suite_sha256": "s", "protocol": now["protocol"],
+                  "requirements": {"quality_mode": "preserve"}, "speed": speed_part({}, decode_score=100.0),
                   "quality": {"sets": {"conversations/served": {"kld_mean": 0.01}}}}
         compared = status.changes(now, before)
         self.assertTrue(compared["comparable"])
@@ -3246,6 +3505,24 @@ class QualityTests(unittest.TestCase):
                          {"comparable": False, "reason": "measured with crit-eval-v5"})
         for other in (dict(before, suite_sha256="older suite"), dict(before, model_sha256="other")):
             self.assertFalse(status.changes(now, other)["comparable"])
+        # A baseline judged in the other quality mode does not compare: no KPI deltas, no generality gate against it,
+        # no stop record headroom from it. One that states no mode is refused, as every reader refuses it.
+        speed = dict(before, requirements={"quality_mode": "speed"})
+        self.assertEqual(status.changes(now, speed),
+                         {"comparable": False, "reason": "judged in quality mode speed, this result in preserve"})
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        built = status.build(now, protocol, baseline=speed)
+        self.assertEqual(built["baseline"], {"comparable": False,
+                                             "reason": "judged in quality mode speed, this result in preserve"})
+        starts = lambda found: [row["start"] for row in found["stop_record_headroom"]["kpis"]]  # noqa: E731
+        self.assertTrue(any(starts(status.build(now, protocol, baseline=before))))
+        self.assertFalse(any(starts(built)))
+        held = {"status": "measured", "decode_score": 50.0, "prompts": {"p": {}}}
+        gate = status._generality_gate(dict(now, heldout=held), protocol, dict(speed, heldout=held))
+        self.assertEqual([(g["state"], g["detail"]) for g in gate], [
+            ("unmeasured", "baseline not comparable: judged in quality mode speed, this result in preserve")])
+        with self.assertRaisesRegex(ValueError, "quality_mode is None"):
+            status.changes(now, dict(before, requirements={}))
 
     def test_compare_shows_every_set_and_path(self):
         result, current = self.measure(self.Engine(self))
@@ -3365,9 +3642,10 @@ class LongPromptTests(unittest.TestCase):
     def test_gates_of_parts_not_run_are_unmeasured(self):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         result = {"protocol": protocol["protocol"], "engine": {"speculative": False},
-                  "requirements": {"exactness": "reported"},
-                  "speed": {"cases": {"a": {"status": "measured", "repeatable": True}}},
-                  "context": {"tokens": 8192, "points": {"8192": {"status": "measured"}}}}
+                  "requirements": {"exactness": "reported", "quality_mode": "preserve"},
+                  "speed": speed_part({"a": {}}),
+                  "context": {"tokens": 8192, "points": {"8192": {"status": "measured"}},
+                              "decode_text": {"source": "generated", "reason": "a fixture"}}}
         gates = {g["name"]: g["state"] for g in status.build(result, protocol)["gates"]}
         self.assertEqual((gates["request_history"], gates["retrieval"]), ("unmeasured", "unmeasured"))
 
@@ -3489,9 +3767,65 @@ class ReferenceTests(unittest.TestCase):
         self.assertTrue(torch.equal(eager[1], chunked[1]))
         self.assertLess(float((eager[0] - chunked[0]).abs().max()), 1e-5)
 
+    def test_cpu_layers_keep_the_torch_functions_a_package_kernel_would_take(self):
+        # transformers swaps a modeling function for an installed package's device kernel (its hub_kernels
+        # integration, fla's Triton kernels for a gated delta rule) whatever the tensors' device: the reference sends
+        # CPU tensors to the modeling code's torch function and any other device's to the kernel, once per process.
+        import sys
+        import types
+        import torch
+        from crit_eval.quality import reference
+        name = "transformers.models.crit_eval_test_kernels"
+        module = types.ModuleType(name)
+        scope = {}
+        exec(compile("import functools\n"
+                     "def decorate(torch_function, kernel):\n"
+                     "    @functools.wraps(torch_function)\n"
+                     "    def wrapped(*args, **kwargs):\n"
+                     "        return kernel(*args, **kwargs)\n"
+                     "    return wrapped\n", "/site/transformers/integrations/hub_kernels.py", "exec"), scope)
+        calls = []
+
+        def torch_rule(x, scale=1.0):
+            calls.append("torch")
+            return x * scale
+
+        def kernel(x, scale=1.0, cu_seqlens=None):
+            calls.append("kernel")
+            return x
+        torch_rule.__module__ = name
+        module.rule, module.plain = scope["decorate"](torch_rule, kernel), torch_rule
+        layer = type("Layer", (torch.nn.Module,), {"__module__": name})()
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name)
+        self.assertEqual(reference.torch_paths_on_cpu(layer), [f"{name}.rule"])
+        self.assertIs(module.plain, torch_rule)   # a function no package kernel wraps stays
+        # A keyword only the kernel takes is left out of the torch call.
+        self.assertTrue(torch.equal(module.rule(torch.ones(2), scale=2.0, cu_seqlens=None), torch.full((2,), 2.0)))
+        module.rule(torch.ones(2, device="meta"))
+        module.rule(torch.ones(2, device="meta"), scale=torch.ones(1))   # the first tensor argument's device decides
+        self.assertEqual(calls, ["torch", "kernel", "kernel"])
+        self.assertEqual(reference.torch_paths_on_cpu(layer), [])
+        # transformers' own: a hybrid model's gated delta rule runs on the CPU with fla installed or not.
+        if importlib.util.find_spec("transformers.models.qwen3_next"):
+            from transformers.models.qwen3_next import modeling_qwen3_next
+            hybrid = dict(self.tiny_models())["hybrid"]
+            self.assertTrue(getattr(modeling_qwen3_next.torch_chunk_gated_delta_rule, "_crit_cpu_dispatch", False))
+            with torch.no_grad():
+                logits = hybrid.float().eval()(torch.tensor([[3, 5, 7, 9] * 20]), use_cache=False).logits
+            self.assertTrue(bool(torch.isfinite(logits).all()))
+
     def tiny_models(self):
         """(name, model) for a Llama-style model and, where transformers has it, a hybrid one whose cache keeps
-        linear-attention conv and recurrent states beside the full-attention layer's keys and values."""
+        linear-attention conv and recurrent states beside the full-attention layer's keys and values. Each runs its
+        CPU forward on the modeling code's torch functions, as the reference does (reference.torch_paths_on_cpu): with a
+        package's device kernels installed (fla) transformers would send it CPU tensors."""
+        for name, model in self._tiny_models():
+            from crit_eval.quality import reference
+            reference.torch_paths_on_cpu(model)
+            yield name, model
+
+    def _tiny_models(self):
         import torch
         from transformers import Qwen3Config, Qwen3ForCausalLM
         torch.manual_seed(0)
@@ -3538,6 +3872,8 @@ class ReferenceTests(unittest.TestCase):
             with torch.no_grad():
                 for param in model.parameters():
                     param.add_(torch.randn_like(param) * 0.05)
+            from crit_eval.quality import reference
+            reference.torch_paths_on_cpu(model)
             yield "qwen4_exp", model
 
     def score_texts(self, folder, texts, **patches):
@@ -4080,6 +4416,7 @@ class ReferenceTests(unittest.TestCase):
         config._attn_implementation = "eager"
         config._experts_implementation = "eager"
         model = Qwen4ExpForCausalLM(config).float().eval()
+        reference.torch_paths_on_cpu(model)   # its CPU forward on the torch functions, as the reference's
         tensors = {}
         with torch.no_grad():
             for name, param in model.named_parameters():

@@ -4,14 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.5.3"
+version = "0.6.0"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
+# crit-core 0.17.0 on: --package measures a crit engine package through Core's eval-v1 adapter, which it ships.
 # No upper bound: crit pins the crit-eval it ships with, so a new crit-core release needs no crit-eval release.
-dependencies = ["crit-core>=0.12.0"]
+dependencies = ["crit-core>=0.17.0"]
 
 [project.optional-dependencies]
 # The reference scores the quality texts on the checkpoint itself (crit-eval reference).

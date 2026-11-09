@@ -3,12 +3,13 @@ crit_eval.limits.schemes. For each, the reference decodes the stored weights to 
 library produces, the model scores exactly as transformers scores its dequantized twin, and the ceiling counts the
 same matrices as the unquantized model at the scheme's rate.
 
-The fixtures are tiny models written on the CPU by each format's own tool: GPTQModel (GPTQ, AWQ), mlx-lm,
-bitsandbytes through transformers, llm-compressor (compressed-tensors), and Optimum with onnxruntime's MatMulNBits
-quantizer (ONNX). A test is skipped when its tool is not
-installed; they need torch, transformers, safetensors and tokenizers."""
+The fixtures are tiny models written on the CPU by each format's own tool: GPTQModel (GPTQ, AWQ), MLX's converter
+(the Python module CRIT_MLX_CONVERTER names, run as `python -m MODULE convert`), bitsandbytes through transformers,
+llm-compressor (compressed-tensors), and Optimum with onnxruntime's MatMulNBits quantizer (ONNX). A test is skipped
+when its tool is not installed; they need torch, transformers, safetensors and tokenizers."""
 import importlib.util
 import json
+import os
 from pathlib import Path
 import shutil
 import sys
@@ -25,6 +26,7 @@ def _has(*names):
 
 
 HAS_REFERENCE = _has("torch", "transformers", "safetensors", "tokenizers")
+MLX_CONVERTER = os.environ.get("CRIT_MLX_CONVERTER")   # the Python module of MLX's converter
 CALIBRATION = ["the quick brown fox jumps over the lazy dog " * 8] * 16
 
 
@@ -262,7 +264,8 @@ class FormatTests(unittest.TestCase):
         self.assert_scores_like_dequantized(folder)
         self.assert_counted_like(folder, self.small, "bf16")
 
-    @unittest.skipUnless(_has("mlx", "mlx_lm", "numpy"), "needs mlx and mlx-lm")
+    @unittest.skipUnless(MLX_CONVERTER and _has("mlx", "numpy", MLX_CONVERTER),
+                         "needs mlx and CRIT_MLX_CONVERTER (the Python module of MLX's converter)")
     def test_mlx(self):
         import subprocess
         import mlx.core as mx
@@ -278,7 +281,7 @@ class FormatTests(unittest.TestCase):
         for name, (options, rate) in cases.items():
             with self.subTest(name):
                 folder = self.root / f"mlx-{name}"
-                subprocess.run([sys.executable, "-m", "mlx_lm", "convert", "--hf-path", str(self.small),
+                subprocess.run([sys.executable, "-m", MLX_CONVERTER, "convert", "--hf-path", str(self.small),
                                 "--mlx-path", str(folder), "-q", *options], check=True, capture_output=True)
                 arrays = mx.load(str(folder / "model.safetensors"))
                 quantization = json.loads((folder / "config.json").read_text())["quantization"]

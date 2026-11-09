@@ -2,7 +2,7 @@
 derived files, and the reference's GGUF layout (crit_eval.architectures.gguf_layout).
 
 The conformance tests convert tiny Hugging Face models with GGUF's reference converter and need a checkout of it
-(CRIT_LLAMA_CPP=/path/to/the/checkout) plus torch, transformers, safetensors, tokenizers and gguf; without them they
+(CRIT_GGUF_TOOLS=/path/to/the/checkout) plus torch, transformers, safetensors, tokenizers and gguf; without them they
 are skipped."""
 import importlib.util
 import json
@@ -23,8 +23,8 @@ from gguf_writer import gguf_bytes  # noqa: E402
 
 HAS_TEXT = all(importlib.util.find_spec(name) for name in ("tokenizers", "jinja2"))
 HAS_LAYOUT = all(importlib.util.find_spec(name) for name in ("torch", "transformers", "gguf", "numpy"))
-LLAMA_CPP = os.environ.get("CRIT_LLAMA_CPP")
-HAS_CONVERTER = HAS_LAYOUT and bool(LLAMA_CPP) and all(
+GGUF_TOOLS = os.environ.get("CRIT_GGUF_TOOLS")
+HAS_CONVERTER = HAS_LAYOUT and bool(GGUF_TOOLS) and all(
     importlib.util.find_spec(name) for name in ("safetensors", "tokenizers"))
 
 CONFIG = {"architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5_text", "hidden_size": 256,
@@ -207,16 +207,16 @@ MROPE = ("mrope_section", "mrope_interleaved")
 # The converter's elementwise transforms (1 + w, -exp(A_log)) round once each way.
 ROUNDED = ("norm.weight", ".A_log")
 CONVERT = """import runpy, sys
-llama = sys.argv[1]
-sys.path[:0] = [llama, llama + "/gguf-py"]
+checkout = sys.argv[1]
+sys.path[:0] = [checkout, checkout + "/gguf-py"]
 import conversion.base as base
 base.TextModel.get_vocab_base_pre = lambda self, tokenizer: "qwen2"   # tiny test vocabularies have no known hash
 sys.argv = ["convert_hf_to_gguf.py"] + sys.argv[2:]
-runpy.run_path(llama + "/convert_hf_to_gguf.py", run_name="__main__")
+runpy.run_path(checkout + "/convert_hf_to_gguf.py", run_name="__main__")
 """
 
 
-@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_LLAMA_CPP (a converter checkout), torch, transformers, safetensors, "
+@unittest.skipUnless(HAS_CONVERTER, "needs CRIT_GGUF_TOOLS (a converter checkout), torch, transformers, safetensors, "
                                     "tokenizers and gguf")
 class GgufConformanceTests(unittest.TestCase):
     """A tiny model of each architecture with LAYOUTS rules, converted by the reference converter to an F32 GGUF, comes
@@ -281,7 +281,7 @@ class GgufConformanceTests(unittest.TestCase):
         folder = self.root / f"gguf-{name}"
         folder.mkdir()
         out = folder / f"{name}-F32.gguf"
-        subprocess.run([sys.executable, str(self.root / "convert.py"), LLAMA_CPP, str(hf), "--outfile",
+        subprocess.run([sys.executable, str(self.root / "convert.py"), GGUF_TOOLS, str(hf), "--outfile",
                         str(out), "--outtype", "f32"], check=True, capture_output=True)
         return out
 

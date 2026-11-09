@@ -45,6 +45,9 @@ class Text(CharacterText):
     def render(self, messages, tools=None, **variables):
         return "".join(f"<{m['role']}>{m['content']}" for m in messages) + "<a>"
 
+    def encode_chat(self, messages, tools=None, **variables):
+        return [ord(c) for c in self.render(messages, tools)]
+
 
 def ids(messages, tools=None):
     return prepare.token_ids(Text(), Text().render(messages, tools))
@@ -98,6 +101,12 @@ class FakeChat(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self.server.headers.append(dict(self.headers))
+        if self.path == "/health":   # crit serve's, at the root beside /v1
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(json.dumps({"status": "ok", "engine": {"engine_loads": 1,
+                                                                     "device_free_bytes": 3 << 30}}).encode())
+            return
         if self.path != "/v1/models":
             return self.send_error(404)
         self.send_response(200)
@@ -122,7 +131,10 @@ class FakeChat(BaseHTTPRequestHandler):
             finish, used = "length", len(reply)
         # A server streaming log-probabilities (server.stream_logprobs): each character's entry rides its delta.
         entries = self.entries(body)[0] if body.get("logprobs") else None
-        usage = {"prompt_tokens": 1000 + len(body["messages"]), "completion_tokens": used, **self.server.usage}
+        # A reply with log-probabilities counts the prompt the server rendered (the honesty check scores after it).
+        rendered = (len(ids(body["messages"])) + self.server.logprobs.get("prompt_offset", 0)
+                    if body.get("logprobs") or self.server.real_usage else 1000 + len(body["messages"]))
+        usage = {"prompt_tokens": rendered, "completion_tokens": used, **self.server.usage}
         # A plain request (crit's decode extension) decodes one token per target pass.
         telemetry = {"tokens_per_round": 1.0} if (body.get("crit") or {}).get("decode") == "plain" else self.server.telemetry
         events = ([{"choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}}]}]
@@ -219,6 +231,7 @@ class ChatServerTests(unittest.TestCase):
         self.server.usage, self.server.streams_usage, self.server.logprobs = {}, True, {}
         self.server.stream_logprobs = False   # answer log-probability requests unstreamed unless a test streams them
         self.server.one_piece, self.server.stream_error, self.server.telemetry = False, None, None
+        self.server.real_usage = False   # True: every reply counts the prompt the server rendered
         self.server.scores, self.server.score_offset, self.server.scored = True, 0.0, []
         self.server.card = {}  # what crit serve adds to a model's card (supported_sampling_parameters, engine_facts)
         self.server.packed = None  # True: scores in the packed format; False: an earlier crit serve refusing it
@@ -237,9 +250,10 @@ class ChatServerTests(unittest.TestCase):
         self.server.shutdown()
         self.server.server_close()
 
-    def run_eval(self, parts, repetitions=2):
+    def run_eval(self, parts, repetitions=2, **options):
         return run_full(None, "unused-model", self.data, self.data / "result.json", parts=parts, warmups=0,
-                          repetitions=repetitions, log=lambda message: None, context_tokens=4096, url=self.url + "/")
+                          repetitions=repetitions, log=lambda message: None, context_tokens=4096, url=self.url + "/",
+                          **options)
 
     def engine(self, served_model=None, context_tokens=4096):
         prepared = json.loads((self.data / "prepared.json").read_text())
@@ -275,6 +289,15 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(agent["tools"], TOOLS)
         call, answer = agent["messages"][1]["tool_calls"][0], agent["messages"][2]
         self.assertEqual((call["function"]["arguments"], answer["tool_call_id"]), ('{"path": "a.py"}', call["id"]))
+
+    def test_the_load_count_and_free_memory_are_read_from_the_servers_root_health(self):
+        # crit serve answers /health beside /v1, not under it: with the API URL ending in /v1 both readings were None.
+        from crit_eval.run import host, tracks
+        engine, _ = self.engine()
+        self.assertEqual(tracks.engine_loads(engine), 1)
+        self.assertEqual(engine.device_free_bytes(), 3 << 30)
+        row = host.with_engine_reading({"index": 0, "free_bytes": 5 << 30, "used_bytes": 1, "total_bytes": 8 << 30}, engine)
+        self.assertEqual(row["free_bytes"], 3 << 30)
 
     def test_tokens_per_round_come_from_crit_serves_telemetry(self):
         self.server.telemetry = {"tokens_per_round": 3.0}
@@ -505,6 +528,48 @@ class ChatServerTests(unittest.TestCase):
         curve = [r for r in self.server.requests if r.get("messages") and r["messages"][-1]["content"].endswith("then summarize.")]
         self.assertEqual([r.get("logprobs") for r in curve], [None])
 
+    def test_a_long_reply_is_scored_after_the_prompt_the_server_rendered(self):
+        # A frame's prompt goes to the server as decoded text, which its template may tokenize to other ids (a merge
+        # across the document's cut): the reply is scored after the model's template applied to the sent messages.
+        engine, _ = self.engine()
+        prompt = [7, 8, 9, 10]
+        shorter = [7, 99]
+
+        class Merging(Text):
+            def encode_chat(self, messages, tools=None, **variables):
+                return list(shorter)
+        engine.text = Merging()
+        self.assertEqual(engine.served_ids(prompt, CURVE, None, {"prompt_tokens": 2}), shorter)
+        self.assertEqual(engine.served_ids(prompt, CURVE, None, {"prompt_tokens": 4}), prompt)
+        with self.assertRaisesRegex(RuntimeError, "rendered the prompt as 3 tokens"):
+            engine.served_ids(prompt, CURVE, None, {"prompt_tokens": 3})
+        frozen = json.loads((self.data / "prepared.json").read_text())["speed"][0]["prompt_ids"]
+        self.assertEqual(engine.served_ids(frozen, CHAT, None, {"prompt_tokens": 1}), frozen)
+
+    def precheck(self, **options):
+        from crit_eval.run import precheck
+        with patch.object(precheck.host, "device_memory", lambda: {"free_bytes": 3 << 30}):
+            return {item["name"]: item for item in precheck.run_precheck(
+                None, "unused-model", self.data, 4096, url=self.url + "/", log=lambda message: None,
+                vram_headroom_bytes=1 << 30, **options)}
+
+    def test_the_precheck_asks_the_gates_that_fail_whole_rounds(self):
+        self.server.stream_logprobs = self.server.real_usage = True
+        items = self.precheck()
+        self.assertEqual(sorted(items), ["precheck_device_memory", "precheck_history", "precheck_honesty",
+                                         "precheck_long_honesty"])   # a server is not opened again: no lower context
+        self.assertEqual({name: item["state"] for name, item in items.items()},
+                         {name: "passed" for name in items})
+        self.assertEqual(items["precheck_long_honesty"]["context"], 4096)
+        # Scores moved off what the server serves fail both honesty items before any Eval round would.
+        self.server.score_offset = 0.5
+        items = self.precheck()
+        self.assertEqual((items["precheck_honesty"]["state"], items["precheck_long_honesty"]["state"]),
+                         ("failed", "failed"))
+        with patch.object(chat.ChatEngine, "generate", side_effect=RuntimeError("boom")):
+            with self.assertRaisesRegex(RuntimeError, "boom"):
+                self.precheck()
+
     def test_quality_scores_the_fixed_texts_through_the_servers_score_call(self):
         self.store()
         result = self.run_eval(("quality",))
@@ -585,15 +650,29 @@ class ChatServerTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "scores no fixed text"):
             engine.score(self.prompt("tides"), [1], 16)
 
+    def test_history_and_repeatability_are_judged_in_either_mode(self):
+        for mode in ("preserve", "speed"):
+            with self.subTest(mode=mode):
+                result = self.run_eval(("speed", "history"), quality_mode=mode)
+                self.assertEqual(result["requirements"]["quality_mode"], mode)
+                self.assertTrue(result["history"]["passed"])
+                gates = {g["name"]: g["state"] for g in result["status"]["gates"]}
+                self.assertEqual((gates["repeatable"], gates["request_history"]), ("pass", "pass"))
+
     def test_a_score_call_off_the_served_replies_fails_the_honesty_check(self):
+        # preserve asks for the same values on both paths (1e-3 nats); speed, the default, bounds them
+        # (quality.honesty.modes: 2 nats per token, 0.1 on a reply's mean), which 0.02 stays within.
         self.store()
         self.server.score_offset = -0.02
-        result = self.run_eval(("quality",))
+        result = self.run_eval(("quality",), quality_mode="preserve")
         honesty = result["quality"]["honesty"]
         self.assertFalse(honesty["passed"])
         self.assertAlmostEqual(honesty["max_abs_logprob_diff"], 0.02)
         gate = next(g for g in result["status"]["gates"] if g["name"] == "quality")
         self.assertEqual(gate["state"], "fail")
+        bounded = self.run_eval(("quality",))
+        self.assertEqual(bounded["requirements"]["quality_mode"], "speed")
+        self.assertTrue(bounded["quality"]["honesty"]["passed"])
 
     def test_a_quality_reply_must_name_every_token_by_its_bytes_with_its_alternatives(self):
         engine, _ = self.engine()
@@ -620,7 +699,7 @@ class ChatServerTests(unittest.TestCase):
         texts = fixed.texts(json.loads((self.data / "prepared.json").read_text()))
 
         class Reference:
-            def __init__(self, model, quality_mode="preserve"):
+            def __init__(self, model):
                 self.model = model
                 # The spread pass (every text, protocol quality.spread) switches TF32 on and back.
                 flags = SimpleNamespace(allow_tf32=False)
@@ -630,7 +709,7 @@ class ChatServerTests(unittest.TestCase):
                 return {"model_sha256": model_sha, "reference": reference.REFERENCE_VERSION}
 
             def declared_activations(self):
-                return []   # plain weights: an empty as_quantized allowance, no second pass
+                return []   # plain weights: an empty allowance, no second pass
 
             def score_texts(self, found, top_k, valid_vocab, scratch, log, long, check):
                 # Rows as the real reference returns them, tensors store_texts reads with tolist(), without torch.

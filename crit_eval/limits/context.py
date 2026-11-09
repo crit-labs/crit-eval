@@ -237,7 +237,8 @@ def link_gbs(device):
     return curve[max(curve, key=int)] if curve else None
 
 
-def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, tokens, drafters=()):
+def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, tokens, drafters=(), held_bytes=None,
+              kv_bytes_per_token=None):
     """The placement scenario of MODEL on DEVICE (a `crit eval probe` result) at `tokens` of required context: which of
     SCENARIOS applies, the bytes each memory tier holds, where the lookup tables go, and the bound one plain decode
     pass (one token, no speculation, routing spread evenly over the experts so a device cache holds its share of them)
@@ -246,8 +247,11 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     most at its read rate. Even routing is the pessimistic case: real routing concentrates on fewer experts, so a
     cache hits more often than its share and its hit rate is the main lever. Where experts stay off the device, the
     device's expert cache also gets the reserve (expert_cache_bytes): prompt buffers are lent from cache slots while a
-    prompt runs and returned for decode, not held as a fixed workspace. None when Eval cannot size the model
-    (max_context's `missing`)."""
+    prompt runs and returned for decode, not held as a fixed workspace. held_bytes: the device memory an engine opened
+    at the requirement holds, measured (free memory before its load less after it); with it the resident weights off
+    the device are those that footprint cannot hold beside its KV cache at the requirement (kv_bytes_per_token, the
+    engine's, else the protocol precision's), not those the planning margins (headroom and reserve) leave no room
+    for. None when Eval cannot size the model (max_context's `missing`)."""
     value = max_context(model, device, vram_headroom_bytes, settings, tokens, drafters)
     basis = value.get("basis")
     if not basis:
@@ -274,6 +278,12 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     kv_needed = (value.get("kv_bytes_per_token") or 0) * int(tokens)
     weights_room = (basis["memory_free_bytes"] - basis["vram_headroom_bytes"] - basis["reserve_bytes"]
                     - basis["fixed_state_bytes"] - basis.get("companion_drafter_bytes", 0) - kv_needed)
+    if held_bytes is not None:
+        # An engine holds what it holds: the margins size a context for an engine not yet built, while one opened at
+        # the requirement shows what fits beside its own KV cache.
+        kv_held = int(kv_bytes_per_token or value.get("kv_bytes_per_token") or 0) * int(tokens)
+        weights_room = (int(held_bytes) - basis["fixed_state_bytes"] - basis.get("companion_drafter_bytes", 0)
+                        - kv_held)
     resident_off = min(resident, max(0, resident - weights_room))
     host_left = None if host is None else max(0, host - (off_device if value["tokens"] else resident + experts))
     tier = ("device" if tables <= left else "host" if host_left is None or tables <= host_left else "disk") if tables else None
@@ -282,17 +292,22 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     active, missed = experts * share, (experts * share * off_device / experts) if experts else 0
     bandwidth, link, memory = (device or {}).get("bandwidth_gbs"), link_gbs(device), ((device or {}).get("host_memory_gbs") or {}).get("read")
     floors = {}
+    lane = (device or {}).get("host_expert_gbs") or {}   # crit eval probe's CPU expert lane, when measured
     if bandwidth and value["tokens"]:
         own = (resident - basis["draft_weight_bytes"] + active - missed) / (bandwidth * 1e9) * 1000
         floors["device"] = (resident - basis["draft_weight_bytes"] + active) / (bandwidth * 1e9) * 1000
         if missed and link:
             floors["link"] = max(own, missed / (link * 1e9) * 1000)
-        if missed and memory:
-            floors["cpu"] = max(own, missed / (memory * 1e9) * 1000)
-        if missed and link and memory:
-            # A link copy reads host memory as the CPU's arithmetic does: split so both finish together, the misses
-            # come at the two rates' sum only up to host memory's read rate.
-            floors["split"] = max(own, missed / (min(link + memory, memory) * 1e9) * 1000)
+        # The CPU computes misses at its expert lane's measured rate (one token an expert, a plain pass), never above
+        # host memory's read rate; a probe without the lane prices them at the read rate, an upper bound.
+        cpu_rate = min(memory, lane["tokens_1"]) if memory and lane.get("tokens_1") else memory
+        if missed and cpu_rate:
+            floors["cpu"] = max(own, missed / (cpu_rate * 1e9) * 1000)
+        if missed and link and cpu_rate:
+            # A link copy reads host memory as the CPU's arithmetic does: split so both finish together. With the lane
+            # measured beside link copies, the split runs at those two rates' sum; else at most host memory's read rate.
+            both = lane.get("with_link_cpu", 0) + lane.get("with_link_link", 0)
+            floors["split"] = max(own, missed / ((both if both else min(link + cpu_rate, memory)) * 1e9) * 1000)
     # A device cache over host experts (scenario 2's starting design) copies its slots from host memory, so the host
     # holds every expert, those the device also caches included; where only the off-device share fits, the device's
     # experts must be its own (a static split), not cached copies.
@@ -301,11 +316,15 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
             "expert_cache_bytes": on_device if off_device else None,
             "bytes": {"resident": resident, "resident_off_device": resident_off, "experts": experts,
                       "experts_on_device": on_device, "experts_off_device": off_device, "lookup_tables": tables,
-                      "host_memory_for_weights": host},
+                      "host_memory_for_weights": host,
+                      "device_held": int(held_bytes) if held_bytes is not None else None},
+            "resident_basis": "measured" if held_bytes is not None else "margins",
             "host_holds_every_expert": every,
             "lookup_tables": {"bytes": tables, "tier": tier} if tables else None,
             "active_expert_bytes_per_token": int(active), "missed_expert_bytes_per_token": int(missed),
-            "rates_gbs": {"device": bandwidth, "link": link, "host_memory_read": memory},
+            "rates_gbs": {"device": bandwidth, "link": link, "host_memory_read": memory,
+                          **({"cpu_expert_lane": {k: lane[k] for k in ("tokens_1", "tokens_3", "tokens_8", "with_link_cpu",
+                                                                      "with_link_link") if k in lane}} if lane else {})},
             "cpu_gflops": ((device or {}).get("cpu_gflops") or {}).get("fp32"),
             "plain_pass_floor_ms": floors,
             "plain_pass_ceiling_tps": {k: round(1000 / v, 1) for k, v in floors.items() if v}}
@@ -322,7 +341,12 @@ def render_placement(value):
              + (f"; host memory for weights {b['host_memory_for_weights'] / gb:.1f} GB" if b["host_memory_for_weights"] is not None else "")]
     if b.get("resident_off_device"):
         lines.append(f"  resident weights off the device {b['resident_off_device'] / gb:.2f} GB: they do not fit next to "
-                     f"the {value['tokens']:,}-token KV cache, so every pass reads them from host memory")
+                     f"the {value['tokens']:,}-token KV cache"
+                     + (f" in the {b['device_held'] / gb:.1f} GB the engine holds" if b.get("device_held") is not None else "")
+                     + ", so every pass reads them from host memory")
+    elif b.get("device_held") is not None and b["resident"]:
+        lines.append(f"  resident weights all on the device: the engine holds {b['device_held'] / gb:.1f} GB with the "
+                     f"{value['tokens']:,}-token KV cache")
     if value.get("host_holds_every_expert") is False:
         lines.append(f"  host memory holds the {b['experts_off_device'] / gb:.1f} GB off the device but not all "
                      f"{b['experts'] / gb:.1f} GB of experts: a device cache copying from host memory does not fit; "
@@ -339,11 +363,16 @@ def render_placement(value):
                      "(prefill) buffers are lent from cache slots while a prompt runs and returned for decode")
     names = {"device": "all on the device", "link": "misses copied over the host link", "cpu": "misses computed on the CPU",
              "split": "misses split between CPU and link"}
+    lane = value["rates_gbs"].get("cpu_expert_lane") or {}
+    if lane:
+        lines.append(f"  CPU expert lane (integer block rows): {lane.get('tokens_1', 0):g} / {lane.get('tokens_3', 0):g} / "
+                     f"{lane.get('tokens_8', 0):g} GB/s at 1 / 3 / 8 tokens an expert; beside link copies "
+                     f"{lane.get('with_link_cpu', 0):g} GB/s with the link at {lane.get('with_link_link', 0):g}")
     for key, tps in value["plain_pass_ceiling_tps"].items():
         lines.append(f"  plain pass, {names[key]}: {value['plain_pass_floor_ms'][key]:.2f} ms floor, {tps:,.1f} tok/s"
-                     + (f" (both read host memory, together at most its {value['rates_gbs']['host_memory_read']:g} GB/s "
-                        "read: a split beats the CPU alone only where the CPU's arithmetic reads slower, and is set "
-                        "from both paths' measured rates, alone and together)" if key == "split" else ""))
+                     + ((" (the CPU lane and the link measured together, both reading host memory)" if lane else
+                         f" (both read host memory, together at most its {value['rates_gbs']['host_memory_read']:g} GB/s "
+                         "read; probe again for the CPU lane's own rates)") if key == "split" else ""))
     if value["missed_expert_bytes_per_token"]:
         lines.append("  even routing is the pessimistic case: real routing concentrates on fewer experts, so the "
                      "cache's hit rate under it is the main lever")

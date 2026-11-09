@@ -15,14 +15,29 @@ import sys
 from pathlib import Path
 
 STORE = "reference"
-# The quality modes a run judges in: preserve, against the model's own arithmetic with exact activations; as_quantized,
-# against the same scores with the drift budget widened by the checkpoint's own activation quantization (ALLOWANCE).
-QUALITY_MODES = ("preserve", "as_quantized")
-# Where crit-eval before protocol crit-eval-v0.3.0 kept the as_quantized mode's own scores: read only to derive an
-# allowance from (crit_eval.quality.reference.store_allowance), removed by a fetch.
-LEGACY_AS_QUANTIZED = "reference-as-quantized"
+# The quality modes a run judges in (protocol quality.modes): how much output drift from the checkpoint the user
+# selected an engine may trade for speed, never how that checkpoint is quantized or stored. Both judge against the
+# same scores, the checkpoint's stored weights decoded exactly with FP32 activations. speed: a
+# budget eight times preserve's (quality.mode_thresholds), near-tie output differences allowed (forks); preserve: a
+# budget that keeps the output close to the checkpoint's.
+QUALITY_MODES = ("preserve", "speed")
+# The mode a run judges in when it names none.
+DEFAULT_QUALITY_MODE = "speed"
+
+
+def mode_of(requirements):
+    """The quality mode a run's or result's requirements state (requirements.quality_mode), one of QUALITY_MODES;
+    a missing or other one is refused: every result states the mode it was judged in."""
+    mode = (requirements or {}).get("quality_mode")
+    if mode not in QUALITY_MODES:
+        raise ValueError(f"quality_mode is {mode!r}: a result states the quality mode it was judged in, "
+                         f"{' or '.join(QUALITY_MODES)}")
+    return mode
+
+
 # How far the checkpoint run with its activations quantized as it declares lands from the stored scores, per set and
-# path (crit_eval.quality.reference.store_allowance): the as_quantized mode's allowance, beside the scores.
+# path (crit_eval.quality.reference.store_allowance): what the format itself costs, beside the scores. Reported only
+# (protocol quality.allowance): no run reads it.
 ALLOWANCE = "allowance.json"
 # The reference's own spread (protocol quality.spread): how a second run of the long texts under an engine-sized
 # perturbation (TF32 matmuls) disagrees with the stored scores, per set and path, with the identity it was computed
@@ -127,8 +142,8 @@ def load_spread(data, expected, store=STORE):
 
 
 def write_allowance(data, identity_value, allowance):
-    """Store the as_quantized allowance ({"activations", "sets": {"SET/path": text_quality row}, ...}) beside the
-    reference scores of prepared data folder `data`."""
+    """Store the allowance ({"activations", "sets": {"SET/path": text_quality row}, ...}: what the checkpoint's declared
+    activation quantization costs, reported only) beside the reference scores of prepared data folder `data`."""
     folder = Path(data) / STORE
     folder.mkdir(parents=True, exist_ok=True)
     temporary = folder / (ALLOWANCE + ".tmp")

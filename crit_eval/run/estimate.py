@@ -16,7 +16,10 @@ exactness check decodes one token per target pass (step times the tokens per rou
 Left out: a speed case's third repetition (only when its first two disagree, which a quiet engine's rarely do), the
 warmups a case's drift adds before its first repetition (protocol speed.steady_state),
 prompt caches (follow-up turns and retrieval requests prefill in full) and replies ending early (each runs its
-length), so a cached or early-stopping engine takes less.
+length), so a cached or early-stopping engine takes less; the held-out prompts are priced at their nominal lengths, of
+which a run draws 80-100% (protocol jitter). The concurrency part, last of all, is not priced: how long a level of N
+clients takes depends on how far the engine runs them together, which no single-stream request shows (a staged run
+prices each level from the aggregate of the one before it).
 """
 from ..limits.context import curve_points, lower_context, retrieval_points
 
@@ -24,10 +27,11 @@ from ..limits.context import curve_points, lower_context, retrieval_points
 # packing, sending and parsing its rows (a 27B model's packed rows took 0.35 ms each).
 SCORE_ROW_SECONDS = 3.5e-4
 
-# The parts of a run in the order they run (result timing.parts), and the timing parts each runner part
-# (crit_eval.run.runner PARTS) runs.
+# The parts of a run without stages (stage full, a profile) in the order they run (result timing.parts), and the
+# timing parts each runner part (crit_eval.run.runner PARTS) runs. A staged run (crit_eval.run.stages) runs stage 1's
+# history, speed, held-out prompts and quality first, then each later stage's parts.
 ORDER = ("lower_context", "load", "history", "followup", "speed", "sampled_speed", "sampling_check", "heldout",
-         "quality", "context", "retrieval", "exactness", "followup_again", "history_again")
+         "quality", "context", "retrieval", "exactness", "followup_again", "history_again", "forks", "concurrency")
 RUNS = {"speed": ("speed", "sampled_speed", "sampling_check"), "context": ("lower_context", "context", "retrieval"),
         "history": ("history", "history_again"), "followup": ("followup", "followup_again")}
 

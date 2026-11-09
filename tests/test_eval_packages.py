@@ -11,16 +11,18 @@ ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_eval.quality import fixed, packages
 from crit_eval.quality import prepare  # noqa: E402
+from crit_eval import EVAL_DIR, load_json  # noqa: E402
 
 MODEL, SUITE = "a" * 64, "b" * 64
+PROTOCOL = load_json(EVAL_DIR / "protocol.json")["protocol"]
 REFERENCE = 3
 
 
-def scored(data, model=MODEL, suite=SUITE):
+def scored(data, model=MODEL, suite=SUITE, protocol=PROTOCOL):
     """A prepared data folder with stored reference scores of one text."""
     data = Path(data)
     data.mkdir(parents=True, exist_ok=True)
-    (data / "prepared.json").write_text(json.dumps({"protocol": "crit-eval-v7", "suite_sha256": suite,
+    (data / "prepared.json").write_text(json.dumps({"protocol": protocol, "suite_sha256": suite,
                                                     "model": {"sha256": model}}))
     fixed.write(data, {"reference": REFERENCE, "model_sha256": model, "top_k": 2},
                 {"text": ([-0.5, -1.5], [[3, 4], [5, 6]], [[-0.1, -0.2], [-0.3, -0.4]])})
@@ -65,6 +67,20 @@ class PackageTests(unittest.TestCase):
             self.assertIsNone(quality_checks.reference_origin(root / "run")["package"])
             self.assertIsNone(quality_checks.reference_origin(root / "nowhere"))
 
+    def test_a_package_of_another_protocol_series_is_not_fetched(self):
+        # A package prepared under an earlier series would replace the run's prepared data with data the run refuses
+        # (prepare.check_prepared): the reference is scored locally instead, and the run's data is left as it was.
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first, second, third = self.identities()
+            with first, second, third:
+                packages.pack(scored(root / "data", protocol="crit-eval-v0.1.0"), root / "packages")
+                run = scored(root / "run")
+                before = (run / "prepared.json").read_bytes()
+                self.assertIsNone(packages.find("checkpoint", root / "packages"))
+                self.assertIsNone(packages.fetch("checkpoint", run, root / "packages", log=lambda m: None))
+            self.assertEqual((run / "prepared.json").read_bytes(), before)
+
     def test_another_checkpoint_or_suite_has_no_package(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -101,9 +117,8 @@ class PackageTests(unittest.TestCase):
                     packages.fetch("checkpoint", root / "run", root / "packages")
 
     def test_the_scores_carry_their_spread_and_allowance(self):
-        # The reference's own spread and the as_quantized allowance travel with the scores they were measured
-        # against; ones of other scores (an earlier reference, say) stay behind, and a fetch removes the
-        # as_quantized scores an earlier crit-eval kept in a store of their own.
+        # The reference's own spread and the allowance (scored with the activations the checkpoint declares) travel
+        # with the scores they were measured against; ones of other scores (an earlier reference, say) stay behind.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = scored(root / "data")
@@ -119,15 +134,13 @@ class PackageTests(unittest.TestCase):
                 entry = packages.pack(data, root / "packages")
                 self.assertFalse({f"{fixed.STORE}/{fixed.SPREAD}", f"{fixed.STORE}/{fixed.ALLOWANCE}"} & set(entry["files"]))
                 fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread)
-                fixed.write_allowance(data, {**identity, "allowance": "as_quantized"}, allowance)
+                fixed.write_allowance(data, {**identity, "allowance": "declared_activations"}, allowance)
                 entry = packages.pack(data, root / "packages")
                 self.assertIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])
                 self.assertIn(f"{fixed.STORE}/{fixed.ALLOWANCE}", entry["files"])
-                (root / "run" / fixed.LEGACY_AS_QUANTIZED).mkdir(parents=True)
                 packages.fetch("checkpoint", root / "run", root / "packages", log=lambda m: None)
             self.assertEqual(fixed.load_spread(root / "run", {"reference": REFERENCE}), spread)
             self.assertEqual(fixed.load_allowance(root / "run", identity), allowance)
-            self.assertFalse((root / "run" / fixed.LEGACY_AS_QUANTIZED).exists())
 
     def test_scores_of_another_reference_are_not_packed(self):
         with tempfile.TemporaryDirectory() as directory:

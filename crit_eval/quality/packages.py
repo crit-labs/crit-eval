@@ -4,7 +4,8 @@ every crit-eval of that checkpoint, so a run needs only the engine (`crit eval p
 A package source is a folder or an HTTPS base URL (a Hugging Face dataset's `resolve/main/`, say) holding
 packages.json and one folder per package, named by the first 16 hex digits of the model's and the suite's sha256:
 prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with the reference's own spread
-(spread.json) and the as_quantized quality mode's allowance (allowance.json) when the data holds them. packages.json
+(spread.json) and the allowance (allowance.json, what the checkpoint's declared activation format costs, reported
+only) when the data holds them. packages.json
 lists each package with the
 identities it was made under (model_sha256, suite_sha256, protocol, reference version) and the sha256 of every file,
 which fetch checks before it writes anything into the data. The scores do not depend on the device that computed
@@ -111,9 +112,20 @@ def find(model, source, chat_template=None):
     key = name(model_sha, suite_sha)
     entry = listing.get("packages", {}).get(key)
     if entry is None or entry["model_sha256"] != model_sha or entry["suite_sha256"] != suite_sha \
-            or entry.get("reference") != REFERENCE_VERSION:
+            or entry.get("reference") != REFERENCE_VERSION or not _same_series(entry.get("protocol")):
         return None
     return key, entry
+
+
+def _same_series(protocol):
+    """Whether a package prepared under `protocol` runs under this crit-eval's protocol (prepare.check_prepared's
+    rule): a package of another series would replace the run's prepared data with data the run then refuses, so the
+    reference is scored here instead."""
+    from .. import EVAL_DIR, protocol_series
+    try:
+        return protocol_series(protocol) == protocol_series(load_json(EVAL_DIR / "protocol.json")["protocol"])
+    except (TypeError, ValueError):
+        return False
 
 
 def fetch(model, data, source, log=print, chat_template=None):
@@ -142,9 +154,8 @@ def fetch(model, data, source, log=print, chat_template=None):
             (staging / relative).parent.mkdir(parents=True, exist_ok=True)
             (staging / relative).write_bytes(raw)
         data.mkdir(parents=True, exist_ok=True)
-        from .fixed import LEGACY_AS_QUANTIZED, STORE
-        for store in (STORE, LEGACY_AS_QUANTIZED):
-            shutil.rmtree(data / store, ignore_errors=True)
+        from .fixed import STORE
+        shutil.rmtree(data / STORE, ignore_errors=True)
         for relative in entry["files"]:
             (data / relative).parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(staging / relative), data / relative)

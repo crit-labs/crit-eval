@@ -281,18 +281,22 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
            "matmul_by_format": by_format}
     # Weights off the device (ceiling's tiers, protocol headroom.tiers): the prompt also moves them, alongside its
     # arithmetic, and takes the longer of the two.
-    host = prompt_host(ceiling.get("tiers"), n, (ceiling.get("tiers") or {}).get("engine_hit_rate"))
+    tiers = ceiling.get("tiers")
+    host = prompt_host(tiers, n, tiers["engine_hit_rate"], tiers["engine_hit_rate_source"]) if tiers else None
     if host:
         out.update(compute_ms=compute, host=host, total_ms=max(compute, host["host_ms"]),
                    bound="host" if host["host_ms"] > compute else "compute")
     return out, []
 
 
-def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None, activations=None):
+def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None, activations=None,
+                  kv_bytes_per_token=None):
     """Floor of the time to first token: the larger of the prompt's compute floor (with the quantized formats'
     activations, prefill_floor_ms) and one read of the weights (bytes_per_pass when the adapter declares it) plus the
-    prompt's KV writes. With the ceiling's tiers (protocol headroom.tiers) the weights off the device are read from host
-    memory instead, on their faster path (tiers.prompt_host), and the floor takes the longest of the three."""
+    prompt's KV writes at the engine's kv_bytes_per_token. Without that count the KV writes are left out, still a floor:
+    the model's geometry does not say the precision the engine stores its KV at (the callers ask for it, headroom
+    KV_BYTES). With the ceiling's tiers (protocol headroom.tiers) the weights off the device are read from host memory
+    instead, on their faster path (tiers.prompt_host), and the floor takes the longest of the three."""
     compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens, activations)
     weights = bytes_per_pass or (ceiling or {}).get("weight_bytes")
     if not weights or not bandwidth_gbs:
@@ -302,7 +306,7 @@ def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=
     host = compute.get("host")
     arithmetic = compute.get("compute_ms", compute["total_ms"])
     on_device = max(0, weights - host["host_bytes"]) if host else weights
-    memory = (on_device + (ceiling.get("kv_bytes_per_token") or 0) * prompt_tokens) / (bandwidth_gbs * 1e9) * 1000
+    memory = (on_device + (kv_bytes_per_token or 0) * prompt_tokens) / (bandwidth_gbs * 1e9) * 1000
     parts = {"compute": arithmetic, "memory": memory, **({"host": host["host_ms"]} if host else {})}
     bound = max(parts, key=parts.get)
     return {"compute_ms": arithmetic, "memory_ms": memory, **({"host_ms": host["host_ms"], "host": host} if host else {}),

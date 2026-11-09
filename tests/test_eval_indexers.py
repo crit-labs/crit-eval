@@ -154,6 +154,10 @@ class QsaModelTests(unittest.TestCase):
         model = AutoModelForCausalLM.from_config(AutoConfig.for_model("qwen4_exp_text", vocab_size=320, eos_token_id=0,
                                                                       **TINY), dtype=torch.float32)
         model.config._experts_implementation = "eager"
+        # Its CPU forward on the modeling code's torch functions, as the reference runs CPU layers (with fla installed
+        # transformers would send them CPU tensors).
+        from crit_eval.quality.reference import torch_paths_on_cpu
+        torch_paths_on_cpu(model)
         with torch.no_grad():
             for key, parameter in model.named_parameters():
                 parameter.copy_(torch.randn_like(parameter) * 0.2 + (0.5 if "norm" in key else 0)

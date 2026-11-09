@@ -152,12 +152,15 @@ class Checkpoint(TensorCheckpoint):
         self.files = {}
         self.where = {}
         self.info = {}
-        # The files and headers Core validates (crit_core.model.inspect_model) before torch reads any tensor.
+        # The files and headers Core validates (crit_core.model.inspect_model) before torch reads any tensor. Each
+        # shard's keys are read and its handle closed: no mapping stays open while the checkpoint lives, so its files
+        # can be moved or deleted (Windows) once a read is done, however long a reference keeps the object.
         for shard in inspect_model(self.model).shards:
-            handle = safe_open(str(shard.path), "pt", device="cpu")
-            self.files[shard.path.name] = handle
-            for key in handle.keys():
-                self.where[key] = handle
+            with safe_open(str(shard.path), "pt", device="cpu") as handle:
+                keys = list(handle.keys())
+            self.files[shard.path.name] = shard.path
+            for key in keys:
+                self.where[key] = shard.path
             for tensor in shard.tensors:
                 self.info[tensor.name] = tensor
 
@@ -183,7 +186,9 @@ class Checkpoint(TensorCheckpoint):
             return self.placed[key]
         tensor = self._mapped(key, lambda data: data)
         if tensor is None:
-            return self.where[key].get_tensor(key)
+            from safetensors import safe_open
+            with safe_open(str(self.where[key]), "pt", device="cpu") as handle:
+                return handle.get_tensor(key)
         return tensor.reshape(self.info[key].shape)
 
     placed = {}
@@ -274,8 +279,8 @@ class Checkpoint(TensorCheckpoint):
         return found
 
     def header(self, key):
-        part = self.where[key].get_slice(key)
-        return SimpleNamespace(dtype=part.get_dtype(), shape=tuple(part.get_shape()))
+        tensor = self.info[key]   # the shard header Core read, as safetensors states it
+        return SimpleNamespace(dtype=tensor.dtype, shape=tuple(tensor.shape))
 
 
 class StateDictCheckpoint(TensorCheckpoint):

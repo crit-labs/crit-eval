@@ -1,5 +1,6 @@
 """crit eval run's stages (protocol stages): stage 1 on every engine, the budget choosing how far a run goes, and
 the certification serving the required context (mock adapter, no GPU)."""
+import json
 from pathlib import Path
 import sys
 import tempfile
@@ -19,12 +20,16 @@ PROTOCOL = load_json(EVAL_DIR / "protocol.json")
 REQUIRED = 65536
 
 
-def run(directory, **options):
+def run(directory, baseline=None, mock=None, **options):
+    """A run of the mock engine on the fixture; mock: more of the mock's configuration (its test knobs)."""
     data = Path(directory)
-    fixture(data)
+    prepared = fixture(data)
+    prepared["heldout"] = [{"id": "zh", "language": "Chinese", "kind": "prose", "prompt_ids": [7, 8, 9],
+                            "output_tokens": 12}]
+    (data / "prepared.json").write_text(json.dumps(prepared))
     # The mock answers the retrieval facts it was given.
-    return runner.run(MOCK, "unused-model", data, data / "result.json", {"facts_from": FACTS}, log=lambda message: None,
-                      context_tokens=REQUIRED, **options)
+    return runner.run(MOCK, "unused-model", data, data / "result.json", {"facts_from": FACTS, **(mock or {})}, log=lambda message: None,
+                      context_tokens=REQUIRED, baseline=baseline, **options)
 
 
 def gate(result, name):
@@ -60,8 +65,11 @@ class StagedRunTests(unittest.TestCase):
         self.assertIn("--certify", gate(result, "lower_context")["detail"])
         # The request history repeats the shortest case alone.
         self.assertEqual(list(result["history"]["cases"]), ["short"])
-        # The held-out prompts need a baseline that measured them.
-        self.assertEqual(result["heldout"]["status"], "skipped")
+        # The held-out prompts run in stage 1, right after the speed cases, with no baseline needed to measure them.
+        self.assertEqual(result["heldout"]["status"], "measured")
+        parts = list(result["timing"]["parts"])
+        self.assertEqual(parts.index("heldout"), parts.index("speed") + 1)
+        self.assertEqual(gate(result, "generality")["state"], "unmeasured")
         # What stage 1 gives without a long prompt: decode projected to the requirement and the TTFT floor.
         creep = result["context"]["creep"]
         # The curve's first point fills its drawn share of 32,768 tokens (protocol jitter).
@@ -83,9 +91,12 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual((cases["long"]["status"], cases["long"]["over_budget"]), ("skipped", True))
         self.assertIn("over budget", cases["long"]["reason"])
         self.assertEqual(gate(result, "coverage")["state"], "unmeasured")
-        for part in ("followup", "sampled_speed", "heldout"):
+        for part in ("followup", "sampled_speed"):
             self.assertEqual(result[part]["status"], "skipped")
             self.assertIn("stopped after stage 1", result[part]["reason"])
+        # Stage 1 measures the held-out prompts whatever the budget left: they are every later Eval's baseline.
+        self.assertEqual(result["heldout"]["status"], "measured")
+        self.assertIn("heldout", result["history"]["served_between"])
         self.assertEqual(result["exactness"]["status"], "unmeasured")
         self.assertNotIn("points", result["context"])
         self.assertIsNone(result["context"]["lower"]["context"])
@@ -104,6 +115,15 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual(result["aborted"]["reason"], "hung")
         self.assertEqual(stored["aborted"]["detail"], "no answer within 893 s")
 
+    def test_a_run_of_the_context_part_alone_measures_the_curve_and_retrieval(self):
+        # Without the speed part there are no rates to budget by: the curve and retrieval still run.
+        with tempfile.TemporaryDirectory() as directory:
+            result = run(directory, parts=("context",))
+        self.assertEqual(list(result["context"]["points"]), ["32768"])
+        self.assertEqual(result["context"]["retrieval"]["status"], "measured")
+        self.assertEqual(gate(result, "retrieval")["state"], "pass")
+        self.assertNotIn("speed", result)
+
     def test_a_stage_cap_stops_a_run_there(self):
         with tempfile.TemporaryDirectory() as directory:
             result = run(directory, stage=2)
@@ -111,6 +131,31 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual(list(result["context"]["points"]), ["32768"])
         self.assertEqual(result["sampled_speed"]["status"], "skipped")
         self.assertNotIn("again", result["followup"])
+        # Stage 2 repeats the short cases: their outputs are compared.
+        self.assertEqual(gate(result, "repeatable")["state"], "pass")
+        self.assertEqual(gate(result, "repeatable")["detail"], "2/2 cases repeat their output")
+        # The follow-up turns run again in stage 3: a stage 2 run says so.
+        followup = {"status": "measured", "turns": [{"turn": 1, "cached_tokens": 0}]}
+        found = status._prompt_cache_gate({"followup": followup, "stages": {"reached": 2}})
+        self.assertEqual(found["state"], "unmeasured")
+        self.assertIn("a stage 3 part, and this run stopped after stage 2", found["detail"])
+
+    def test_a_case_decoded_once_repeats_nothing(self):
+        # Stage 1 decodes each speed case once: the repeatable gate has no output to compare, and says so instead of
+        # counting the cases as repeating.
+        with tempfile.TemporaryDirectory() as directory:
+            result = run(directory, stage=1)
+        repeatable = gate(result, "repeatable")
+        self.assertEqual((repeatable["state"], repeatable["detail"]),
+                         ("unmeasured", "every speed case decoded once: no output to repeat"))
+        self.assertEqual({c["outputs"] for c in result["speed"]["cases"].values()}, {1})
+        # A result that compares some cases names the others.
+        cases = {"a": {"status": "measured", "repeatable": True, "outputs": 2, "samples": []},
+                 "b": {"status": "measured", "repeatable": True, "outputs": 1, "samples": [{"warmup": False}]}}
+        found = next(g for g in status._gates({"speed": {"cases": cases}, "context": {}, "requirements": {
+            "exactness": "reported"}}) if g["name"] == "repeatable")
+        self.assertEqual((found["state"], found["detail"]), ("pass", "1/1 cases repeat their output; decoded once, "
+                                                                     "not compared: b"))
 
     def test_a_certified_run_serves_the_required_context_and_passes_capacity(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -134,6 +179,36 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual(list(result["context"]["points"]), ["32768", str(REQUIRED)])
         self.assertEqual(gate(result, "capacity")["state"], "pass")
         self.assertEqual(result["context"]["lower"]["context"], 16384)   # without --certify, as before stages
+
+    def test_the_first_certified_eval_judges_generality_against_the_first_staged_one(self):
+        # protocol stages 1: a candidate's first staged Eval measured the held-out prompts, so the certification's
+        # generality gate has a baseline that did.
+        with tempfile.TemporaryDirectory() as first, tempfile.TemporaryDirectory() as second:
+            staged = run(first, stage=1)
+            certified = run(second, certify=True, baseline=staged)
+        self.assertEqual((staged["stages"]["reached"], staged["heldout"]["status"]), (1, "measured"))
+        generality = gate(certified, "generality")
+        self.assertNotEqual(generality["state"], "unmeasured", generality["detail"])
+        self.assertIn("held-out decode", generality["detail"])
+
+    def test_an_engines_own_expert_cache_counters_are_read_over_each_speed_suite(self):
+        # An engine whose requests report no expert reads but whose telemetry() counts its expert cache: the counters
+        # over the speed suites' requests are the hit rate its memory tiers price (protocol headroom.tiers).
+        from crit_eval.limits import headroom
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            result = runner.run(MOCK, "unused-model", data, data / "result.json",
+                                {"facts_from": FACTS, "expert_cache": {"reads_per_token": 10, "hit_rate": 0.75}},
+                                log=lambda message: None, context_tokens=REQUIRED)
+        self.assertEqual(sorted(result["telemetry"]), ["sampled_speed", "speed"])
+        for window in result["telemetry"].values():
+            self.assertGreater(window["reads"], 0)
+            self.assertAlmostEqual(window["hit_rate"], 0.75, places=2)
+        self.assertEqual(headroom.measured_hit_rate(result)[1], "engine telemetry")
+        # An engine without counters records none.
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertNotIn("telemetry", run(directory, stage=1))
 
     def test_certify_is_for_a_staged_run(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -164,6 +239,13 @@ class StagePlanTests(unittest.TestCase):
         self.assertEqual(len(planned[3]["sampled_speed"]), 4)   # a warmup and one seed per case
         self.assertNotIn("lower_context", planned[3])
         self.assertEqual(planned["certify"], {})
+        # The held-out prompts are stage 1's, priced at their nominal lengths; a run without the part plans none.
+        held = {**self.PREPARED, "heldout": [{"prompt_ids": [0] * 200, "output_tokens": 64}]}
+        settings = stages.staged_settings(PROTOCOL["context"], PROTOCOL["stages"], False)
+        found = stages.stage_requests(held, PROTOCOL, 200000, self.INFO, settings)
+        self.assertEqual(found[1]["heldout"], [(200, 64, 0, False)])
+        self.assertFalse(any("heldout" in found[stage] for stage in (2, 3, "certify")))
+        self.assertNotIn("heldout", stages.stage_requests(held, PROTOCOL, 200000, self.INFO, settings, heldout=False)[1])
         certified = self.plan(certify=True)["certify"]
         self.assertEqual(certified["context"], [(200000 - 256, 256, 0, False)])
         self.assertEqual(len(certified["lower_context"]), 2)   # each speed case once at the lower context
@@ -197,11 +279,35 @@ class StagePlanTests(unittest.TestCase):
         self.assertIsNone(stages.creep({"speed": {"cases": {"a": row(899, 0.01)}}}, 200000))
 
     def test_the_memory_fit_compares_free_memory_with_the_kv_cache_at_the_requirement(self):
-        found = stages.memory_fit({"free_bytes": 4e9}, {"kv_bytes_per_token": 24576}, None, 200000)
+        found = stages.memory_fit({"free_bytes": 4e9}, {"kv_bytes_per_token": 24576}, 200000)
         self.assertEqual(found["kv_bytes_at_requirement"], 24576 * 200000)
         self.assertFalse(found["fits_if_allocated_late"])
-        self.assertEqual(stages.memory_fit({"free_bytes": 4e9}, {}, {"kv_bytes_per_token": 1000}, 200000)
-                         ["kv_bytes_per_token_source"], "model")
+        self.assertIsNone(found["unmeasured"])
+        self.assertTrue(stages.memory_fit({"free_bytes": 4e9}, {"kv_bytes_per_token": 1000}, 200000)
+                        ["fits_if_allocated_late"])
+
+    def test_the_memory_fit_takes_no_kv_count_but_the_engines(self):
+        # A model's geometry says nothing of the precision the engine stores its KV at: without the engine's count the
+        # KV cache at the requirement is unmeasured, never priced at 16 bits.
+        for info in ({}, {"kv_bytes_per_token": None}, {"kv_bytes_per_token": 0}):
+            with self.subTest(info=info):
+                found = stages.memory_fit({"free_bytes": 4e9}, info, 200000)
+                self.assertEqual(found, {"free_after_load_bytes": 4e9, "kv_bytes_per_token": None,
+                                         "kv_bytes_at_requirement": None, "fits_if_allocated_late": None,
+                                         "unmeasured": stages.KV_UNMEASURED})
+
+    def test_a_run_sizes_the_kv_cache_at_the_engines_count(self):
+        # The mock engine reports its KV bytes per token: the fit takes them, not the model's 16-bit K and V.
+        with tempfile.TemporaryDirectory() as directory:
+            result = run(directory, stage=1, mock={"kv_bytes_per_token": 36864})
+        fit = result["context"]["fit"]
+        self.assertEqual(fit["kv_bytes_per_token"], 36864)
+        self.assertEqual(fit["kv_bytes_at_requirement"], 36864 * result["context"]["tokens"])
+        self.assertIsNone(fit["unmeasured"])
+        with tempfile.TemporaryDirectory() as directory:
+            fit = run(directory, stage=1)["context"]["fit"]
+        self.assertEqual((fit["kv_bytes_per_token"], fit["kv_bytes_at_requirement"], fit["unmeasured"]),
+                         (None, None, stages.KV_UNMEASURED))
 
     def test_a_later_quality_set_joins_the_first_ones(self):
         first = {"status": "scored", "sets": {"a/prompt": {"passed": True}}, "buckets": {"a/prompt": {}},
@@ -218,14 +324,106 @@ class StagePlanTests(unittest.TestCase):
         self.assertEqual(merged["seconds"], 3.0)
 
 
+class CounterTests(unittest.TestCase):
+    """The engine's own expert cache counters over each speed suite (runner.Counters) and the hit rate a declared
+    host_bytes_per_pass implies (runner.declared_hit_rate)."""
+
+    class Engine:
+        def __init__(self, *readings):
+            self.readings = list(readings)
+
+        def telemetry(self):
+            reads, hits = self.readings.pop(0)
+            return {"expert_cache": {"reads": reads, "hits": hits}}
+
+    def test_a_window_is_the_counters_change_over_a_suite_that_completed(self):
+        counters = runner.Counters(self.Engine((100, 50), (300, 200), (300, 200), (500, 300)))
+        with counters.window("speed"):
+            pass
+        with counters.window("speed"):   # a second stretch of the same suite (a staged run's stage 2) adds to it
+            pass
+        self.assertEqual(counters.record(), {"speed": {"reads": 400, "hits": 250, "hit_rate": 0.625}})
+        # Counters that went backwards (the engine opened again) record no window.
+        backwards = runner.Counters(self.Engine((500, 300), (40, 30)))
+        with backwards.window("speed"):
+            pass
+        self.assertEqual(backwards.record(), {})
+        # A suite that raises records none: its counters cover requests it did not finish.
+        failed = runner.Counters(self.Engine((0, 0), (10, 5)))
+        with self.assertRaises(RuntimeError):
+            with failed.window("speed"):
+                raise RuntimeError("disturbed")
+        self.assertEqual(failed.record(), {})
+        # An engine without telemetry(), or whose telemetry names no expert cache, records none.
+        none = runner.Counters(object())
+        with none.window("speed"):
+            pass
+        self.assertEqual(none.record(), {})
+
+    def test_a_declared_host_bytes_per_pass_implies_a_hit_rate(self):
+        tiers = {"active_expert_bytes_per_token": 4 * 10**9, "resident_off_device_bytes": 10**9}
+        # 2 GB per pass from host memory beyond the 1 GB of resident weights off the device: 1 of a token's 4 GB of
+        # experts misses, a 75% hit rate.
+        self.assertAlmostEqual(runner.declared_hit_rate({"host_bytes_per_pass": {"link": 1.5e9, "cpu": 0.5e9}}, tiers), 0.75)
+        self.assertEqual(runner.declared_hit_rate({"host_bytes_per_pass": {"link": 9e9}}, tiers), 0.0)   # clamped
+        self.assertIsNone(runner.declared_hit_rate({}, tiers))
+        self.assertIsNone(runner.declared_hit_rate({"host_bytes_per_pass": {"link": 1e9}}, None))
+
+    def test_a_resumed_round_answers_the_counters_from_its_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            options = dict(log=lambda message: None, context_tokens=REQUIRED, stage=1)
+            config = {"facts_from": FACTS, "expert_cache": {"reads_per_token": 10, "hit_rate": 0.75}}
+            first = runner.run(MOCK, "unused-model", data, data / "a.json", config, **options)
+            again = runner.run(MOCK, "unused-model", data, data / "b.json", config,
+                               resume=data / "a.journal.jsonl", **options)
+        self.assertEqual(again["telemetry"], first["telemetry"])
+        self.assertEqual(again["journal"]["live_calls"], 0)
+
+
+class StatusDetailTests(unittest.TestCase):
+    def test_the_quality_gate_says_honesty_was_not_checked_only_when_it_judged_nothing(self):
+        sets = {"conversations/served": {"passed": True, "failures": []}}
+        checked = status._quality_gate({"quality": {"status": "scored", "sets": sets, "skipped": {}, "honesty": {
+            "passed": True, "tolerance": 0.001, "max_abs_logprob_diff": 0.0, "failures": []}}})
+        self.assertEqual(checked["state"], "pass")
+        self.assertIn("served replies scored alike within 0.0e+00", checked["detail"])
+        self.assertNotIn("honesty not checked", checked["detail"])
+        unchecked = status._quality_gate({"quality": {"status": "scored", "sets": sets, "skipped": {}, "honesty": {
+            "passed": None, "reason": "no honesty set fits the context"}}})
+        self.assertIn("honesty not checked: no honesty set fits the context", unchecked["detail"])
+        # A check that failed on its top-k lists alone is no unchecked one either.
+        listed = status._quality_gate({"quality": {"status": "scored", "sets": sets, "skipped": {}, "honesty": {
+            "passed": False, "tolerance": 0.001, "max_abs_logprob_diff": 0.0, "failures": ["top-k lists differ"]}}})
+        self.assertEqual(listed["state"], "fail")
+        self.assertNotIn("honesty not checked", listed["detail"])
+
+    def test_a_staged_run_times_its_fork_judging(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = run(directory, stage=1, quality_mode="speed")
+        self.assertIn("forks", result["timing"]["parts"])
+
+
 class CapacityGateTests(unittest.TestCase):
+    def capacity(self, fit):
+        return status._context_gates({"context": {"tokens": 200000, "certified": False, "points": {}, "fit": fit}})[0]
+
     def test_an_uncertified_run_leaves_capacity_unmeasured_with_the_memory_it_needs(self):
-        found = status._context_gates({"context": {"tokens": 200000, "certified": False, "points": {},
-                                                   "fit": {"free_after_load_bytes": 2e9,
-                                                           "kv_bytes_at_requirement": 5e9}}})
-        capacity = found[0]
+        capacity = self.capacity(stages.memory_fit({"free_bytes": 2e9}, {"kv_bytes_per_token": 25000}, 200000))
         self.assertEqual(capacity["state"], "unmeasured")
-        self.assertIn("2.00 GB free after the load", capacity["detail"])
+        self.assertIn("2.00 GB free after the load; the KV cache at the requirement needs 5.00 GB "
+                      "(25,000 bytes per token, the engine's)", capacity["detail"])
+
+    def test_the_kv_cache_of_an_engine_that_reports_no_count_is_unmeasured(self):
+        capacity = self.capacity(stages.memory_fit({"free_bytes": 2e9}, {}, 200000))
+        self.assertEqual(capacity["state"], "unmeasured")
+        self.assertIn("2.00 GB free after the load; the KV cache at the requirement is unmeasured: "
+                      + stages.KV_UNMEASURED, capacity["detail"])
+        self.assertNotIn("needs", capacity["detail"])
+        unread = self.capacity(stages.memory_fit(None, {"kv_bytes_per_token": 25000}, 200000))
+        self.assertNotIn("free after the load", unread["detail"])
+        self.assertIn("needs 5.00 GB", unread["detail"])
 
 
 if __name__ == "__main__":

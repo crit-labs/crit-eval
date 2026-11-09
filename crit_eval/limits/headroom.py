@@ -65,7 +65,14 @@ repetitions.
 """
 from . import ceiling as model_ceiling
 from . import tiers as memory_tiers
+from ..quality.fixed import mode_of
 from ..reports import metrics
+
+# What prices the expert misses of an engine whose experts the device cannot all hold (protocol headroom.tiers).
+EXPERT_HITS = ("expert_reads and expert_hits per request (generate()'s result, crit serve's telemetry), or the expert "
+               "cache's reads and hits in the engine's telemetry(): without them the misses the routed experts bring "
+               "from host memory are unmeasured, and the floors hold only those the device's capacity forces, "
+               "every other routed expert read from the device: optimistic floors")
 
 
 def decode_suite(result):
@@ -346,7 +353,9 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
     ceiling.ACTIVATIONS (bf16, fp16_acc, fp8 and stored, the stored-format ceiling), and at the engine's declared
     prompt_activations; which of them quality evidence shows passing or rules out, and the reachable ceiling: the
     fastest shown to pass. evidence: earlier results of the same model (a baseline) whose quality judged their own
-    declared activations, beside this result's. None when the model stores no quantized matrices."""
+    declared activations, beside this result's; only those judged in this result's quality mode count, since a pass
+    under the speed mode's budget shows nothing for preserve's and a failure under preserve's nothing for the speed
+    mode's. None when the model stores no quantized matrices."""
     ceiling = tiered_ceiling(result)
     formats = model_ceiling.quantized_formats(ceiling)
     speed, info = result.get("speed") or {}, result.get("engine") or {}
@@ -358,7 +367,7 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
         floors, ttfts, lacking = {}, [], []
         for case_id, case in measured.items():
             floor, missing = model_ceiling.ttft_floor_ms(ceiling, rates, result.get("bandwidth_gbs"), case["prompt_tokens"],
-                                                         info.get("bytes_per_pass"), shares)
+                                                         info.get("bytes_per_pass"), shares, info.get("kv_bytes_per_token"))
             compute, missing_compute = model_ceiling.prefill_floor_ms(ceiling, rates, case["prompt_tokens"], shares)
             lacking += [m for m in missing + missing_compute if m not in lacking]
             if compute and case_id in prefill_cases:
@@ -382,7 +391,8 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
             row["missing"] = lacking
         modes[activation] = {**row, "state": None, "evidence": []}
     judged = [prompt_evidence(result, formats)] + [prompt_evidence(other, formats) for other in evidence
-                                         if other.get("model_sha256") == result.get("model_sha256")]
+                                         if other.get("model_sha256") == result.get("model_sha256")
+                                         and quality_mode(other) == quality_mode(result)]
     declared, state, detail = judged[0]
     own = None
     if declared is not None:
@@ -412,28 +422,34 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
 # A quality-preserving engine keeps its prompt activations in 16 bits (quality mode preserve): the fastest of these
 # prices its prompt arithmetic's limits, unless quality shows a faster arithmetic passing.
 PRESERVE_ACTIVATIONS = ("bf16", "fp16_acc")
+# The prompt activations of the quantized matrices each quality mode admits without quality evidence (the formats
+# activation_ceilings prices): preserve's 16-bit ones; the speed mode admits every one, the stored format's own,
+# FP8 and 16-bit, whatever format the checkpoint stores, so its limits never fall below preserve's.
+MODE_ACTIVATIONS = {"preserve": PRESERVE_ACTIVATIONS, "speed": ("bf16", "fp16_acc", "fp8", "stored")}
 
 
 def quality_mode(result):
-    """The quality mode a result was judged in (requirements.quality_mode): preserve unless it says as_quantized."""
-    return (result.get("requirements") or {}).get("quality_mode") or "preserve"
+    """The quality mode a result was judged in (requirements.quality_mode, which every result states: fixed.mode_of)."""
+    return mode_of(result.get("requirements"))
 
 
 def mode_limits(result):
     """The prefill ceiling, time-to-first-token floor and long-context first-token floor of the result's quality mode:
     {"activations": label, "prefill": tok/s, "ttft": ms, "context_ttft": ms or None}, or None where the stored-format
-    limits stand. as_quantized runs the checkpoint's own activations, so its limits are the stored format's (None).
-    preserve keeps the activations exact: its limits take the fastest of the 16-bit prompt activations
-    (PRESERVE_ACTIVATIONS) and of any arithmetic quality shows passing (activation_ceilings' reachable one), priced on
-    the same cases and points as the stored ones. None too while the ceilings by activation are not priced."""
-    if quality_mode(result) != "preserve":
-        return None
+    limits stand. A mode's limits take the fastest of the prompt activations it admits (MODE_ACTIVATIONS) and of any
+    arithmetic quality shows passing (activation_ceilings' reachable one), priced on the same cases and points as the
+    stored ones. preserve keeps the activations in 16 bits; the speed mode admits the stored
+    format's too, so its limits are the stored format's (None) wherever that is the fastest priced (a device with the
+    format's tensor cores), and a faster one's elsewhere (FP8 for 4-bit matrices on a device without 4-bit ones).
+    None too while the ceilings by activation are not priced (a checkpoint with no FP8 or NVFP4 matrices)."""
+    mode = quality_mode(result)
+    admitted = MODE_ACTIVATIONS[mode]
     room = result.get("headroom") or {}
     found = room.get("activations") or {}
     formats = found.get("formats") or ()
+    modes = found.get("modes") or {}
     options = [(row["ceiling_score"], name, {f: {name: 1.0} for f in formats}, row.get("ttft_floor_ms"))
-               for name, row in (found.get("modes") or {}).items()
-               if name in PRESERVE_ACTIVATIONS and row.get("ceiling_score")]
+               for name, row in modes.items() if name in admitted and row.get("ceiling_score")]
     reach = found.get("reachable")
     if reach and reach.get("ceiling_score"):
         shares = ((found.get("declared") or {}).get("activations") if reach["name"] == "declared"
@@ -442,6 +458,9 @@ def mode_limits(result):
     if not options:
         return None
     score, label, shares, ttft_floor = max(options, key=lambda option: option[0])
+    stored = (modes.get("stored") or {}).get("ceiling_score")
+    if "stored" in admitted and stored and score <= stored:
+        return None   # the stored format is the fastest the mode admits: its limits stand
     # The long-context points' first-token floors at the same activations, as context_summary prices the stored ones.
     points = [row for row in ((room.get("context") or {}).get("points") or {}).values() if row.get("ttft_floor")]
     rates = (room.get("rates") or {}).get("tflops")
@@ -449,7 +468,8 @@ def mode_limits(result):
     for row in points:
         floor, _ = model_ceiling.ttft_floor_ms(tiered_ceiling(result), rates, room.get("bandwidth_gbs") or
                                                result.get("bandwidth_gbs"), row["prompt_tokens"],
-                                               (result.get("engine") or {}).get("bytes_per_pass"), shares)
+                                               (result.get("engine") or {}).get("bytes_per_pass"), shares,
+                                               (result.get("engine") or {}).get("kv_bytes_per_token"))
         if floor:
             floors.append(floor["total_ms"])
     context = metrics.geometric_mean(floors) if points and len(floors) == len(points) else None
@@ -492,8 +512,11 @@ def ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs):
             continue
         row = {"prompt_tokens": case["prompt_tokens"], "ttft_ms": case["ttft_ms"], **ttft_parts(case)}
         floor, lacking = model_ceiling.ttft_floor_ms(ceiling, tflops, bandwidth_gbs, case["prompt_tokens"],
-                                                    info.get("bytes_per_pass"))
+                                                    info.get("bytes_per_pass"),
+                                                    kv_bytes_per_token=info.get("kv_bytes_per_token"))
         missing += [m for m in lacking if m not in missing]
+        if floor and not info.get("kv_bytes_per_token") and KV_BYTES not in missing:
+            missing.append(KV_BYTES)   # the floor leaves the prompt's KV writes out
         if floor:
             row["floor"] = floor
             row["efficiency"] = floor["total_ms"] / case["ttft_ms"]
@@ -707,9 +730,36 @@ def fixed_decode(decode_speed, model_pass, bandwidth_gbs, decode_name="greedy"):
             "fraction": metrics.geometric_mean([row["fraction"] for row in cases.values()]), "cases": cases}
 
 
+def telemetry_rate(telemetry, decode_name="greedy"):
+    """The expert cache's hit rate the engine's own counters (telemetry(): result telemetry, the reads and hits over each
+    speed suite's requests) give for the decode suite `decode_name`, or None without them."""
+    window = (telemetry or {}).get("sampled_speed" if decode_name == "sampled" else "speed") or {}
+    return window["hits"] / window["reads"] if window.get("reads") else None
+
+
+# What a pass or first-token floor lacks without the engine's KV count: it leaves the KV term out, still a floor, since
+# the model's geometry does not say the precision the engine stores its KV at (summarize, ttft_summary,
+# context_summary).
+KV_BYTES = "kv_bytes_per_token from the adapter (the KV bytes each token adds at the engine's KV precision)"
+
+
+def measured_hit_rate(result):
+    """(the expert cache's hit rate the run measured, where it came from): its decode suite's requests' expert_hits over
+    expert_reads ("engine"), else the engine's own counters over that suite ("engine telemetry"), else (None,
+    "unmeasured"): no rate is assumed (protocol headroom.tiers)."""
+    name, decoded = decode_suite(result)
+    samples = [s for c in (decoded.get("cases") or {}).values() if c.get("status") == "measured"
+               for s in c.get("samples", []) if not s.get("warmup")]
+    rate = memory_tiers.hit_rate(samples)
+    if rate is not None:
+        return rate, "engine"
+    rate = telemetry_rate(result.get("telemetry"), name)
+    return (rate, "engine telemetry") if rate is not None else (None, "unmeasured")
+
+
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
               prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy",
-              host_rates=None, model_pass=None, tiers=None):
+              host_rates=None, model_pass=None, tiers=None, telemetry=None):
     """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
     in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s; ceiling:
     the prepared model arithmetic (ceiling.model_ceiling); tflops: GEMM rates by format; steps:
@@ -719,7 +769,9 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     the probe's host rates ({"link", "memory"} GB/s) that price an engine's declared host_bytes_per_pass (host_pass);
     model_pass: the model files' bytes per pass and KV bytes per token, the fixed denominator (fixed_decode); tiers: the
     model's memory tiers on the device (crit_eval.limits.tiers.derive), which price an engine that declares no host
-    bytes, each case at its own expert cache hit rate, and the prompts' floors (protocol headroom.tiers)."""
+    bytes, each case at its own expert cache hit rate, and the prompts' floors (protocol headroom.tiers); telemetry: the
+    engine's own expert cache counters over each speed suite (result telemetry), the hit rate where its requests report
+    none. Without either the expert misses are unmeasured: no rate is assumed."""
     decode_speed = decode_speed or speed
     width = info.get("draft_width")
     probed_gbs = bandwidth_gbs   # the fixed denominator takes the probe's, never an engine's
@@ -727,9 +779,12 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     declared = host_pass(info, host_rates)
     samples = [s for c in (decode_speed or {}).get("cases", {}).values() if c.get("status") == "measured"
                for s in c.get("samples", []) if not s.get("warmup")]
-    engine_rate = memory_tiers.hit_rate(samples)
+    engine_rate, engine_source = memory_tiers.hit_rate(samples), "engine"
+    if engine_rate is None and telemetry_rate(telemetry, decode_name) is not None:
+        engine_rate, engine_source = telemetry_rate(telemetry, decode_name), "engine telemetry"
     if tiers:
-        tiers = {**tiers, "engine_hit_rate": engine_rate}
+        tiers = {**tiers, "engine_hit_rate": engine_rate,
+                 "engine_hit_rate_source": engine_source if engine_rate is not None else "unmeasured"}
         ceiling = {**(ceiling or {}), "tiers": tiers} if ceiling else ceiling
 
     def priced(rows=()):
@@ -737,11 +792,12 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         if declared:
             return declared
         rate = memory_tiers.hit_rate([s for r in rows for s in r.get("samples", []) if not s.get("warmup")])
-        return memory_tiers.decode_host(tiers, engine_rate if rate is None else rate)
+        return (memory_tiers.decode_host(tiers, rate, "engine") if rate is not None else
+                memory_tiers.decode_host(tiers, engine_rate, engine_source))
     host = priced()
     floor = pass_floor_ms(info.get("bytes_per_pass"), bandwidth_gbs, host)
     draft_floor = pass_floor_ms(info.get("draft_bytes_per_step"), bandwidth_gbs)
-    kv_per_token = info.get("kv_bytes_per_token") or (ceiling or {}).get("kv_bytes_per_token") or 0
+    kv_per_token = info.get("kv_bytes_per_token") or 0   # the engine's count only (KV_BYTES)
     steps = steps or {}
     cases, warnings, curves, case_floors, missing, bound_curves = {}, [], [], [], [], []
     bound_width = max(width or 0, thresholds.get("acceptance_ceiling_width", 8))
@@ -800,9 +856,18 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         cases[case_id] = row
 
     efficiency = floor / step_ms if floor and step_ms else None
+    if floor and not kv_per_token:
+        missing.append(KV_BYTES)
     if host and (not host["memory_gbs"] or (host["link"] and not host["link_gbs"])):
         missing.append("host rates for host_bytes_per_pass (re-run crit eval probe)" if declared else
                        "host rates for the weights off the device (re-run crit eval probe)")
+    if tiers and tiers["experts_off_device_bytes"] and engine_rate is None:
+        # No rate is assumed: the floors hold the misses the device's capacity forces, and the rest is named (the
+        # prompts' floors too where a declared host_bytes_per_pass prices the decode pass).
+        missing.append(EXPERT_HITS)
+    if host and host.get("hit_rate_source") == "unmeasured":   # a declared host_bytes_per_pass carries no hit rate
+        warnings.append("expert misses from host memory unmeasured: the pass floor reads every routed expert from the "
+                        "device, an optimistic floor (the engine reports no expert cache hits)")
     if efficiency is None:
         lacking = [name for name, value in (("bytes_per_pass from the adapter", info.get("bytes_per_pass")),
                                             ("device bandwidth (--device)", bandwidth_gbs),
@@ -919,15 +984,15 @@ def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, 
             row["round_floor_ms"] = pass_floor + width * (draft_floor or 0.0)
             row["ceiling_tps"] = (point.get("tokens_per_round") or 1.0) * 1000 / row["round_floor_ms"]
         floor, lacking = model_ceiling.ttft_floor_ms(ceiling, tflops, bandwidth_gbs, point["prompt_tokens"],
-                                                    info.get("bytes_per_pass"))
+                                                    info.get("bytes_per_pass"), kv_bytes_per_token=kv_per_token)
         missing += [m for m in lacking if m not in missing]
         if floor:
             row["ttft_floor"] = floor
         points[key] = row
     if width and draft_floor is None:
         missing.append("draft_bytes_per_step from the adapter (long-context round floor)")
-    if not info.get("kv_bytes_per_token"):
-        missing.append("kv_bytes_per_token from the adapter (the KV bytes each token adds at the engine's KV precision)")
+    if not kv_per_token:
+        missing.append(KV_BYTES)
     complete = bool(points) and len(points) == len(context["points"])
     decode = [r["decode_tps"] for r in points.values() if r.get("decode_tps")]
     score = metrics.geometric_mean(decode) if decode and len(decode) == len(points) else None
