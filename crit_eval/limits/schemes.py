@@ -29,6 +29,10 @@ tensors under `base.` and the model's quantization config (quantization_config, 
     bnb8          bitsandbytes LLM.int8 (I8 base.weight, base.SCB per row: w = q * SCB / 127)
     nbits         ONNX Runtime's MatMulNBits (base.nbits_weight and its scales, zero points and g_idx, as
                   crit_core.model.onnx names a MatMulNBits node's inputs, with the node's K, N, bits and block size)
+    exl3          EXL3 (base.trellis [in / 16, out / 16, 16 K] I16 trellis codes for K bits a weight, 1 to 8 or 1.5 /
+                  2.5 / 3.5, the sign vectors base.suh / base.svh or their bitfields base.su / base.sv, a base.mcg or
+                  base.mul1 marker naming the codebook): w = diag(su) H Q H diag(sv), Q the tiles as the format's
+                  decoder gives them (FP16, exact) and H the 128-point Hadamard, the rotations in FP32
 
 stored(tensors, base, quantization) gives the scheme's name, its GEMM rate key for the prefill floor and the
 matrix's element count from headers alone (no torch). dense(checkpoint, base, device) decodes it to FP32 [out, in]
@@ -407,6 +411,114 @@ def _byte_codes(data, bits):
     return value & ((1 << bits) - 1)
 
 
+EXL3_HAD = 128          # the Hadamard blocks both sides of an EXL3 matrix are rotated by
+EXL3_MASK = 0xFFFFFFFF
+
+
+def exl3_codebook(words, codebook):
+    """FP16 values of 16-bit trellis states (int64 tensor of 0..65535) in EXL3's procedural codebooks: 0 3INST, 1 MCG,
+    2 MUL1, each the integer arithmetic of its definition and one FP16 rounding (a sum of two FP16 halves for 3INST and
+    MCG, a fused multiply-add for MUL1), as the format's decoder rounds them."""
+    import torch
+    if codebook == 2:
+        x = (words * 0x83DCD12D) & EXL3_MASK
+        total = sum((x >> s) & 0xFF for s in (0, 8, 16, 24)) + 0x6400
+        h = (total & 0xFFFF).to(torch.int16).view(torch.float16).double()
+        k_inv = torch.tensor(0x1EEE, dtype=torch.int16).view(torch.float16).double()
+        k_bias = torch.tensor(0xC931 - 0x10000, dtype=torch.int16).view(torch.float16).double()
+        return (h * k_inv + k_bias).half()
+    if codebook == 0:
+        x = (words * 89226354 + 64248484) & EXL3_MASK
+    else:
+        x = (words * 0xCBAC1FED) & EXL3_MASK
+    x = (x & 0x8FFF8FFF) ^ 0x3B603B60
+
+    def half(bits):
+        return torch.where(bits >= 0x8000, bits - 0x10000, bits).to(torch.int16).view(torch.float16).float()
+    return (half(x & 0xFFFF) + half(x >> 16)).half()
+
+
+def exl3_tiles(trellis, codebook, bits, half_bit):
+    """The 16 x 16 tiles [k / 16, n / 16, 16, 16] (FP16) of a trellis [k / 16, n / 16, 16 K] (K = bits, or bits + 0.5 with
+    half_bit): each tile a circular bitstream of 256 K bits, read most significant bit first from 32-bit words of two
+    stored 16-bit words each (the first the low half); position p's state is the 16 bits ending at bit (p + 1) K (for
+    a half-integer K, odd positions take bits + 1 bits, so position p ends at (p // 2)(2 bits + 1) + bits for even p,
+    (p // 2 + 1)(2 bits + 1) for odd); positions map to the tile's rows and columns in the tensor-core fragment order:
+    lane L = p // 8 and j = p % 8 give row 2 (L % 4) + j % 2 + 8 ((j // 2) % 2), column 2 (L // 8 + 4 (j // 4)) +
+    (L // 4) % 2."""
+    import torch
+    device = trellis.device
+    kt, nt, width = trellis.shape
+    stored = trellis.to(torch.int64) & 0xFFFF
+    words = (stored[..., 0::2] | (stored[..., 1::2] << 16)).reshape(kt * nt, width // 2)
+    total = words.shape[1] * 32
+    p = torch.arange(256, device=device)
+    if half_bit:
+        pair = 2 * bits + 1
+        end = (p // 2) * pair + torch.where(p % 2 == 0, bits, pair)
+    else:
+        end = (p + 1) * bits
+    end = end + total            # windows near the start wrap to the stream's end
+    last = ((end - 1) // 32) % words.shape[1]
+    first = ((end - 16) // 32) % words.shape[1]
+    shift = (((end - 1) // 32) + 1) * 32 - end
+    hi, lo = words[:, first], words[:, last]
+    state = (((hi << 32) | lo) >> shift) & 0xFFFF
+    values = exl3_codebook(state, codebook).view(kt * nt, 32, 8)
+    lane = torch.arange(32, device=device)[:, None]
+    j = torch.arange(8, device=device)[None, :]
+    row = 2 * (lane % 4) + j % 2 + 8 * ((j // 2) % 2)
+    col = 2 * (lane // 8 + 4 * (j // 4)) + (lane // 4) % 2
+    tiles = torch.empty(kt * nt, 16, 16, dtype=torch.float16, device=device)
+    tiles[:, row, col] = values
+    return tiles.view(kt, nt, 16, 16)
+
+
+def exl3_hadamard(device):
+    """The normalized 128-point Sylvester Hadamard matrix (FP32)."""
+    import torch
+    h = torch.ones(1, 1, device=device)
+    while h.shape[0] < EXL3_HAD:
+        h = torch.cat((torch.cat((h, h), 1), torch.cat((h, -h), 1)), 0)
+    return h / math.sqrt(EXL3_HAD)
+
+
+def exl3_signs(packed, size, device):
+    """FP32 +-1 of a sign bitfield (int16, bit i of word w for element 16 w + i: 1 is -1)."""
+    import torch
+    words = packed.to(device).view(-1).to(torch.int32) & 0xFFFF
+    bits = (words[:, None] >> torch.arange(16, device=device)) & 1
+    return (1.0 - 2.0 * bits.reshape(-1)[:size].float())
+
+
+def _exl3_decode(checkpoint, base, device):
+    """EXL3 trellis codes: base.trellis [in / 16, out / 16, 16 K] int16, the input and output sign
+    vectors base.suh / base.svh (FP16) or their bitfields base.su / base.sv, the codebook named by a base.mcg or
+    base.mul1 marker (3INST without one). W [in, out] = diag(su) H Q H diag(sv), Q the decoded tiles and H the
+    block-diagonal normalized 128-point Hadamard on each side: the tiles exactly as the format decodes them (FP16),
+    the rotations in FP32."""
+    trellis = checkpoint.raw(base + ".trellis").to(device)
+    kt, nt, width = trellis.shape
+    k, n = 16 * kt, 16 * nt
+    bits, half_bit = width // 16, width % 16 == 8
+    def has(suffix):
+        return checkpoint.has(base + suffix)
+    codebook = 1 if has(".mcg") else 2 if has(".mul1") else 0
+    if not 1 <= bits <= 8 or (width % 16 not in (0, 8)) or (half_bit and (codebook != 2 or bits > 3)):
+        raise SchemeError(f"{base}: an EXL3 trellis of {width} words a tile is not a bitrate the format defines")
+    if k % EXL3_HAD or n % EXL3_HAD:
+        raise SchemeError(f"{base}: EXL3 matrices are multiples of {EXL3_HAD} on both sides, not {k} x {n}")
+    su = (checkpoint.raw(base + ".suh").to(device).float() if has(".suh")
+          else exl3_signs(checkpoint.raw(base + ".su"), k, device))
+    sv = (checkpoint.raw(base + ".svh").to(device).float() if has(".svh")
+          else exl3_signs(checkpoint.raw(base + ".sv"), n, device))
+    q = exl3_tiles(trellis, codebook, bits, half_bit).permute(0, 2, 1, 3).reshape(k, n).float()
+    h = exl3_hadamard(device)
+    q = (h @ q.view(k // EXL3_HAD, EXL3_HAD, n)).view(k, n)              # rows: H Q
+    q = (q.view(k, n // EXL3_HAD, EXL3_HAD) @ h).view(k, n)              # columns: (H Q) H
+    return (su[:, None] * q * sv[None, :]).T.contiguous()
+
+
 # Each scheme crit_core recognises, decoded to FP32 [out, in] with the format library's own arithmetic.
 DECODERS = {
     "nvfp4": _nvfp4_decode,
@@ -418,6 +530,7 @@ DECODERS = {
     "bnb4": _bnb4_decode,
     "bnb8": _bnb8_decode,
     "nbits": _nbits_decode,
+    "exl3": _exl3_decode,
     "plain": _plain_decode,
 }
 if set(DECODERS) != set(RECOGNISERS):

@@ -271,6 +271,7 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
     tolerance, mean_tolerance = bound.get("tolerance", rule["tolerance"]), bound.get("mean_tolerance")
     if not callable(getattr(engine, "reply", None)):
         return {"passed": None, "reason": "the engine replies over no chat API", "tolerance": tolerance}
+    as_served = getattr(engine, "as_served", None)
     replies, failures, worst, timing = [], [], 0.0, {"replies": [], "scores": []}
     asked = [(text["id"], text["prompt_ids"], None) for text in prepared["quality"]
              if texts and text["set"] in rule["sets"] and text["set"] not in skipped] + list(extra)
@@ -287,13 +288,16 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
         for position, (logprob, top, row) in enumerate(zip(served["logprobs"], served["top"], scored)):
             diff = max(diff, abs(logprob - row["logprob"]))
             total += abs(logprob - row["logprob"])
-            mine, theirs = dict(top), dict(row["top"])
+            # The scored list read as the served one is: ids named by their bytes, those no bytes name left out
+            # (ChatEngine.as_served), so a token the served list could not hold is not taken for a disagreement.
+            mine, theirs = dict(top), (as_served(row["top"]) if as_served else dict(row["top"]))
             diff = max([diff] + [abs(mine[t] - theirs[t]) for t in mine.keys() & theirs.keys()])
-            # A token in only one list must sit at that list's edge: within tolerance of its k-th value.
-            for found, other in ((mine, theirs), (theirs, mine)):
-                if len(found) < top_k:
+            # A token in only one list must sit at that list's edge: within tolerance of its k-th value. The scored
+            # list's edge is its own k-th value, before ids were left out.
+            for found, other, full in ((mine, theirs, mine), (theirs, mine, dict(row["top"]))):
+                if len(full) < top_k:
                     continue   # alternatives the server could not name by bytes were left out
-                edge = min(found.values())
+                edge = min(full.values())
                 if any(value > edge + tolerance for t, value in found.items() if t not in other):
                     lists.append(position)
                     break

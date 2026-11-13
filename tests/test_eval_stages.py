@@ -91,9 +91,10 @@ class StagedRunTests(unittest.TestCase):
         self.assertEqual((cases["long"]["status"], cases["long"]["over_budget"]), ("skipped", True))
         self.assertIn("over budget", cases["long"]["reason"])
         self.assertEqual(gate(result, "coverage")["state"], "unmeasured")
-        for part in ("followup", "sampled_speed"):
-            self.assertEqual(result[part]["status"], "skipped")
-            self.assertIn("stopped after stage 1", result[part]["reason"])
+        self.assertEqual(result["followup"]["status"], "skipped")
+        self.assertIn("stopped after stage 1", result["followup"]["reason"])
+        # The sampled suite is stage 1's: every candidate's decode KPI is the sampled one.
+        self.assertEqual(result["sampled_speed"]["status"], "measured")
         # Stage 1 measures the held-out prompts whatever the budget left: they are every later Eval's baseline.
         self.assertEqual(result["heldout"]["status"], "measured")
         self.assertIn("heldout", result["history"]["served_between"])
@@ -129,7 +130,7 @@ class StagedRunTests(unittest.TestCase):
             result = run(directory, stage=2)
         self.assertEqual(result["stages"]["reached"], 2)
         self.assertEqual(list(result["context"]["points"]), ["32768"])
-        self.assertEqual(result["sampled_speed"]["status"], "skipped")
+        self.assertEqual(result["sampled_speed"]["status"], "measured")
         self.assertNotIn("again", result["followup"])
         # Stage 2 repeats the short cases: their outputs are compared.
         self.assertEqual(gate(result, "repeatable")["state"], "pass")
@@ -236,7 +237,8 @@ class StagePlanTests(unittest.TestCase):
         self.assertEqual(len(planned[2]["speed"]), 1)    # the short case once more, the long one not again
         self.assertEqual(planned[2]["context"], [(32768 - 256, 256, 0, False)])
         self.assertEqual(planned[2]["retrieval"][0][0] + planned[2]["retrieval"][0][1], 4096)
-        self.assertEqual(len(planned[3]["sampled_speed"]), 4)   # a warmup and one seed per case
+        self.assertEqual(len(planned[1]["sampled_speed"]), 4)   # a warmup and one seed per case, in stage 1
+        self.assertNotIn("sampled_speed", planned[3])
         self.assertNotIn("lower_context", planned[3])
         self.assertEqual(planned["certify"], {})
         # The held-out prompts are stage 1's, priced at their nominal lengths; a run without the part plans none.

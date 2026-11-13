@@ -498,6 +498,7 @@ PROTOCOLS = {
     "crit-eval-v0.4.0": "3f6a56953fe781d6f683970ba5c814ef0451246e73259b98e019934a5e5ddc28",  # stages, certification
     "crit-eval-v0.5.0": "14a342ae8f2b9f413c7c748f71c8831cab8bec36f607184bfd310f8b2d3472d3",  # releases 0.5.0 to 0.5.3
     "crit-eval-v0.6.0": "0ccc760244b448454b16b5eeafef260de88b7811f6a2ace55b53c3938695a812",  # release 0.6.0: modes preserve and speed
+    "crit-eval-v0.7.0": "e13a0225f4998250a485d428b12b228a8dc9699faab3b9e084668b74fdbb0580",  # release 0.7.0: sampled suite in stage 1
 }
 
 
@@ -642,23 +643,26 @@ class CeilingTests(unittest.TestCase):
         self.assertEqual(out["weight_bytes"], read)
         self.assertIsNone(ceiling.model_ceiling(Path(directory) / "missing"))
 
-    def test_exl2_and_exl3_checkpoints_are_refused_not_counted_without_their_matrices(self):
-        trellis = {"model.layers.0.mlp.up_proj.trellis": {"dtype": "I16", "shape": [4, 4, 256],
-                                                          "data_offsets": [0, 8192]},
-                   "model.norm.weight": {"dtype": "BF16", "shape": [64], "data_offsets": [8192, 8320]}}
+    def test_exl2_checkpoints_are_refused_and_exl3_matrices_counted(self):
+        trellis = {"model.layers.0.mlp.up_proj.trellis": {"dtype": "I16", "shape": [4, 4, 64],
+                                                          "data_offsets": [0, 2048]},
+                   "model.norm.weight": {"dtype": "BF16", "shape": [64], "data_offsets": [2048, 2176]}}
         q_weight = {"model.layers.0.mlp.up_proj.q_weight": {"dtype": "I32", "shape": [16, 64],
                                                             "data_offsets": [0, 4096]}}
-        cases = {"exl3 by its config": ({"quant_method": "exl3", "bits": 4}, trellis, "EXL3"),
-                 "exl3 by its tensors": (None, trellis, "EXL3"),
-                 "exl2 by its tensors": (None, q_weight, "EXL2")}
-        for label, (quantization, tensors, method) in cases.items():
-            with self.subTest(label), tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory:
+            model = Path(directory)
+            write_safetensors(model / "model.safetensors", q_weight)
+            (model / "config.json").write_text(json.dumps({"num_hidden_layers": 1}))
+            with self.assertRaisesRegex(ValueError, "EXL2 weights are not read: they are decoded only in CUDA kernels"):
+                ceiling.model_ceiling(model)
+        for quantization in ({"quant_method": "exl3", "bits": 4}, None):
+            with self.subTest(quantization=quantization), tempfile.TemporaryDirectory() as directory:
                 model = Path(directory)
-                write_safetensors(model / "model.safetensors", tensors)
+                write_safetensors(model / "model.safetensors", trellis)
                 config = {"num_hidden_layers": 1, **({"quantization_config": quantization} if quantization else {})}
                 (model / "config.json").write_text(json.dumps(config))
-                with self.assertRaisesRegex(ValueError, f"{method} weights are not read: they are decoded only in CUDA kernels"):
-                    ceiling.model_ceiling(model)
+                out = ceiling.model_ceiling(model)
+                self.assertEqual(out["matmul_flops_per_token"]["bf16"], 2 * 64 * 64)   # a 64 x 64 matrix at 4 bits
 
     def test_prefill_floor_adds_matmul_attention_and_recurrent_time(self):
         model = {"matmul_flops_per_token": {"nvfp4": 4e9, "fp8": 2e9}, "attention_flops_per_pair": 1e5,
@@ -1361,6 +1365,22 @@ class HeldoutTests(unittest.TestCase):
         gate = self.gate(self.result(100.0, 52.0, {"zh": 40.0, "de": 67.6}), baseline)
         self.assertEqual(gate["state"], "fail")
         self.assertIn("zh", gate["detail"])
+
+    def test_a_prompt_drop_within_its_acceptance_noise_passes(self):
+        # 24 rounds accepting 0 to 4 drafts each: a 15% drop on one prompt is inside two standard errors of the change,
+        # while a steady prompt (every round accepting the same) is judged at prompt_tolerance alone.
+        def held(result, pid, accepted):
+            result["heldout"]["prompts"][pid]["samples"] = [{"accepted": accepted}]
+            return result
+        noisy = [0, 4, 1, 3, 0, 4, 2, 2, 0, 4, 1, 3] * 2
+        baseline = held(held(self.result(100.0, 50.0), "zh", noisy), "de", [2] * 24)
+        gate = self.gate(held(held(self.result(100.0, 49.0, {"zh": 42.5, "de": 57.0}), "zh", noisy), "de", [2] * 24),
+                         baseline)
+        self.assertEqual(gate["state"], "pass", gate["detail"])
+        steady = held(held(self.result(100.0, 49.0, {"zh": 57.0, "de": 42.5}), "zh", noisy), "de", [2] * 24)
+        gate = self.gate(steady, baseline)
+        self.assertEqual(gate["state"], "fail")
+        self.assertIn("de", gate["detail"])
 
     def test_without_a_measured_baseline_the_gate_is_unmeasured(self):
         self.assertEqual(self.gate(self.result(100.0, 50.0), None)["state"], "unmeasured")
@@ -3142,6 +3162,37 @@ class QualityTests(unittest.TestCase):
         self.assertAlmostEqual(rounded["replies"][0]["mean_abs_logprob_diff"], 0.025)
         self.assertFalse(check(0.4, "speed")["passed"])       # mean 0.2 over the bound
         self.assertFalse(check(2.5, "speed")["passed"])       # one position past 2 nats
+
+    def test_honesty_reads_the_scored_list_as_the_served_list_names_it(self):
+        """A token no bytes name (it reads as U+FFFD) is left out of the served top-k list; the scored list, which
+        names ids, is read the same way before the two are compared, so it is no disagreement. A real one still fails."""
+        from crit_eval.run.chat import ChatEngine
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        top_k = protocol["quality"]["top_k"]
+        texts = [{"id": "json", "set": "conversations", "prompt_ids": [1, 2, 3]}]
+        pieces = [f"t{i}".encode() for i in range(top_k + 2)]
+        pieces[3] = "�".encode()
+        tokenizer = SimpleNamespace(token_bytes=lambda: pieces, id_to_token=lambda i: f"t{i}", added_tokens={})
+        values = [-1.0 - i for i in range(top_k)]   # the scored list's edge is values[-1]
+        scored_top = [[i, values[i]] for i in range(top_k)]   # id 3 (U+FFFD) sits far above the edge
+
+        def engine(served_top):
+            chat = ChatEngine.__new__(ChatEngine)
+            chat.text, chat.by_bytes, chat.named = SimpleNamespace(tokenizer=tokenizer), None, None
+            chat.reply = lambda prompt, n, k: {"tokens": [0], "logprobs": [values[0]], "top": [served_top]}
+            chat.score = lambda prompt, continuation, k, prompt_rows=True: {
+                "continuation": [{"logprob": values[0], "top": scored_top}]}
+            return chat
+
+        def check(served_top):
+            return quality_checks.run_honesty(engine(served_top), {}, {"quality": texts}, protocol, lambda m: None, {},
+                                              mode="speed")
+        served = [pair for pair in scored_top if pair[0] != 3]   # top_k - 1 entries, as _reply_rows leaves them
+        self.assertTrue(check(served)["passed"])
+        # The served list full, with a token the scored list does not hold far above the edge: a real disagreement.
+        self.assertFalse(check(served + [[top_k, values[1]]])["passed"])
+        # The scored list naming a nameable token the served one lacks, far above the edge: still a disagreement.
+        self.assertFalse(check([pair for pair in served if pair[0] != 1])["passed"])
 
     def lp(self, token):
         return self.LP[self.TOP.index(token)] if token in self.TOP else self.LP[3]

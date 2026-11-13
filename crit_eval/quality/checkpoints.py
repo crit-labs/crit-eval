@@ -364,6 +364,42 @@ def open_checkpoint(model, config):
     return Checkpoint(source.path, quantization)
 
 
+def scoring_refusal(model):
+    """Why crit-eval's reference cannot score `model`, from its files alone (no weight is read), or None. What the
+    reference would refuse later: a model Core cannot open or whose config Core's rules refuse (for a lone GGUF, an
+    architecture without config rules), a GGUF architecture without layout rules (crit_eval.architectures.gguf_layout)
+    or one the gguf package does not know, a scheme no CPU decoder reads, and a model type the installed transformers
+    has no modeling code for. crit run create states it before any candidate is built."""
+    import importlib.util
+    from crit_core.model import open_model
+    try:
+        source = open_model(model)
+        config = source.config()
+        if source.format == "gguf":
+            from ..architectures.gguf_layout import LAYOUTS
+            architecture = source.weights.architecture
+            if architecture not in LAYOUTS:
+                return (f"GGUF architecture {architecture!r} has no layout rules in crit_eval.architectures.gguf_layout "
+                        f"(supported: {', '.join(sorted(LAYOUTS))})")
+            if importlib.util.find_spec("gguf") is None:
+                return "the reference decodes a GGUF's tensors with the gguf package, which is not installed"
+            import gguf
+            if architecture not in gguf.MODEL_ARCH_NAMES.values():
+                return f"the installed gguf package does not know architecture {architecture!r}"
+        else:
+            refuse_unread(quantization_of(config))
+    except (ValueError, OSError, SystemExit) as error:   # Core's and the schemes' refusals are ValueErrors
+        return str(error)
+    if importlib.util.find_spec("transformers") is None:
+        return "the reference runs the model's transformers modeling code, and transformers is not installed"
+    from importlib.metadata import version
+    from transformers import CONFIG_MAPPING
+    kind = config.text_model_type or config.model_type
+    if kind and kind not in CONFIG_MAPPING and config.model_type not in CONFIG_MAPPING:
+        return f"transformers {version('transformers')} has no modeling code for model type {kind!r}"
+    return None
+
+
 def _text_config(model):
     """transformers' own config object, which its modeling classes need, from the model's config.json (the
     folder's own, or the one a GGUF derives); it must first pass Core's rules (crit_core.model.ModelSource.config),

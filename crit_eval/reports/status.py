@@ -375,9 +375,32 @@ def _host_load(row):
     return f", other processes {low:.1f} vs {high:.1f} CPU cores"
 
 
+def _relative_acceptance_error(row):
+    """The relative standard error of a held-out prompt's tokens per round, from the drafts each of its measured
+    rounds accepted (samples[].accepted): None for a prompt that reports no rounds, or fewer than two."""
+    accepted = [a for sample in row.get("samples") or [] for a in (sample.get("accepted") or [])]
+    if len(accepted) < 2:
+        return None
+    mean = sum(accepted) / len(accepted)
+    spread = (sum((a - mean) ** 2 for a in accepted) / (len(accepted) - 1)) ** 0.5
+    return spread / len(accepted) ** 0.5 / (mean + 1)   # a round emits its accepted drafts and the target's token
+
+
+def _acceptance_noise(row, old):
+    """protocol heldout.prompt_noise_z: the relative standard error of a held-out prompt's decode change between two
+    results, from both prompts' per-round acceptance (each run draws its own prompt length and decodes its own text,
+    so a prompt's tokens per round moves between runs by about this much on the same engine); None when either
+    reports no rounds."""
+    now, before = _relative_acceptance_error(row), _relative_acceptance_error(old)
+    if now is None or before is None:
+        return None
+    return (now ** 2 + before ** 2) ** 0.5
+
+
 def _generality_gate(result, protocol, baseline):
     """Held-out prompts against a baseline that measured them: the held-out decode score may not fall by more than
-    the tolerance and no held-out prompt may slow down by more than prompt_tolerance, whatever the suite gained.
+    the tolerance and no held-out prompt may slow down by more than prompt_tolerance, or by more than prompt_noise_z
+    standard errors of its acceptance where that is wider (_acceptance_noise), whatever the suite gained.
     How far the held-out change trails the suite's is reported, not judged: speculation gains less on text that
     drafts poorly, so a trailing held-out score alone is not proof of tuning to the suite."""
     held = result.get("heldout")
@@ -402,12 +425,16 @@ def _generality_gate(result, protocol, baseline):
     failures = []
     if held_change < -tolerance:
         failures.append(f"held-out decode {held_change:+.1%} (more than {tolerance:.0%} slower)")
+    z = float(settings.get("prompt_noise_z", 0.0))
     for pid, row in held.get("prompts", {}).items():
         old = (before.get("prompts") or {}).get(pid) or {}
         if row.get("status") == "measured" and old.get("status") == "measured" and old.get("decode_tps"):
             change = row["decode_tps"] / old["decode_tps"] - 1
-            if change < -prompt_tolerance:
-                failures.append(f"{pid} ({row.get('language')}) {change:+.1%}")
+            noise = _acceptance_noise(row, old)
+            bound = max(prompt_tolerance, z * noise) if noise is not None else prompt_tolerance
+            if change < -bound:
+                failures.append(f"{pid} ({row.get('language')}) {change:+.1%}"
+                                + (f" (beyond its {bound:.0%} noise bound)" if bound > prompt_tolerance else ""))
     suite = "suite decode not compared (different decode text)" if suite_change is None else f"suite {suite_change:+.1%}"
     detail = f"held-out decode {held_change:+.1%}, {suite} against {compared['label']}"
     return [{"name": "generality", "state": "fail" if failures else "pass",

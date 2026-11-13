@@ -6,10 +6,10 @@ architecture, such as Qwen3 MoE always renormalising its top-k expert weights, t
 derives a lone GGUF's config.json with them (crit_core.model.gguf_files, through crit_core.registry gguf_config:
 crit_eval registers CONFIG_RULES when imported and names it in an entry point), and crit_eval.architectures.gguf_layout
 inverts the converter's tensor transforms for the same architectures. A rule builds on crit-core's generic keys
-(base_config, expert_config, layer_flag); DeepSeek V4's and Qwen3.8-Flash-Next's own keys are
-crit_eval.architectures.gguf_deepseek4 and gguf_qwen4exp. Every rule is tested against the original config.json of
-models converted by the reference converter (tests/test_eval_gguf.py, test_eval_gguf_deepseek4.py and
-test_eval_gguf_qwen4exp.py).
+(base_config, expert_config, layer_flag); DeepSeek V4's, Qwen3.8-Flash-Next's and Gemma 4's own keys are
+crit_eval.architectures.gguf_deepseek4, gguf_qwen4exp and gguf_gemma4. Every rule is tested against the original
+config.json of models converted by the reference converter (tests/test_eval_gguf.py, test_eval_gguf_deepseek4.py,
+test_eval_gguf_qwen4exp.py and test_eval_gguf_gemma4.py).
 """
 import math
 import struct
@@ -161,6 +161,11 @@ def _deepseek4(model, get):
     return deepseek4_config(model, get)
 
 
+def _gemma4(model, get):
+    from .gguf_gemma4 import gemma4_config
+    return gemma4_config(model, get)
+
+
 def _qwen4exp(model, get):
     from .gguf_qwen4exp import qwen4exp_config
     return qwen4exp_config(model, get, _qwen35(model, get, moe=True))
@@ -177,4 +182,5 @@ CONFIG_RULES = {
     "qwen35moe": lambda model, get: _qwen35(model, get, moe=True),
     "deepseek4": _deepseek4,
     "qwen4exp": _qwen4exp,
+    "gemma4": _gemma4,
 }
