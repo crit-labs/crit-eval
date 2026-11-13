@@ -18,7 +18,8 @@ An architecture is read only when LAYOUTS has its rules; each rule set is the in
 that architecture and is proven by a round trip (tests/test_eval_gguf.py: a model converted by the reference
 converter comes back tensor for tensor; DeepSeek V4, whose rules are crit_eval.architectures.gguf_deepseek4, in
 tests/test_eval_gguf_deepseek4.py; Qwen3.8-Flash-Next, whose rules are crit_eval.architectures.gguf_qwen4exp, in
-tests/test_eval_gguf_qwen4exp.py). A Llama-architecture GGUF is assumed converted from the Hugging Face
+tests/test_eval_gguf_qwen4exp.py; Gemma 4, whose rules are crit_eval.architectures.gguf_gemma4, in
+tests/test_eval_gguf_gemma4.py). A Llama-architecture GGUF is assumed converted from the Hugging Face
 layout (Q and K permuted); one converted from Mistral's native format is not. Requires numpy, torch and gguf.
 """
 import math
@@ -156,6 +157,11 @@ def _deepseek4(gguf, config):
     return DeepseekV4Layout(gguf, config)
 
 
+def _gemma4(gguf, config):
+    from .gguf_gemma4 import Gemma4Layout
+    return Gemma4Layout(gguf, config)
+
+
 def _qwen4exp(gguf, config):
     from .gguf_qwen4exp import Qwen4ExpLayout
     return Qwen4ExpLayout(gguf, config)
@@ -171,6 +177,7 @@ LAYOUTS = {
     "qwen35moe": GatedDeltaNetLayout,
     "deepseek4": _deepseek4,
     "qwen4exp": _qwen4exp,
+    "gemma4": _gemma4,
 }
 
 

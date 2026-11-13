@@ -58,8 +58,10 @@ def batch_terms(model, kv_bytes_per_element):
     shape = config.attention_shape()
     kv = attention = 0
     if shape:
-        full, heads, head_dim, kv_heads = shape
-        kv = 2 * kv_heads * head_dim * full * kv_bytes_per_element
+        full, heads, head_dim, _ = shape
+        # Core's count of what a token caches: a layer whose keys are its values caches one tensor, a latent-attention
+        # layer its latent and rope key.
+        kv = (config.kv_elements_per_token() or 0) * kv_bytes_per_element
         attention = 4 * heads * head_dim * full
     moe = config.moe
     return {"resident_bytes": split["resident"] - split["draft"], "expert_bytes": split["experts"],

@@ -140,7 +140,7 @@ From a Hugging Face GGUF repository, download the one quantization you want and 
 file: a folder with several quantizations holds several models and is refused.
 
 Configs are derived for the `llama`, `qwen2`, `qwen3`, `qwen3moe`, `qwen35`, `qwen35moe`,
-`deepseek4` (DeepSeek V4) and `qwen4exp` (Qwen3.8-Flash-Next) architectures (another
+`deepseek4` (DeepSeek V4), `qwen4exp` (Qwen3.8-Flash-Next) and `gemma4` (Gemma 4) architectures (another
 architecture gets the generic shape keys when its metadata needs nothing more, and is refused by
 name otherwise), tokenizers for byte-level BPE
 vocabularies with the `qwen2`, `qwen35`, `llama-bpe`, `deepseek-v3`, `joyai-llm` (DeepSeek V4's)
@@ -166,7 +166,13 @@ norms as 1 + w and moves the n-gram hash constants to metadata; the reference ta
 joins the projection, subtracts the 1 (one rounding) and reads the constants exactly, from GGUFs
 written with or without the merges ([gguf_qwen4exp.py](../crit_eval/architectures/gguf_qwen4exp.py)). A GGUF
 whose attention layers have no compress ratio (the converter writes that when transformers renamed
-the layer types it read) runs plain attention in GGUF's runtime and is refused. Embedding tables are
+the layer types it read) runs plain attention in GGUF's runtime and is refused. Gemma 4's converter
+writes its geometry per layer kind (the sliding layers' and the full layers' own KV heads and head
+size, keys equal to values where a full layer holds no value projection, the full layers'
+proportional RoPE as a `rope_freqs` tensor) and moves the router's two scale vectors; the config
+states each and the reference moves the vectors back, with no rounding
+([gguf_gemma4.py](../crit_eval/architectures/gguf_gemma4.py)); it needs a transformers with Gemma 4
+and a gguf package that knows `gemma4`. Embedding tables are
 read by rows: a row of a GGUF tensor is whole blocks of its format, so a lookup reads and decodes only
 the rows it needs, never the whole table (Qwen3.8-Flash-Next's n-gram table is about 95 GiB). A
 block type the gguf package cannot decode is refused by name: ISTA-DASLab's GSQ-RCO quantizations
@@ -200,8 +206,10 @@ at its stored format's rate: weight-only integer codes at bf16 (engines widen th
 8-bit integer weights with per-row scales at fp8 (int8 tensor cores run at the FP8 rate), MXFP4 at
 nvfp4. Refused by name: AWQ GEMV layouts, GPTQModel's planar 5/6/7-bit layout, generative ONNX
 graphs (a `genai_config.json` beside them: fused, renamed layers), ONNX quantized ops other than
-MatMulNBits, and EXL2 and EXL3, which are decoded only in CUDA kernels, so there is no CPU
-dequantization to check against.
+MatMulNBits, and EXL2, which is decoded only in CUDA kernels, so there is no CPU dequantization to
+check against. EXL3 is decoded on the CPU: its tiles with the format's own integer arithmetic and FP16
+roundings (the tests check every codebook and bitrate against the format's CUDA decoder, bit for bit),
+the Hadamard rotations and sign vectors around them in FP32.
 
 `reference` runs the text model's own transformers forward in FP32 and streams its decoder
 layers onto the GPU one at a time ([reference.py](../crit_eval/quality/reference.py)). One pass
@@ -403,7 +411,8 @@ within one series: one minor version before 1.0 (0.1.x), one major version from 
 crit-eval's releases only, and the release names them: between releases every change to the protocol or the suite
 stays under the protocol id of the coming release, and nothing in a change picks a version: the changes since the
 0.5.x releases (which all ran `crit-eval-v0.5.0`) ran under `crit-eval-v0.6.0`, the coming release's working id,
-which crit-eval 0.6.0 kept. A change that can move a
+which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the changes since ran under
+`crit-eval-v0.7.0`, which crit-eval 0.7.0 kept. A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results

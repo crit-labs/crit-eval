@@ -136,10 +136,11 @@ def model_ceiling(model):
            "attention_layers": None, "attention_flops_per_pair": None, "kv_bytes_per_token": None,
            "recurrent_flops_per_token": 0}
     if shape:
-        full, heads, head_dim, kv_heads = shape
-        # Scores (QK^T) and weighted values (PV): 2 x 2 x heads x head_dim FLOPs per query-key pair.
+        full, heads, head_dim, _ = shape
+        # Scores (QK^T) and weighted values (PV): 2 x 2 x heads x head_dim FLOPs per query-key pair. The cache is
+        # Core's count of what a token caches (one tensor where keys are values), in BF16.
         out.update(attention_layers=full, attention_flops_per_pair=4 * heads * head_dim * full,
-                   kv_bytes_per_token=2 * kv_heads * head_dim * 2 * full)  # K and V, BF16
+                   kv_bytes_per_token=(config.kv_elements_per_token() or 0) * 2)
     linear = config.layer_types.count("linear_attention")
     attention = config.linear
     hv, dk, dv = ((attention.num_value_heads, attention.key_head_dim, attention.value_head_dim) if attention

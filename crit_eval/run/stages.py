@@ -127,7 +127,7 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
         if certify and first < required <= info["max_context"]:
             out["certify"]["context"] = [(required - n, n, 0, False)]
     if sampled and prepared.get("sampling") is not None:
-        out[3]["sampled_speed"] = each * (int(rule["sampled_repetitions"]) + 1)
+        out[1]["sampled_speed"] = each * (int(rule["sampled_repetitions"]) + 1)
     if exactness and info.get("speculative"):
         out[3]["exactness"] = [(len(c["prompt_ids"]), c["output_tokens"], 0, True)
                                for c in exactness_cases(prepared, info, rule)]

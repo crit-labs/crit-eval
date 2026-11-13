@@ -9,6 +9,62 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-11-13
+
+### Overview
+
+crit-eval 0.7.0 starts protocol series crit-eval-v0.7, with protocol crit-eval-v0.7.0. The protocol changes since
+0.6.1: the sampled suite runs in stage 1, so every candidate's decode KPI is the sampled one; the generality gate
+judges each held-out prompt against its own acceptance noise; and the ceiling and the batched step count the KV cache
+as Core does, keys equal to values cached once. The reference reads EXL3 checkpoints and Gemma 4 GGUFs, and
+`scoring_refusal` says from a model's files alone why the reference cannot score it, which crit run create states
+before any candidate is built. Results do not compare with 0.6.x ones; the reference scores carry over.
+
+### Added
+
+- `crit_eval.quality.checkpoints.scoring_refusal(model)` says why the reference cannot score a model, from its files
+  alone: a model Core cannot open or whose config its rules refuse, a GGUF architecture without layout rules or one
+  the gguf package does not know, a scheme no CPU decoder reads, a model type the installed transformers has no
+  modeling code for. crit run create states it before any candidate is built.
+- Gemma 4 GGUFs are read for the reference (`gemma4`, `crit_eval.architectures.gguf_gemma4`): the config states
+  the sliding and full layers' own KV heads and head size, keys equal to values, the shared-KV and per-layer-input
+  keys, the MoE block with `top_k_experts`, and both layer kinds' RoPE (the full layers' partial rotary factor from
+  the converter's `rope_freqs`); the reference moves the router's scale vectors back and reads the fused or split
+  experts, with no rounding. Its block formats (Q8_0, IQ4_NL, IQ4_XS, IQ3_S and the K-quants) decode through gguf-py,
+  as Core's own decoders decode them. Proven by a round trip through the reference converter.
+- EXL3 checkpoints are read: the reference decodes their matrices on the CPU (the tiles bit for bit as the format's
+  decoder gives them, for every codebook and bitrate, the Hadamard rotations and sign vectors in FP32), and the
+  ceiling counts them at the bf16 rate. EXL2 stays refused.
+
+### Changed
+
+- The protocol is `crit-eval-v0.7.0`, a new series: the two changes below changed `protocol.json` under the released
+  `crit-eval-v0.6.0`, which the test that pins every released protocol to its hash refused. Results under
+  `crit-eval-v0.6.0` compare with each other, not with these.
+- The ceiling and the batched step count the KV cache as Core does (`kv_elements_per_token`): a full-attention
+  layer whose keys are its values caches one tensor, and a latent-attention layer its latent and rope key, where
+  they counted K and V of every KV head. That halves the ceiling's and the concurrency floor's KV bytes per token for
+  keys-equal-values models such as Gemma 4 and changes them for latent-attention ones; other models are unchanged.
+- The sampled suite runs in stage 1, so every candidate's Eval scores the sampled decode KPI and the sampling check:
+  a run capped at stage 1 or 2 used to score greedy decode only, and a plan forecast from those Evals missed the
+  first certified one on decode by the gap between the two suites. It adds about one greedy suite's decode time to
+  stage 1 (the warmup that serves the sampling check and one seed per case). Exactness and the follow-up turns' second
+  pass stay stage 3's. Results measured before are unchanged; a stage 1 or 2 result from crit-eval 0.6.1 has no
+  sampled suite to compare with.
+- The generality gate judges each held-out prompt against its own noise: a prompt fails when it decodes slower than in
+  the baseline by more than `prompt_tolerance` or, where that is wider, by more than `prompt_noise_z` (2) standard
+  errors of the change, from the drafts each result's rounds accepted on it. A 64-token reply is about 25 rounds and
+  each run decodes its own text at its own drawn length, so one prompt moved 10-20% between Evals of the same engine
+  and failed the gate on noise. The held-out decode score's `tolerance` is unchanged, and so is a prompt of an engine
+  that reports no rounds.
+
+### Fixed
+
+- The honesty check reads the scored top-k list the way the served one is read: an alternative no bytes name (a token
+  that reads as U+FFFD, which the served list leaves out) is left out of the scored list too before the two are
+  compared, and the scored list's edge stays its own k-th value. Such a token sitting above the scored list's edge
+  failed an engine whose served and scored replies agreed bit for bit.
+
 ## [0.6.1] - 2026-11-09
 
 ### Changed
@@ -811,7 +867,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.0...HEAD
+[0.7.0]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/crit-labs/crit-eval/compare/v0.5.2...v0.5.3

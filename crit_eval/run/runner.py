@@ -816,6 +816,16 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
         # measured them (protocol heldout.generality).
         with times.part("heldout"):
             result["heldout"] = run_heldout(engine, info, prepared, protocol, log, settings["jitter"])
+    if sampled and "speed" in parts:
+        # protocol stages 1: the sampled suite on every candidate, so each Eval's decode KPI is the sampled one its
+        # plan is judged by; its warmup's replies serve the sampling check.
+        checked = {}
+        with times.part("sampled_speed"), counters.window("sampled_speed"):
+            result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, 1,
+                                                        int(rule["sampled_repetitions"]), log, disturbed, checked)
+        if result["sampled_speed"]["status"] == "measured":
+            with times.part("sampling_check"):
+                result["sampling_check"] = run_sampling_check(engine, info, prepared, protocol, log, checked)
     short = int(rule["short_quality_tokens"])
     later = quality_sets(prepared, short, above=True)
     stopped = None
@@ -931,14 +941,6 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
     elif "followup" in parts:
         result["followup"] = not_run(2)
     if stage >= 3 and not stopped:
-        if sampled and fits("sampled_speed", cost(3, "sampled_speed")):
-            checked = {}
-            with times.part("sampled_speed"), counters.window("sampled_speed"):
-                result["sampled_speed"] = run_sampled_speed(engine, info, prepared, protocol, 1,
-                                                            int(rule["sampled_repetitions"]), log, disturbed, checked)
-            if result["sampled_speed"]["status"] == "measured":
-                with times.part("sampling_check"):
-                    result["sampling_check"] = run_sampling_check(engine, info, prepared, protocol, log, checked)
         if shared and "speed" in result and fits("exactness", cost(3, "exactness")):
             with times.part("exactness"):
                 result["exactness"] = run_exactness(module, None, {}, with_speed(prepared, exactness_cases(
@@ -948,9 +950,6 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             with times.part("followup_again"):
                 again = run_followup(engine, info, prepared, protocol, lambda message: log("again: " + message))
             result["followup"]["again"] = compare_followup(result["followup"], again)
-    else:
-        if sampled:
-            result["sampled_speed"] = not_run(3)
     if info.get("speculative") and "exactness" in parts and "exactness" not in result and (stage < 3 or info.get("served")):
         result["exactness"] = {"mode": exactness, "status": "unmeasured", "cases": {},
                                "reason": not_run(3)["reason"] if stage < 3 else

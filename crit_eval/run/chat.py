@@ -244,6 +244,7 @@ class ChatEngine:
             self.generate_plain = self._generate_plain
         self.text = load_text(context["model"], server.chat_template)
         self.by_bytes = None  # ids_by_bytes, built for the first quality reply
+        self.named = None     # the ids by_bytes names, for the first scored list read as served
         self.packed = None   # whether the score call answers in the packed format (None: not asked yet)
         # With quality measured (crit_eval.run.runner), every prompt sent as its frozen messages must render to the ids
         # prepare froze, as the honesty check requires: a server on another template fails at its first request.
@@ -445,6 +446,16 @@ class ChatEngine:
             raise RuntimeError(f"{url} returned an empty reply")
         return {"tokens": tokens, "logprobs": logprobs, "top": top, "finish_reason": finish,
                 "prompt_tokens": usage["prompt_tokens"]}
+
+    def as_served(self, top):
+        """A scored top-k list [[id, logprob], ...] as a served reply's would read: {id: logprob} without the ids
+        ids_by_bytes names no bytes by (a piece that reads as U+FFFD), which _reply_rows cannot name in a served list
+        either."""
+        if self.by_bytes is None:
+            self.by_bytes = ids_by_bytes(self.text.tokenizer)
+        if self.named is None:
+            self.named = frozenset(self.by_bytes.values())
+        return {token: value for token, value in top if token in self.named}
 
     def score(self, prompt, continuation, top_k, prompt_rows=True):
         """Fixed text scored through the engine's serving paths (crit serve's chat-score-v1, POST /v1/crit/score):
