@@ -9,6 +9,17 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+### Fixed
+
+- Protocol crit-eval-v0.7.1 (the coming release's working id): in a staged run, steady state (`speed.steady_state`) no longer measures a case's cold
+  first request of stage 2 because it agreed with stage 1's request. Stage 1 decodes each case once, and the other
+  cases run before stage 2 measures it again, so an engine that adapts to what it serves (a device expert cache, a
+  residency that follows the routed experts) meets stage 2 as cold as stage 1: the two requests agreed within 10%,
+  the first was measured, and the case's speed rising as the engine adapted (55, 82, 86 tok/s) stopped the round as
+  a disturbed device. Such a first measured repetition is now provisional: when the request after it spreads from it
+  by more than the tolerance, it stands as one more warmup and that request is judged against it. An engine whose
+  second stage agrees with its first measures as before; unstaged runs, whose warmups are their own, are unchanged.
+
 ## [0.7.0] - 2026-11-13
 
 ### Overview

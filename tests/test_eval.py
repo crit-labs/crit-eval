@@ -1561,6 +1561,41 @@ class RepetitionTests(unittest.TestCase):
         calls, case = self.run_case([130.0, 129.0, 0.0], 1, warmups=0, warmed=earlier)
         self.assertEqual(calls, 2)
 
+    def adapting_case(self, requests, warmups, warmed=None):
+        """One speed case whose requests decode and reach their first token as `requests` ((tok/s, ms) each, 256
+        tokens in 3 s), with a 25% disturbed limit; returns the measured case."""
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
+        queue = [self.sample(decode, ttft) for decode, ttft in requests]
+
+        def timed(engine, prompt, n):
+            return [7] * 4, dict(queue.pop(0), request_ms=3000.0, prefill_tps=None, tokens_per_round=None,
+                                 round_ms=None, output_tokens=256)
+        with patch.object(speed, "timed_generate", timed):
+            return speed.run_speed(None, {"max_context": 64}, prepared, protocol, warmups, 1, lambda m: None,
+                                   disturbed_spread=0.25, warmed=warmed)["cases"]["a"]
+
+    def test_a_repetition_that_agreed_only_with_an_earlier_stage_is_provisional(self):
+        # An engine that adapts to what it serves, staged: stage 1 decoded the case at 57 tok/s on a placement made
+        # for the cases before it, the other cases ran, and stage 2's first request is as cold (55, within 10% of 57,
+        # so measured). Its first token disagrees, so a second repetition runs at 82, the engine now adapted to the
+        # case: 55 was still warming up, 82 too (apart from 55 by more than 10%), and 86, which agrees with 82, is the
+        # measured repetition. Before, 55 stayed measured and 55, 82, 86 stopped the round as a disturbed device.
+        earlier = {"a": {"samples": [{**self.sample(57.0, 50.0), "request_ms": 3000.0}], "tokens": [7] * 4}}
+        requests = [(55.0, 60.0), (82.0, 50.0), (86.0, 50.0), (86.5, 50.0)]
+        case = self.adapting_case(requests, 0, warmed=earlier)
+        self.assertEqual([s["decode_tps"] for s in case["samples"]], [57.0, 55.0, 82.0, 86.0])
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, True, True, False])
+        self.assertEqual(case["decode_tps"], 86.0)
+        self.assertEqual((case["steady_state"]["added"], case["steady_state"]["steady"]), (2, True))
+        # A repetition that agrees with the earlier warmup and with the request after it stays measured, as before.
+        case = self.adapting_case([(56.0, 60.0), (57.5, 50.0), (57.0, 50.0)], 0, warmed=earlier)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, False, False, False])
+        self.assertEqual(case["steady_state"]["added"], 0)
+        # Unstaged, the first measured repetition follows this call's own warmup, and is judged as before.
+        with self.assertRaises(timing.Disturbed):
+            self.adapting_case([(57.0, 50.0)] + requests, 1)
+
     def test_noise_comes_from_the_cases_measured_more_than_once(self):
         def case(*speeds):
             return {"status": "measured", "samples": [{"decode_tps": s, "ttft_ms": 10.0, "output_tokens": 4,

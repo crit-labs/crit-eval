@@ -35,7 +35,10 @@ two repetitions. A KPI's run-to-run spread comes from the cases measured more th
 **Steady state** (`speed.steady_state`): a case is measured at the speed it settles to. Before its first measured
 repetition, a request whose decode speed differs from the request's before it by more than 10% stands as one more
 warmup, until two consecutive requests agree or the case's warmups are done; the extra repetition and the disturbed
-check apply from the first measured repetition on. An engine that adapts to what it serves, a device cache filling
+check apply from the first measured repetition on. In a staged run a case's warmup is its first stage's request, measured before
+the other cases ran: an engine that adapts to what it serves may meet the second stage as cold as it was then, so a
+first measured repetition that agreed only with that warmup is provisional. When the request after it differs from
+it by more than 10%, it stands as one more warmup, and that request is judged against it as above. An engine that adapts to what it serves, a device cache filling
 with the experts a case routes to for example, is measured once it has adapted instead of stopping the round as a
 disturbed device. A case's warmups are done after four that decoded 1,024 tokens between them, and after 16 in any
 case: an engine that adapts per decode window adapts by the tokens it

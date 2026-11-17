@@ -460,7 +460,8 @@ with each score:
 A round stops early when a speed case's measured decode speeds spread by more than the protocol's
 `disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
 The spread is taken over the repetitions measured once the case reached steady state: requests whose speed still
-moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16
+moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16;
+in a staged run a first repetition that agreed only with stage 1's request is provisional
 (protocol `speed.steady_state`,
 [measurements](MEASUREMENTS.md)), and the case records them and the drift as `steady_state`. Repetitions that decoded different replies are
 compared only with repetitions of the same reply (`speed.output_varies`). The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.
