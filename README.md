@@ -117,7 +117,7 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 | exactness | `exactness` | Whether speculative output equals plain greedy, case by case |
 | sampling | `sampling_check` | Whether sampled tokens follow the model's distribution |
 | request history | `history` | Whether the same greedy requests give the same tokens after a long request history |
-| prompt cache | `followup` | Follow-up turns answered from a prompt cache: the same answer, and their prefill and ttft |
+| prompt cache | `followup`, `headroom.followup` | Follow-up turns answered from a prompt cache: the same answer, their prefill and ttft, and the ttft against its floor with a prompt cache, one read of the weights where a turn adds a few tokens (the goal `followup_ttft`) |
 | held-out prompts | `heldout` | Speed on ten prompts in other languages and styles, never used for tuning |
 | hardware | `host`, `device` | OS, CPU, RAM and GPUs (name, VRAM, driver, PCIe link), and the measured GPU bandwidth and matmul rates, PCIe transfer rates, host memory bandwidth and CPU throughput |
 | engine | `engine` | What the engine reported: name, configuration, max context, drafting, bytes read per pass |

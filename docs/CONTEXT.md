@@ -21,7 +21,7 @@ may only make the engine faster.
   length key, from the text config of a multimodal model); with YaRN rope scaling, the original
   positions times the factor.
 - **Device limit:** from the least free memory any `crit eval probe` run saw, subtract the VRAM
-  headroom (default 1 GiB), the reserve for activations, workspaces and graphs, the weights read
+  headroom (default 0.25 GiB), the reserve for activations, workspaces and graphs, the weights read
   on every pass and the state that does not grow with context. Divide the rest by the KV bytes
   per token at the protocol's KV precision and round down to 1,024 tokens.
 

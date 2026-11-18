@@ -78,6 +78,16 @@ def compare(paths):
                 cell += f" ({t['fraction_of_floor']:.0%} of {t['floor_ms']:,.0f} ms floor)"
             cells.append(cell)
         rows.append(("**TTFT** (geomean ms)", cells))
+        if any((r.get("followup") or {}).get("status") == "measured" for r in results):
+            # The follow-up turns' first token against its floor with a prompt cache (headroom.followup_summary).
+            cells = []
+            for r in results:
+                f = (r.get("headroom") or {}).get("followup") or headroom.followup_summary(r) or {}
+                cell = _fmt(f.get("score_ms"), ",.0f")
+                if f.get("floor_ms"):
+                    cell += f" ({f['fraction_of_floor']:.1%} of {f['floor_ms']:,.1f} ms floor with a prompt cache)"
+                cells.append(cell)
+            rows.append(("Follow-up TTFT (geomean ms)", cells))
         for case in case_ids:
             cells = []
             for r in results:

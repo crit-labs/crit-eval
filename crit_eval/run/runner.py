@@ -425,9 +425,13 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         included, so no single-stream figure or gate sees it."""
         if "concurrency" in parts and not result.get("stopped_early"):
             with times.part("concurrency"):
+                try:   # a drafting engine that declares none: the checkpoint's draft layers and the head they read
+                    own = None if info.get("draft_bytes_per_step") or not info.get("speculative") else draft_step_bytes(model)
+                except (OSError, ValueError, KeyError):
+                    own = None
                 result["concurrency"] = run_concurrency(engine, info, prepared, protocol, result, required, log, fits,
                                                         ceiling_inputs,
-                                                        forks=headroom.quality_mode(result) == "speed")
+                                                        forks=headroom.quality_mode(result) == "speed", draft_bytes=own)
     try:
         if staged is not None:
             plan = _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required,

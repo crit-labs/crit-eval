@@ -11,9 +11,10 @@ speed-case reply against that case's serial greedy reply (in quality mode speed,
 protocol forks judges one), the level's aggregate against the batched ceiling (crit_eval.limits.batched), and its
 speedup over the 1-client level beside the speedup the cost model expects (protocol concurrency.speedup; reported, not
 judged)."""
-from ..limits.batched import step_floor
+from ..limits.batched import drafted_floor, step_floor
 from ..limits.context import token_text
 from ..limits.tiers import hit_rate
+from ..reports import metrics
 from .estimate import duration
 from .forks import ForkJudge
 from .outcomes import RequestRecord, StreamOutcome, validate_cohort
@@ -172,15 +173,45 @@ def expectations(found):
         level["expected_missing"] = why
 
 
+def pool_tokens_per_round(result, prompts):
+    """The tokens per round the greedy speed suite measured on the pool's speed cases (geometric mean), which a drafting
+    engine's batched round emits per row (drafted_floor): the level's requests are those prompts, greedy. None without
+    a measured case of the pool."""
+    cases = (result.get("speed") or {}).get("cases") or {}
+    found = [cases[p["case"]]["tokens_per_round"] for p in prompts if p["case"] in cases
+             and cases[p["case"]].get("status") == "measured" and cases[p["case"]].get("tokens_per_round")]
+    return metrics.geometric_mean(found) if found else None
+
+
+def drafted_levels(found, terms, bandwidth_gbs, tflops, host, width, tokens_per_round, draft_bytes):
+    """Each level's ceiling with its drafts counted (drafted_floor), in place on `found`'s levels as "drafted_ceiling"
+    with its fraction ("fraction_of_drafted"), priced as each level's own ceiling is: at its own hit rate where its
+    requests report one. The limit of the concurrency goal (crit_eval.reports.status): the one-token ceiling stays the
+    speedup's, whose ratio speculation leaves alone. Without what prices it, "drafted_missing" says why."""
+    for clients, level in found["levels"].items():
+        rate = level.get("expert_hit_rate")
+        priced = ({**host, "hit_rate": rate, "hit_rate_source": "level requests"} if host and rate is not None else host)
+        floor, missing = drafted_floor(terms, int(clients), found["mean_context"], bandwidth_gbs, tflops, priced,
+                                       width, tokens_per_round, draft_bytes)
+        level["drafted_ceiling"] = ({k: floor.get(k) for k in ("ceiling_tps", "bound", "step_ms", "draft_ms", "round_ms",
+                                                               "tokens_per_round", "width", "basis", "unmeasured")}
+                                    if floor else None)
+        level["drafted_missing"] = missing or None
+        level["fraction_of_drafted"] = (level["aggregate_tps"] / floor["ceiling_tps"]
+                                        if floor and floor.get("ceiling_tps") and level["aggregate_tps"] else None)
+
+
 def run_concurrency(engine, info, prepared, protocol, result, required, log, fits=None, ceiling_inputs=None,
-                    forks=False):
+                    forks=False, draft_bytes=None):
     """The concurrency part on an engine that runs a cohort (a served engine, or Core's package adapter in process):
     result["concurrency"]. fits(name, seconds): whether a level expected to take `seconds` still fits a staged run's
     budget (None: no budget). ceiling_inputs(): (crit_eval.limits.batched batch_terms of the model, the device
     bandwidth, its best rates, host) for each level's ceiling, read only when a level runs; host: what the model reads
     from host memory where the device cannot hold every weight ({"tiers", "hit_rate", "hit_rate_source"} at the run's
     single-stream hit rate, batched.step_floor), None where it can. forks (quality mode speed): each reply that
-    differs from its serial one has its fork judged on the engine (protocol forks)."""
+    differs from its serial one has its fork judged on the engine (protocol forks). draft_bytes: the bytes one draft
+    step reads where the adapter declares none (the model's draft layers), which a drafting engine's level ceilings
+    with its drafts counted take (drafted_levels)."""
     rule = protocol["concurrency"]
     if not callable(getattr(engine, "cohort", None)) or not callable(getattr(engine, "capacity", None)):
         return {"status": "unmeasured", "reason": "measured on an engine that runs requests together: a served one "
@@ -254,6 +285,11 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
                if consistent["compared"] else "")
             + (f", {level['fraction_of_ceiling']:.0%} of its ceiling" if level["fraction_of_ceiling"] else ""))
     expectations(out["levels"])
+    if terms:
+        # A drafting engine that states no width has no drafted ceiling (None): drafted_floor says what is missing.
+        width = (int(info["draft_width"]) if info.get("draft_width") else None) if info.get("speculative") else 0
+        drafted_levels(out, terms, bandwidth_gbs, tflops, host, width, pool_tokens_per_round(result, prompts) if width
+                       else None, info.get("draft_bytes_per_step") or draft_bytes)
     for clients, level in out["levels"].items():
         if int(clients) >= 2 and level["speedup"]:
             log(f"concurrency {clients}: {level['speedup']:.2f}x one client's aggregate"

@@ -463,6 +463,22 @@ class ChatServerTests(unittest.TestCase):
         gate = next(g for g in result["status"]["gates"] if g["name"] == "prompt_cache")
         self.assertEqual(gate["state"], "pass")
 
+    def test_a_server_with_a_prompt_cache_to_turn_off_prefills_every_request_but_the_follow_up_turns(self):
+        self.server.card = {"capabilities": ["chat-prompt-cache-v1"]}
+        result = self.run_eval(("history", "speed", "followup"))
+        self.assertEqual(result["followup"]["status"], "measured")
+        fresh = [r for r in self.server.requests if (r.get("crit") or {}).get("prompt_cache") is False]
+        allowed = [r for r in self.server.requests if "messages" in r and "crit" not in r]
+        # The timed and history requests carry crit.prompt_cache false; the follow-up turns, judged on their text and
+        # timed as a conversation's turns are served, carry none.
+        self.assertTrue(fresh and allowed)
+        self.assertEqual(len(allowed), 2 * len(result["followup"]["turns"]))   # both passes of the turns
+        self.assertEqual(len(fresh) + len(allowed), len([r for r in self.server.requests if "messages" in r]))
+        # A server that declares no such switch gets no crit object, as before.
+        self.server.card, self.server.requests[:] = {}, []
+        self.run_eval(("history",))
+        self.assertFalse([r for r in self.server.requests if "crit" in r])
+
     def test_a_server_must_stream_usage_and_prefill_every_request(self):
         engine, _ = self.engine()
         prompt = json.loads((self.data / "prepared.json").read_text())["speed"][0]["prompt_ids"]

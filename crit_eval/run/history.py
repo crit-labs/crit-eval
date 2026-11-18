@@ -21,15 +21,20 @@ def run_followup(engine, info, prepared, protocol, log):
         reason = f"its last turn needs {len(turns[-1]['prompt_ids']) + n:,} tokens of context"
         log(f"followup: skipped ({reason})")
         return {"status": "skipped", "reason": reason}
-    rows = []
+    rows, before = [], None
     for turn in turns:
         tokens, sample = timed_generate(engine, turn["prompt_ids"], n, prompt_cache=True)
         served = sample.get("served") or {}
         prompt = int(served.get("prompt_tokens") or len(turn["prompt_ids"]))
         cached = served.get("cached_tokens")
         fresh = prompt - (cached or 0)
-        rows.append({"turn": turn["turn"], "prompt_tokens": prompt, "cached_tokens": cached, "ttft_ms": sample["ttft_ms"],
+        rows.append({"turn": turn["turn"], "prompt_tokens": prompt, "cached_tokens": cached,
+                     # The prompt's tokens past the prefix it shares with the turn before it: what a prompt cache
+                     # holding that turn leaves to prefill, which the turn's floor is priced at (headroom.followup_summary).
+                     "new_tokens": new_tokens(turn["prompt_ids"], before),
+                     "ttft_ms": sample["ttft_ms"],
                      "prefill_tps": fresh * 1000 / sample["ttft_ms"] if sample["ttft_ms"] else None, "tokens": tokens})
+        before = turn["prompt_ids"]
         log(f"followup turn {turn['turn']}: {prompt:,} prompt tokens"
             + (f", {cached:,} cached" if cached is not None else "")
             + f", first token after {sample['ttft_ms']:,.0f} ms")
@@ -37,6 +42,13 @@ def run_followup(engine, info, prepared, protocol, log):
     return {"status": "measured", "turns": rows,
             "ttft_ms": metrics.geometric_mean([r["ttft_ms"] for r in later if r["ttft_ms"]]),
             "prefill_tps": metrics.geometric_mean([r["prefill_tps"] for r in later if r["prefill_tps"]])}
+
+
+def new_tokens(prompt, before):
+    """The tokens of `prompt` past the longest prefix it shares with `before`, the turn before it (None: the first
+    turn, every token new)."""
+    shared = next((i for i, (a, b) in enumerate(zip(prompt, before or ())) if a != b), min(len(prompt), len(before or ())))
+    return len(prompt) - shared
 
 
 def compare_followup(first, again):
