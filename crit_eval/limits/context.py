@@ -301,13 +301,18 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
         # The CPU computes misses at its expert lane's measured rate (one token an expert, a plain pass), never above
         # host memory's read rate; a probe without the lane prices them at the read rate, an upper bound.
         cpu_rate = min(memory, lane["tokens_1"]) if memory and lane.get("tokens_1") else memory
+        # A layer whose misses the CPU computes hands its rows to the host and waits for the answer: one turn a
+        # routed layer of the pass (at even routing every routed layer misses), beside whatever the CPU computes.
+        # A probe that measured no turn prices none: the CPU's floors are then lower bounds on a device reached
+        # through a virtual machine, where a turn is most of a millisecond.
+        turns = len(config.routed_layers()) * ((device or {}).get("host_turn_us") or 0.0) / 1000 if missed else 0.0
         if missed and cpu_rate:
-            floors["cpu"] = max(own, missed / (cpu_rate * 1e9) * 1000)
+            floors["cpu"] = max(own, missed / (cpu_rate * 1e9) * 1000) + turns
         if missed and link and cpu_rate:
             # A link copy reads host memory as the CPU's arithmetic does: split so both finish together. With the lane
             # measured beside link copies, the split runs at those two rates' sum; else at most host memory's read rate.
             both = lane.get("with_link_cpu", 0) + lane.get("with_link_link", 0)
-            floors["split"] = max(own, missed / ((both if both else min(link + cpu_rate, memory)) * 1e9) * 1000)
+            floors["split"] = max(own, missed / ((both if both else min(link + cpu_rate, memory)) * 1e9) * 1000) + turns
     # A device cache over host experts (scenario 2's starting design) copies its slots from host memory, so the host
     # holds every expert, those the device also caches included; where only the off-device share fits, the device's
     # experts must be its own (a static split), not cached copies.
@@ -326,6 +331,8 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
                           **({"cpu_expert_lane": {k: lane[k] for k in ("tokens_1", "tokens_3", "tokens_8", "with_link_cpu",
                                                                       "with_link_link") if k in lane}} if lane else {})},
             "cpu_gflops": ((device or {}).get("cpu_gflops") or {}).get("fp32"),
+            "host_turn_us": (device or {}).get("host_turn_us"),
+            "host_turns_ms": round(turns, 3) if floors.get("cpu") is not None else None,
             "plain_pass_floor_ms": floors,
             "plain_pass_ceiling_tps": {k: round(1000 / v, 1) for k, v in floors.items() if v}}
 
@@ -368,8 +375,13 @@ def render_placement(value):
         lines.append(f"  CPU expert lane (integer block rows): {lane.get('tokens_1', 0):g} / {lane.get('tokens_3', 0):g} / "
                      f"{lane.get('tokens_8', 0):g} GB/s at 1 / 3 / 8 tokens an expert; beside link copies "
                      f"{lane.get('with_link_cpu', 0):g} GB/s with the link at {lane.get('with_link_link', 0):g}")
+    turned = value.get("host_turns_ms")
     for key, tps in value["plain_pass_ceiling_tps"].items():
         lines.append(f"  plain pass, {names[key]}: {value['plain_pass_floor_ms'][key]:.2f} ms floor, {tps:,.1f} tok/s"
+                     + (f" ({turned:.2f} ms of it the routed layers' turns to the host and back, "
+                        f"{value['host_turn_us']:g} us each)" if key in ("cpu", "split") and turned else
+                        " (no turn to the host priced: the probe measured none; probe again)"
+                        if key in ("cpu", "split") and turned is not None and not value.get("host_turn_us") else "")
                      + ((" (the CPU lane and the link measured together, both reading host memory)" if lane else
                          f" (both read host memory, together at most its {value['rates_gbs']['host_memory_read']:g} GB/s "
                          "read; probe again for the CPU lane's own rates)") if key == "split" else ""))
