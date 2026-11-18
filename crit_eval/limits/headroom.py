@@ -434,11 +434,12 @@ def quality_mode(result):
 
 
 def mode_limits(result):
-    """The prefill ceiling, time-to-first-token floor and long-context first-token floor of the result's quality mode:
-    {"activations": label, "prefill": tok/s, "ttft": ms, "context_ttft": ms or None}, or None where the stored-format
-    limits stand. A mode's limits take the fastest of the prompt activations it admits (MODE_ACTIVATIONS) and of any
-    arithmetic quality shows passing (activation_ceilings' reachable one), priced on the same cases and points as the
-    stored ones. preserve keeps the activations in 16 bits; the speed mode admits the stored
+    """The prefill ceiling, time-to-first-token floor, long-context first-token floor and follow-up turns' floor of the
+    result's quality mode: {"activations": label, "prefill": tok/s, "ttft": ms, "context_ttft": ms or None,
+    "followup_ttft": ms or None}, or None where the stored-format limits stand. A mode's limits take the fastest of
+    the prompt activations it admits (MODE_ACTIVATIONS) and of any arithmetic quality shows passing
+    (activation_ceilings' reachable one), priced on the same cases, points and turns as the stored ones. preserve
+    keeps the activations in 16 bits; the speed mode admits the stored
     format's too, so its limits are the stored format's (None) wherever that is the fastest priced (a device with the
     format's tensor cores), and a faster one's elsewhere (FP8 for 4-bit matrices on a device without 4-bit ones).
     None too while the ceilings by activation are not priced (a checkpoint with no FP8 or NVFP4 matrices)."""
@@ -473,7 +474,10 @@ def mode_limits(result):
         if floor:
             floors.append(floor["total_ms"])
     context = metrics.geometric_mean(floors) if points and len(floors) == len(points) else None
-    return {"activations": label, "prefill": score, "ttft": ttft_floor, "context_ttft": context}
+    # The follow-up turns' floor with a prompt cache at the same activations (followup_summary).
+    follow = followup_summary(result, rates, shares)
+    return {"activations": label, "prefill": score, "ttft": ttft_floor, "context_ttft": context,
+            FOLLOWUP_KPI: follow["floor_ms"] if follow else None}
 
 
 def reachable_gap(prefill, activations):
@@ -528,6 +532,65 @@ def ttft_summary(info, speed, ceiling, tflops, bandwidth_gbs):
     efficiency = floor_score / score if score and floor_score else None
     return {"cases": cases, "score_ms": score, "floor_ms": floor_score, "fraction_of_floor": efficiency,
             "missing": missing}
+
+
+# The follow-up turns' goal and gap (followup_summary): crit-eval states them; the run's priority rule does not rank them.
+FOLLOWUP_KPI = "followup_ttft"
+FOLLOWUP_GAP = "follow-up turns' first token at its floor with a prompt cache"
+
+
+def followup_summary(result, rates=None, shares=None):
+    """The follow-up turns' time to first token against its floor with a prompt cache (protocol followup's turns; a
+    goal crit-eval states, not a gate): a turn after the first prefills only what a cache holding the turn before it
+    leaves, its new_tokens (the prompt past the prefix the two turns' prompts share; in a result measured before the
+    run counted them, its prompt tokens less the earlier turn's), and fewer where the engine reports more cached, over
+    the whole conversation's KV (ceiling.ttft_floor_ms with cached_tokens). So the floor is one read of the weights
+    and that KV, or the new tokens' arithmetic where that is longer, whatever the engine built. {"score_ms" (the
+    followup KPI: the geometric mean over the turns after the first), "floor_ms" (the same mean of their floors),
+    "fraction_of_floor", "turns", "missing", "gap"}; None when the turns were not measured. rates: the GEMM rates the
+    floors take (default the headroom's); shares: the quantized matrices' prompt activations, where a quality mode
+    prices its own (mode_limits)."""
+    follow = result.get("followup") or {}
+    if follow.get("status") != "measured":
+        return None
+    room, info = result.get("headroom") or {}, result.get("engine") or {}
+    rates = rates or (room.get("rates") or {}).get("tflops")
+    bandwidth_gbs = room.get("bandwidth_gbs") or result.get("bandwidth_gbs")
+    ceiling = tiered_ceiling(result)
+    rows = sorted(follow.get("turns") or [], key=lambda row: row["turn"])
+    turns, missing, measured, floors = {}, [], [], []
+    for before, row in zip(rows, rows[1:]):
+        if not row.get("ttft_ms"):
+            continue
+        prompt = row["prompt_tokens"]
+        new = row["new_tokens"] if row.get("new_tokens") is not None else prompt - before["prompt_tokens"]
+        # Never more than the engine computed: a cache that held more than the earlier turn's prompt left less.
+        new = min(new, prompt - (row.get("cached_tokens") or 0))
+        found = {"prompt_tokens": prompt, "new_tokens": new, "cached_tokens": row.get("cached_tokens"),
+                 "ttft_ms": row["ttft_ms"]}
+        if new > 0:   # a turn served whole from a cache needs no pass: it has no floor
+            floor, lacking = model_ceiling.ttft_floor_ms(ceiling, rates, bandwidth_gbs, prompt, info.get("bytes_per_pass"),
+                                                        shares, info.get("kv_bytes_per_token"), cached_tokens=prompt - new)
+            missing += [m for m in lacking if m not in missing]
+            if floor:
+                found["floor"] = floor
+                found["efficiency"] = floor["total_ms"] / row["ttft_ms"]
+                floors.append(floor["total_ms"])
+        measured.append(row["ttft_ms"])
+        turns[str(row["turn"])] = found
+    score = metrics.geometric_mean(measured)
+    floor_score = metrics.geometric_mean(floors) if floors and len(floors) == len(measured) else None
+    gap = None
+    if score and floor_score and score > floor_score:
+        gap = {"kpi": FOLLOWUP_KPI, "name": FOLLOWUP_GAP, "projected_gain": score / floor_score - 1,
+               "detail": ", ".join(
+                   f"turn {turn}: {row['ttft_ms']:,.0f} vs {row['floor']['total_ms']:,.1f} ms "
+                   f"({row['new_tokens']:,} of {row['prompt_tokens']:,} prompt tokens new, "
+                   f"{row['cached_tokens'] or 0:,} served from a cache; {row['floor']['bound']} bound)"
+                   for turn, row in turns.items() if row.get("floor"))}
+    return {"score_ms": score, "floor_ms": floor_score,
+            "fraction_of_floor": floor_score / score if score and floor_score else None,
+            "turns": turns, "missing": missing, "gap": gap}
 
 
 def prompt_gaps(prefill, ttft, activations=None):
@@ -704,6 +767,11 @@ def price_prompts(result, rates, sources, prefill_cases, evidence=()):
                         if m not in room["missing"]]
     room.update(prefill=prefill, ttft=ttft, activations=activations,
                 rates={"tflops": rates, "sources": sources} if rates else None)
+    # The follow-up turns' floor with a prompt cache at the same rates (followup_summary), its gap after every other.
+    follow = followup_summary({**result, "headroom": room}, tflops)
+    room["gaps"] = ([g for g in room["gaps"] if g.get("kpi") != FOLLOWUP_KPI]
+                    + ([follow["gap"]] if follow and follow["gap"] else []))
+    room["followup"] = {key: value for key, value in follow.items() if key != "gap"} if follow else None
     room["end_to_end"] = end_to_end_summary(decode_suite(result)[1], ttft, (decode_suite(result)[1]).get("decode_score"),
                                             (room.get("projection") or {}).get("ceiling_score"))
     return room

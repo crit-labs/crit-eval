@@ -250,13 +250,16 @@ def matmul_rate(tflops, stored, activation=None):
     return max(found) if found else (None, keys)
 
 
-def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
+def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None, cached_tokens=0):
     """Floor of one prefill in ms with its parts (matmul_by_format: each stored format's matmul ms), or (None,
     missing rates). activations: {stored format: {activation: share}} (activation_shares) for the quantized
-    formats' prompt GEMMs; without it each format multiplies at its own rate."""
+    formats' prompt GEMMs; without it each format multiplies at its own rate. cached_tokens: the prompt's leading
+    tokens a prompt cache holds (a follow-up turn's earlier turns): only the tokens after them are computed, each
+    attending the cached ones too."""
     if not ceiling or not tflops:
         return None, ["device GEMM rates (--device)"] if not tflops else ["model arithmetic (re-run prepare)"]
-    missing, by_format, n = [], {}, prompt_tokens
+    cached = min(max(0, int(cached_tokens or 0)), prompt_tokens)
+    missing, by_format, n = [], {}, prompt_tokens - cached
     for f, flops in ceiling["matmul_flops_per_token"].items():
         ms = 0.0
         for activation, share in ((activations or {}).get(f) or {None: 1.0}).items():
@@ -271,7 +274,7 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
     if missing:
         return None, [f"{f} GEMM rate" for f in sorted(set(missing))]
     matmul = sum(by_format.values())
-    pairs = n * (n + 1) / 2
+    pairs = n * cached + n * (n + 1) / 2
     # Attention at the faster of the BF16 and FP8 rates: engines run Q K^T and P V on FP8 tensor cores within
     # the quality budget, so a BF16-only floor is one they beat.
     attention_rate = max(tflops["bf16"], tflops.get("fp8") or 0)
@@ -291,14 +294,16 @@ def prefill_floor_ms(ceiling, tflops, prompt_tokens, activations=None):
 
 
 def ttft_floor_ms(ceiling, tflops, bandwidth_gbs, prompt_tokens, bytes_per_pass=None, activations=None,
-                  kv_bytes_per_token=None):
+                  kv_bytes_per_token=None, cached_tokens=0):
     """Floor of the time to first token: the larger of the prompt's compute floor (with the quantized formats'
     activations, prefill_floor_ms) and one read of the weights (bytes_per_pass when the adapter declares it) plus the
     prompt's KV writes at the engine's kv_bytes_per_token. Without that count the KV writes are left out, still a floor:
     the model's geometry does not say the precision the engine stores its KV at (the callers ask for it, headroom
     KV_BYTES). With the ceiling's tiers (protocol headroom.tiers) the weights off the device are read from host memory
-    instead, on their faster path (tiers.prompt_host), and the floor takes the longest of the three."""
-    compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens, activations)
+    instead, on their faster path (tiers.prompt_host), and the floor takes the longest of the three. cached_tokens:
+    the prompt's leading tokens a prompt cache holds: the compute floor is the other tokens' (prefill_floor_ms), and
+    the KV bytes stay the whole prompt's, the cached tokens' read where the others' are written."""
+    compute, missing = prefill_floor_ms(ceiling, tflops, prompt_tokens, activations, cached_tokens)
     weights = bytes_per_pass or (ceiling or {}).get("weight_bytes")
     if not weights or not bandwidth_gbs:
         missing = missing + ["device bandwidth (--device)" if not bandwidth_gbs else "model weight bytes (re-run prepare)"]

@@ -5,10 +5,13 @@ A certified round takes most of an hour and judges a gate once it has measured e
 asks only what those gates ask, each once: served and scored log-probabilities of the honesty texts and of one
 long reply at the curve's first point (honesty), the request history around them (request_history, its forks judged
 in quality mode speed), the device memory left after the load (resources), and, on an engine that can be opened again,
-the shortest and longest speed cases at a lower context against the required one (lower_context). Its verdicts
-are hints with the protocol's own rules, never a gate: a single sample stands in for Eval's repetitions, so the
-lower-context comparison allows twice the protocol's tolerance. Each item is {name, state, detail}, state passed,
-failed or unverified, as crit's serving checks report theirs."""
+the speed cases at a lower context against the required one (lower_context). Its verdicts are hints with the
+protocol's own rules, never a gate. The lower-context comparison is the certified gate's (long_context.compare_lower)
+on fewer samples: each case warmed once and timed LOWER_SAMPLES times at both contexts (after the reopen too), its
+tolerance the protocol's or the case's own run-to-run spread when that is larger, its first token the engine's own
+time where it reports one at both. A case slower by more than that is a failure, unless its spread passes
+LOWER_SPREAD_MAX: so few samples then say nothing either way, and the item is unverified. Each item is {name, state,
+detail}, state passed, failed or unverified, as crit's serving checks report theirs."""
 from pathlib import Path
 
 from .. import EVAL_DIR, load_json
@@ -23,9 +26,10 @@ from .history import compare_history, history_cases, history_outputs
 from .quality_checks import run_honesty
 from .timing import timed_generate
 
-# A single sample stands in for Eval's repetitions: the lower-context comparison allows this many times the
-# protocol's tolerance.
-LOWER_SLACK = 2.0
+# The lower-context comparison's samples of each case at each context (after one warm-up request), and the spread past
+# which they cannot tell a slower engine from a noisy one (the item is then unverified, not failed).
+LOWER_SAMPLES = 3
+LOWER_SPREAD_MAX = 0.25
 
 
 def _item(name, state, detail, **facts):
@@ -91,30 +95,48 @@ def history_item(engine, prepared, protocol, cases, fresh, served, mode):
     return _item("precheck_history", "passed", "the replies part only at near-ties (protocol forks)")
 
 
-def speed_samples(engine, cases):
-    """{case id: (decode tok/s, time to first token ms)} of each case's second request (the first warms it)."""
+def speed_samples(engine, cases, samples=LOWER_SAMPLES):
+    """The speed cases as the certified gate's speed run reports them ({"cases": {id: {status, decode_tps, ttft_ms,
+    samples}}}), on fewer requests: each case warmed once, then timed `samples` times; its scores the medians."""
+    from ..reports import metrics
     found = {}
     for case in cases:
         timed_generate(engine, case["prompt_ids"], case["output_tokens"])
-        _, sample = timed_generate(engine, case["prompt_ids"], case["output_tokens"])
-        found[case["id"]] = (sample.get("decode_tps"), sample.get("ttft_ms"))
-    return found
+        timed = [timed_generate(engine, case["prompt_ids"], case["output_tokens"])[1] for _ in range(samples)]
+        decode = [s["decode_tps"] for s in timed if s.get("decode_tps")]
+        ttft = [s["ttft_ms"] for s in timed if s.get("ttft_ms")]
+        found[case["id"]] = {"status": "measured" if decode and ttft else "unmeasured", "samples": timed,
+                             "decode_tps": metrics.median(decode) if decode else None,
+                             "ttft_ms": metrics.median(ttft) if ttft else None}
+    return {"cases": found}
 
 
-def lower_item(at_required, at_lower, lower, tolerance):
-    """Each case's decode and first token at the lower context against the required one, within LOWER_SLACK times
-    the protocol's tolerance."""
-    slower = []
-    for case_id, (decode, ttft) in at_required.items():
-        low_decode, low_ttft = at_lower.get(case_id, (None, None))
-        if decode and low_decode and low_decode / decode - 1 < -tolerance * LOWER_SLACK:
-            slower.append(f"{case_id} decode {decode:.1f} -> {low_decode:.1f} tok/s")
-        if ttft and low_ttft and low_ttft / ttft - 1 > tolerance * LOWER_SLACK:
-            slower.append(f"{case_id} first token {ttft:,.0f} -> {low_ttft:,.0f} ms")
+def lower_item(at_required, at_lower, lower, settings):
+    """The certified gate's comparison (long_context.compare_lower) of the speed cases at the lower context
+    against the required one: failed where a case is slower than its tolerance, unless the case's spread passes
+    LOWER_SPREAD_MAX (unverified: too few samples to judge so noisy a case)."""
+    from .long_context import compare_lower
+    found = compare_lower(at_required, at_lower, lower, settings)
+    slower, noisy = [], []
+    for case_id, kinds in found["slower"].items():
+        row = found["cases"][case_id]
+        for kind in kinds:
+            key, unit, fmt = (("decode_tps", "tok/s", "{:.1f}") if kind == "decode" else
+                              ("engine_ttft_ms" if row.get("ttft_judged") == "engine" else "ttft_ms", "ms", "{:,.0f}"))
+            tolerance = row["decode_tolerance" if kind == "decode" else "ttft_tolerance"]
+            text = (f"{case_id} {'decode' if kind == 'decode' else 'first token'} "
+                    f"{fmt.format(row[key + '_at_required'])} -> {fmt.format(row[key])} {unit} "
+                    f"(tolerance {tolerance:.0%})")
+            (noisy if tolerance > LOWER_SPREAD_MAX else slower).append(text)
     if slower:
-        return _item("precheck_lower_context", "failed", f"at {lower:,} tokens: " + "; ".join(slower), context=lower)
-    return _item("precheck_lower_context", "passed",
-                 f"at {lower:,} tokens no case slower than {tolerance * LOWER_SLACK:.0%}", context=lower)
+        return _item("precheck_lower_context", "failed", f"at {lower:,} tokens, over {LOWER_SAMPLES} samples a "
+                     "case: " + "; ".join(slower), context=lower)
+    if noisy or found["unmeasured"]:
+        return _item("precheck_lower_context", "unverified", f"at {lower:,} tokens the samples spread too wide to "
+                     "judge: " + "; ".join(noisy + [f"{c} unmeasured" for c in found["unmeasured"]]), context=lower)
+    widest = max([max(r["decode_tolerance"], r["ttft_tolerance"]) for r in found["cases"].values()] or [0.0])
+    return _item("precheck_lower_context", "passed", f"at {lower:,} tokens no case slower than its tolerance "
+                 f"({LOWER_SAMPLES} samples a case, the widest {widest:.0%})", context=lower)
 
 
 def memory_item(memory, headroom_bytes):
@@ -167,8 +189,7 @@ def run_precheck(adapter, model, data, context_tokens, quality_mode=DEFAULT_QUAL
                 engine, _ = open_engine(module, model, config or {}, speculative=True, context_tokens=point,
                                         exact_prompts=True)
                 try:
-                    items.append(lower_item(at_required, speed_samples(engine, cases), point,
-                                            float(settings["tolerance"])))
+                    items.append(lower_item(at_required, speed_samples(engine, cases), point, settings))
                 finally:
                     engine.close()
             except Exception as error:   # an engine that cannot open again at a lower context fails the gate

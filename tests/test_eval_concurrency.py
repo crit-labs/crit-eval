@@ -22,6 +22,24 @@ from test_eval_server import REPLY, Text, write_data  # noqa: E402
 PROTOCOL = json.loads((ROOT / "crit_eval/protocol.json").read_text(encoding="utf-8"))
 
 
+def run_levels_for_status():
+    """A result whose concurrency part measured a drafting engine at 1 and 4 clients, as run_concurrency records it with
+    drafted_levels, for status."""
+    def level(clients, aggregate, plain, drafted):
+        return {"aggregate_tps": aggregate, "qualified": True, "peak_concurrency": clients, "streaming_peak": clients,
+                "ran_together": clients > 1 or None, "ttft_ms_p50": 50.0, "ttft_ms_p95": 90.0, "decode_tps_p50": 60.0,
+                "fraction_of_ceiling": aggregate / plain, "speedup": aggregate / 150.0, "expected_speedup": None,
+                "fraction_of_expected": None, "expected_missing": None, "ceiling": {"ceiling_tps": plain, "bound": "memory"},
+                "drafted_ceiling": {"ceiling_tps": drafted, "basis": "the run's tokens per round, width + 1 columns per row"},
+                "fraction_of_drafted": aggregate / drafted, "drafted_missing": None,
+                "consistency": {"fraction": 1.0, "compared": 2, "matched": 2, "differences": {}}, "errors": []}
+    return {"requirements": {"exactness": "reported", "quality_mode": "speed"},
+            "context": {"tokens": None, "reason": "not given", "missing": []}, "engine": {"speculative": True},
+            "concurrency": {"status": "measured", "max_concurrent_requests": 6, "requests_per_client": 4,
+                            "output_tokens": 128, "ceiling_basis": "one token per row per step", "skipped": {},
+                            "levels": {"1": level(1, 150.0, 72.0, 192.0), "4": level(4, 250.0, 282.0, 754.0)}}}
+
+
 class BatchingChat(BaseHTTPRequestHandler):
     """A server that runs requests at once: each streams REPLY's first max_tokens characters, one per `step` seconds,
     whatever else runs. With `unstable`, a reply's characters from the sixth on come out upper case while another
@@ -493,6 +511,81 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertGreater(b["memory_ms"], a["memory_ms"] * 4)   # 16 rows touch most of the experts
         self.assertEqual(batched.step_floor(None, 1, 10, 1000.0, {"bf16": 1.0}), (None, ["model weight headers"]))
         self.assertEqual(batched.step_floor(dense, 1, 10, 1000.0, {"fp8": 1.0})[1], ["bf16 GEMM rate"])
+
+    DENSE = {"resident_bytes": 10e9, "expert_bytes": 0, "experts": 0, "experts_per_token": 0,
+             "dense_flops": {"bf16": 2 * 5e9}, "expert_flops": {}, "kv_bytes_per_token": 100_000,
+             "fixed_state_bytes": 0, "attention_flops_per_pair": 1000}
+
+    def test_a_verify_pass_computes_every_column_and_reads_each_rows_kv_once(self):
+        one, _ = batched.step_floor(self.DENSE, 4, 1000, 1000.0, {"bf16": 200.0})
+        six, _ = batched.step_floor(self.DENSE, 4, 1000, 1000.0, {"bf16": 200.0}, columns=6)
+        self.assertEqual(six["memory_ms"], one["memory_ms"])
+        self.assertAlmostEqual(six["compute_ms"], 6 * one["compute_ms"])
+        self.assertEqual((six["columns"], "columns" in one), (6, False))
+        # Each column routes its own experts: 4 rows of 6 columns touch what 24 rows of one do.
+        moe = {**self.DENSE, "resident_bytes": 2e9, "expert_bytes": 64e9, "experts": 64, "experts_per_token": 8,
+               "expert_flops": {"bf16": 2 * 64e9 / 2}}
+        wide, _ = batched.step_floor(moe, 4, 1000, 1000.0, {"bf16": 200.0}, columns=6)
+        self.assertAlmostEqual(wide["expert_share"], batched.touched(64, 8, 24))
+
+    def test_a_drafting_rounds_ceiling_counts_its_tokens_per_round_and_draft_steps(self):
+        rates = {"bf16": 200.0}
+        plain, _ = batched.drafted_floor(self.DENSE, 4, 1000, 1000.0, rates, width=0)
+        step, _ = batched.step_floor(self.DENSE, 4, 1000, 1000.0, rates)
+        self.assertEqual((plain["ceiling_tps"], plain["basis"]), (step["ceiling_tps"], "one token per row per step"))
+        found, missing = batched.drafted_floor(self.DENSE, 4, 1000, 1000.0, rates, width=5, tokens_per_round=3.5,
+                                               draft_bytes_per_step=1e9)
+        verify, _ = batched.step_floor(self.DENSE, 4, 1000, 1000.0, rates, columns=6)
+        self.assertEqual(missing, [])
+        self.assertAlmostEqual(found["draft_ms"], 5 * 1e9 / 1e12 * 1000)
+        self.assertAlmostEqual(found["round_ms"], verify["step_ms"] + found["draft_ms"])
+        self.assertAlmostEqual(found["ceiling_tps"], 4 * 3.5 / found["round_ms"] * 1000)
+        self.assertGreater(found["ceiling_tps"], step["ceiling_tps"])   # drafts lift the limit a speculating engine beats
+        # Without what prices a drafting round, no ceiling: never the one-token one in its place.
+        self.assertEqual(batched.drafted_floor(self.DENSE, 4, 1000, 1000.0, rates, width=None)[0], None)
+        none, missing = batched.drafted_floor(self.DENSE, 4, 1000, 1000.0, rates, width=5)
+        self.assertIsNone(none)
+        self.assertEqual(len(missing), 2)
+
+    def test_the_concurrency_goal_is_the_most_clients_against_their_drafted_ceiling(self):
+        levels = {"1": {"aggregate_tps": 150.0, "ceiling": {"ceiling_tps": 72.0}},
+                  "4": {"aggregate_tps": 250.0, "ceiling": {"ceiling_tps": 282.0},
+                        "drafted_ceiling": {"ceiling_tps": 754.0, "basis": "the run's tokens per round"}}}
+        found = {"status": "measured", "levels": levels}
+        result = {"engine": {"speculative": True}, "concurrency": found}
+        self.assertEqual(status.concurrency_goal(result), (4, 250.0, 754.0, "the run's tokens per round"))
+        # An engine that does not draft takes the one-token ceiling, which is the same.
+        plain = {"engine": {"speculative": False},
+                 "concurrency": {"status": "measured", "levels": {"4": {**levels["4"], "drafted_ceiling": None}}}}
+        self.assertEqual(status.concurrency_goal(plain)[2], 282.0)
+        # A drafting engine measured before the drafted ceiling has no limit, never the one-token one it beats.
+        old = {"engine": {"speculative": True},
+               "concurrency": {"status": "measured", "levels": {"4": {"aggregate_tps": 250.0,
+                                                                      "ceiling": {"ceiling_tps": 282.0}}}}}
+        self.assertEqual(status.concurrency_goal(old)[2], None)
+        # One client is no concurrency goal; neither is an unmeasured part.
+        self.assertIsNone(status.concurrency_goal({"concurrency": {"status": "measured", "levels": {"1": levels["1"]}}}))
+        self.assertIsNone(status.concurrency_goal({"concurrency": {"status": "unmeasured", "reason": "-"}}))
+
+    def test_status_states_the_concurrency_goal_and_its_gap(self):
+        found = run_levels_for_status()
+        current = status.build(found, PROTOCOL)
+        goal = next(g for g in current["goals"] if g["kpi"] == "concurrency")
+        self.assertEqual((goal["score"], goal["limit"], goal["unit"]), (250.0, 754.0, "tok/s"))
+        self.assertAlmostEqual(goal["fraction_of_limit"], 250 / 754)
+        gap = next(g for g in current["gaps"] if g["kpi"] == "concurrency")
+        self.assertEqual(gap["name"], status.CONCURRENCY_GAP)
+        self.assertAlmostEqual(gap["projected_gain"], 754 / 250 - 1)
+        self.assertNotIn("concurrency", [row["kpi"] for row in (current["stop_record_headroom"] or {"kpis": []})["kpis"]])
+        text = status.render(current)
+        self.assertIn("concurrency 250 -> 754 tok/s (+202%; 33% of its limit)", text)
+        self.assertIn("33% of its 754 tok/s ceiling with its drafts counted", text)
+        # Without a width the limit is unknown, and missing says what would price it.
+        found["concurrency"]["levels"]["4"].update(drafted_ceiling=None, fraction_of_drafted=None,
+                                                   drafted_missing=["draft_width from the adapter"])
+        current = status.build(found, PROTOCOL)
+        self.assertIsNone(next(g for g in current["goals"] if g["kpi"] == "concurrency")["limit"])
+        self.assertIn("concurrency limit: draft_width from the adapter", current["missing"])
 
     def test_percentiles_and_reply_comparison(self):
         self.assertEqual(concurrency.percentile([5, 1, 3, 2, 4], .5), 3)

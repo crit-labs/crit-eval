@@ -17,7 +17,9 @@ the numbers about how to build.
 2. Goals for the next candidate: each of decode, prefill and time to first token, and decode and
    time to first token over the long-context curve, from its current score to its physical limit,
    with the fraction of the limit reached. crit-eval states them and does not order them: a run's
-   priority rule does (crit run).
+   priority rule does (crit run). The follow-up turns' time to first token is stated with them, against
+   its floor with a prompt cache, and so is the most clients' aggregate against its batched ceiling with
+   the drafts counted; the run's rule ranks the five above.
 3. KPIs, each next to its physical limit: the decode score against its ceiling (the larger of
    this drafter's speed of light and a drafter accepting later drafts as often as the first),
    the model pass against its bandwidth floor, the prefill score against its compute ceiling,
@@ -197,6 +199,10 @@ def _quality_gate(result):
     detail = "sets " + ", ".join(quality["sets"]) if not failures else "; ".join(failures)
     if honesty.get("passed") is not None:
         detail += f"; served replies scored alike within {honesty['max_abs_logprob_diff']:.1e}"
+        asked = (honesty.get("judged_by") or {}).get("exactness")
+        if asked:   # the engine states the exactness it asks of its rows: the check judged by it, not by the mode
+            detail += (f" (judged at the {asked['prompt']} prompt rows and {asked['decode']} decode rows the engine "
+                       f"asks: tolerance {honesty['tolerance']:g})")
     if honesty.get("passed") is False and honesty.get("max_abs_logprob_diff", 0.0) > honesty.get("tolerance", 0.0):
         detail += ("; " + HONESTY_HINT)
     elif honesty and honesty.get("passed") is None:
@@ -759,6 +765,26 @@ def _render_stalls(s):
     return [line + " (reported, not judged)"]
 
 
+def _render_followup(f):
+    """The follow-up turns' line: their time to first token against its floor with a prompt cache (headroom.followup_summary),
+    and per turn after the first what the engine served from a cache and what the turn added."""
+    if not f.get("ttft_ms"):
+        return []
+    first = min(f["turns"], key=int)
+    later = {turn: row for turn, row in f["turns"].items() if turn != first and row.get("ttft_ms")}
+    line = f"  followup {f['ttft_ms']:,.0f} ms to the first token of a follow-up turn (geometric mean over {len(later)} turns)"
+    if f.get("floor_ms"):
+        line += f", {_share(f['fraction_of_floor'])} of its {f['floor_ms']:,.1f} ms floor with a prompt cache"
+        if f.get("stored_floor_ms") and f"{f['stored_floor_ms']:,.1f}" != f"{f['floor_ms']:,.1f}":
+            line += f" (the stored format's {f['stored_floor_ms']:,.1f} ms)"
+    for turn, row in later.items():
+        line += (f"; turn {turn} {row['ttft_ms']:,.0f} ms"
+                 + (f" vs {row['floor_ms']:,.1f} ms ({row['bound']} bound)" if row.get("floor_ms") else "")
+                 + f", {row['cached_tokens'] or 0:,} of {row['prompt_tokens']:,} prompt tokens served from a cache"
+                 + (f", {row['new_tokens']:,} new" if row.get("new_tokens") is not None else ""))
+    return [line]
+
+
 def _concurrency_kpi(result):
     """The concurrency part's figures per level (protocol concurrency; the concurrency gate judges them): the aggregate rate, the
     requests in flight at the peak, the first token and per-request decode, the share of replies equal to the serial
@@ -780,6 +806,10 @@ def _concurrency_kpi(result):
                            "ceiling_tps": floor.get("ceiling_tps"), "bound": floor.get("bound"),
                            "hit_rate": floor.get("hit_rate"), "hit_rate_source": floor.get("hit_rate_source"),
                            "unmeasured": floor.get("unmeasured"),
+                           # The ceiling with the drafts counted, the concurrency goal's limit (concurrency_goal).
+                           "drafted_ceiling_tps": (row.get("drafted_ceiling") or {}).get("ceiling_tps"),
+                           "fraction_of_drafted": row.get("fraction_of_drafted"),
+                           "drafted_missing": row.get("drafted_missing"),
                            "consistency": row["consistency"]["fraction"],
                            "first_differences": sorted({d["first_difference"] for d in
                                                         row["consistency"]["differences"].values()
@@ -805,6 +835,9 @@ def _render_concurrency(c):
                 + f", peak {row['peak_concurrency']}")
         if row.get("ceiling_tps"):
             line += f", {_pct(row['fraction_of_ceiling'])} of its {row['ceiling_tps']:,.0f} tok/s ceiling ({row['bound']} bound)"
+        if row.get("drafted_ceiling_tps") and c["speculative"]:
+            line += (f", {_pct(row['fraction_of_drafted'])} of its {row['drafted_ceiling_tps']:,.0f} tok/s ceiling with "
+                     "its drafts counted")
         if row.get("ttft_ms_p50") is not None:
             line += f"; first token p50 {row['ttft_ms_p50']:,.0f} ms, p95 {row['ttft_ms_p95']:,.0f} ms"
         if row.get("decode_tps_p50"):
@@ -1005,6 +1038,14 @@ def build(result, protocol, baseline=None):
                      "turns": {str(t["turn"]): {k: t.get(k) for k in ("prompt_tokens", "cached_tokens", "ttft_ms",
                                                                      "prefill_tps")} for t in follow["turns"]}}
                     if follow.get("status") == "measured" else None)
+    # The turns after the first against their floor with a prompt cache (headroom.followup_summary).
+    cached_floor, followup_gap = _followup(result)
+    if followup_kpi and cached_floor:
+        followup_kpi.update(floor_ms=cached_floor["floor_ms"], fraction_of_floor=cached_floor["fraction_of_floor"])
+        for turn, row in cached_floor["turns"].items():
+            followup_kpi["turns"][turn].update(new_tokens=row["new_tokens"],
+                                               floor_ms=(row.get("floor") or {}).get("total_ms"),
+                                               bound=(row.get("floor") or {}).get("bound"))
     greedy_kpi = ({"score": speed.get("decode_score"), "complete": speed.get("complete")}
                   if suite == "sampled" else None)
     # Prefill's and the first tokens' limits are the quality mode's: preserve prices them at 16-bit prompt
@@ -1021,6 +1062,10 @@ def build(result, protocol, baseline=None):
         if limits["ttft"]:
             ttft_kpi["floor_ms"] = limits["ttft"]
             ttft_kpi["fraction_of_floor"] = limits["ttft"] / ttft_kpi["score_ms"] if ttft_kpi["score_ms"] else None
+        if followup_kpi and limits.get(headroom.FOLLOWUP_KPI) and followup_kpi.get("floor_ms"):
+            followup_kpi.update(stored_floor_ms=followup_kpi["floor_ms"], floor_ms=limits[headroom.FOLLOWUP_KPI],
+                                fraction_of_floor=(limits[headroom.FOLLOWUP_KPI] / followup_kpi["ttft_ms"]
+                                                   if followup_kpi["ttft_ms"] else None))
     perplexity, kl_divergence = _quality_kpis(result.get("quality"), metrics.mode_thresholds(protocol["quality"], mode))
     attribution = (result.get("quality") or {}).get("attribution")
     if kl_divergence is not None and attribution:
@@ -1054,6 +1099,19 @@ def build(result, protocol, baseline=None):
             "tool_calls": _tool_calls_kpi(speed), "concurrency": _concurrency_kpi(result)}
     missing = list(room.get("missing", []))
     gaps = [dict(gap) for gap in room.get("gaps", [])]
+    if followup_gap:   # a result measured before the run priced the follow-up turns: its gap, after every other
+        gaps.append(dict(followup_gap))
+    goal = concurrency_goal(result)
+    if goal and goal[2] and goal[2] > goal[1]:
+        gaps.append({"kpi": "concurrency", "name": CONCURRENCY_GAP, "projected_gain": goal[2] / goal[1] - 1,
+                     "detail": f"{goal[0]} clients {goal[1]:,.1f} vs {goal[2]:,.1f} tok/s ({goal[3]})"})
+    if goal and goal[2] is None:   # the concurrency goal's limit unknown: say what would price it
+        level = result["concurrency"]["levels"][str(goal[0])]
+        lacking = level.get("drafted_missing") or (
+            ["a drafting engine's ceiling with its drafts counted (concurrency levels' drafted_ceiling, which runs "
+             "after crit-eval 0.7.0 record)"] if "drafted_ceiling" not in level else
+            ["the batched ceiling: " + ", ".join(level.get("ceiling_missing") or ["model weight headers"])])
+        missing += [f"concurrency limit: {m}" for m in lacking if f"concurrency limit: {m}" not in missing]
     notes = [f"{cid}: the model's end token appears at output token {c['first_stop_index']} (stops are disabled)"
              for cid, c in speed.get("cases", {}).items() if c.get("stop_crossed")]
     exactness_note = _exactness_note(result)
@@ -1087,7 +1145,61 @@ def build(result, protocol, baseline=None):
 
 # The formats a checkpoint stores its matrices in (crit_eval.limits.ceiling), whose rates the stored-format ceiling takes.
 STORED_FORMATS = ("bf16", "fp8", "nvfp4")
-GOAL_UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_decode": "tok/s", "context_ttft": "ms"}
+GOAL_UNITS = {"decode": "tok/s", "prefill": "tok/s", "ttft": "ms", "context_decode": "tok/s", "context_ttft": "ms",
+              headroom.FOLLOWUP_KPI: "ms", "concurrency": "tok/s"}
+
+
+CONCURRENCY_GAP = "the most clients' aggregate at its ceiling with the drafts counted"
+
+
+def concurrency_goal(result):
+    """The concurrency goal's (level, score, limit, basis): the most clients whose level qualified, its aggregate tok/s
+    and its ceiling with the drafts counted (crit_eval.run.concurrency.drafted_levels), or for an engine that does not
+    draft the one-token ceiling, which is the same. A drafting engine's result measured before levels recorded the
+    drafted ceiling has no limit (None). None when no level of two or more clients qualified."""
+    found = result.get("concurrency") or {}
+    if found.get("status") != "measured":
+        return None
+    levels = [(int(n), row) for n, row in (found.get("levels") or {}).items() if int(n) >= 2 and row.get("aggregate_tps")]
+    if not levels:
+        return None
+    clients, row = max(levels, key=lambda item: item[0])
+    drafted = row.get("drafted_ceiling")
+    if drafted:
+        return clients, row["aggregate_tps"], drafted.get("ceiling_tps"), drafted.get("basis")
+    speculative = bool((result.get("engine") or {}).get("speculative"))
+    plain = None if speculative else (row.get("ceiling") or {}).get("ceiling_tps")
+    return clients, row["aggregate_tps"], plain, None if speculative else "one token per row per step"
+
+
+def _concurrency_limit(result):
+    """(kpi, score, limit) of the concurrency goal (concurrency_goal), a goal crit-eval states beside _limits' as the
+    follow-up turns' is: the run's priority rule and its stop record take _limits' alone."""
+    found = concurrency_goal(result)
+    return [("concurrency", found[1], found[2])] if found else []
+
+
+def _followup(result):
+    """The follow-up turns against their floor with a prompt cache (headroom.followup_summary) and the gap to add to
+    the headroom's: the headroom's own summary, whose gap is among its gaps already (None), or for a result measured
+    before the run priced the turns, the summary priced now from what the result records, with its gap. (None, None)
+    when the turns were not measured."""
+    room = result.get("headroom") or {}
+    if room.get("followup"):
+        return room["followup"], None
+    found = headroom.followup_summary(result)
+    return (found, found["gap"]) if found else (None, None)
+
+
+def _followup_limit(result):
+    """(kpi, score, limit) of the follow-up turns' time to first token, once they were measured: its limit the floor
+    with a prompt cache, at the result's quality mode's prompt activations (headroom.mode_limits). A goal crit-eval
+    states beside _limits': the run's priority rule and its stop record (crit run) take _limits' alone."""
+    found, _ = _followup(result)
+    if not found:
+        return []
+    mode = headroom.mode_limits(result) or {}
+    return [(headroom.FOLLOWUP_KPI, found["score_ms"], mode.get(headroom.FOLLOWUP_KPI) or found["floor_ms"])]
 
 
 def _limits(result):
@@ -1114,8 +1226,11 @@ def _limits(result):
 def goals(result):
     """The next candidate's goals: every KPI from its current score to its physical limit, as the
     change that closes it (time to first token falls, the scores rise), the fraction of the limit
-    reached and its run-to-run noise. crit-eval states them and leaves their order to the run's priority
-    rule (crit run)."""
+    reached and its run-to-run noise: decode, prefill and time to first token, the long-context scores once the
+    curve ran, the follow-up turns' time to first token against its floor with a prompt cache once they were
+    measured, and the aggregate of the most clients measured against its ceiling with the drafts counted
+    (concurrency_goal). crit-eval states them and leaves their order to the run's priority rule (crit run), which
+    ranks the first five."""
     noises = kpi_noise(result)
     return [{"kpi": kpi, "score": score, "limit": limit, "unit": GOAL_UNITS[kpi],
              "change": limit / score - 1 if score and limit else None,
@@ -1123,15 +1238,18 @@ def goals(result):
              "fraction_of_limit": ((limit / score if GOAL_UNITS[kpi] == "ms" else score / limit)
                                    if score and limit else None),
              "noise": noises.get(kpi)}
-            for kpi, score, limit in _limits(result)]
+            for kpi, score, limit in _limits(result) + _followup_limit(result) + _concurrency_limit(result)]
 
 
 def kpi_noise(result):
     """Each goal KPI's run-to-run spread (headroom noise): the decode's from its own suite, prefill's over the
-    prefill cases, and the long-context scores' from the speed suite, since the curve runs once per point."""
+    prefill cases, and the long-context scores' from the speed suite, since the curve runs once per point; the
+    follow-up turns', which run once each, the speed suite's first tokens'; the concurrency aggregate's, one level
+    measured once, the decode's."""
     spreads = (result.get("headroom") or {}).get("noise") or {}
     return {"decode": spreads.get("decode"), "prefill": spreads.get("prefill"), "ttft": spreads.get("ttft"),
-            "context_decode": spreads.get("context_decode"), "context_ttft": spreads.get("context_ttft")}
+            "context_decode": spreads.get("context_decode"), "context_ttft": spreads.get("context_ttft"),
+            headroom.FOLLOWUP_KPI: spreads.get("ttft"), "concurrency": spreads.get("decode")}
 
 
 def stop_record_headroom(result, baseline=None):
@@ -1251,6 +1369,11 @@ def _pct(value):
     return "–" if value is None else f"{value:.0%}"
 
 
+def _share(value):
+    """A share of a limit: whole percent, with one decimal below 10%, where a whole percent says too little."""
+    return "–" if value is None else f"{value:.1%}" if value < 0.0995 else f"{value:.0%}"
+
+
 def _num(value, spec):
     return "–" if value is None else format(value, spec)
 
@@ -1284,7 +1407,7 @@ def render(status):
                 lines.append(f"  {g['kpi']:<8} {_num(g['score'], spec)} {g['unit']}, limit unknown (see missing){noise}")
             else:
                 lines.append(f"  {g['kpi']:<8} {format(g['score'], spec)} -> {format(g['limit'], spec)} {g['unit']} "
-                             f"({g['change']:+.0%}; {_pct(g.get('fraction_of_limit'))} of its limit{noise})")
+                             f"({g['change']:+.0%}; {_share(g.get('fraction_of_limit'))} of its limit{noise})")
     lines.append("KPIs against their physical limits:")
     e = k.get("end_to_end") or {}
     decode = f"  decode   {_num(d['score'], '.1f')} tok/s"
@@ -1395,6 +1518,8 @@ def render(status):
     ttft += _spread_text(e.get("ttft_noise"), basis.get("repeated_cases"), basis.get("cases"))
     lines.append(ttft)
     lines += _render_ttft_parts(t)
+    if k.get("followup"):
+        lines += _render_followup(k["followup"])
     if k.get("stalls"):
         lines += _render_stalls(k["stalls"])
     if k.get("tool_calls"):

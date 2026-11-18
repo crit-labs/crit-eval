@@ -35,7 +35,10 @@ two repetitions. A KPI's run-to-run spread comes from the cases measured more th
 **Steady state** (`speed.steady_state`): a case is measured at the speed it settles to. Before its first measured
 repetition, a request whose decode speed differs from the request's before it by more than 10% stands as one more
 warmup, until two consecutive requests agree or the case's warmups are done; the extra repetition and the disturbed
-check apply from the first measured repetition on. An engine that adapts to what it serves, a device cache filling
+check apply from the first measured repetition on. In a staged run a case's warmup is its first stage's request, measured before
+the other cases ran: an engine that adapts to what it serves may meet the second stage as cold as it was then, so a
+first measured repetition that agreed only with that warmup is provisional. When the request after it differs from
+it by more than 10%, it stands as one more warmup, and that request is judged against it as above. An engine that adapts to what it serves, a device cache filling
 with the experts a case routes to for example, is measured once it has adapted instead of stopping the round as a
 disturbed device. A case's warmups are done after four that decoded 1,024 tokens between them, and after 16 in any
 case: an engine that adapts per decode window adapts by the tokens it
@@ -528,6 +531,15 @@ and each reply's mean difference of its tokens' log-probabilities within 0.1 nat
 one list must be within 2 nats of that list's edge. The served path then stays that close to the
 path quality judged.
 
+An engine that states the exactness it asks of its rows is judged by that instead of by the mode
+(`quality.honesty.levels`). An engine built from crit's plugins states it in its facts (`exactness.asked`,
+from its configuration: a level for the decode rows and one for the prompt rows, of `repeatable`,
+`row-exact`, `exact` and `declared`). Prompt rows asked `exact` or `declared`, beside decode rows asked
+`row-exact` or higher, are the bits of the same token decoded, so the two paths must agree within the
+1e-3 nats in either mode; at any lower level they may round apart and the bound above judges them, in
+either mode. `quality.honesty.judged_by` records which decided, the engine's levels or the quality mode,
+and the quality gate's detail names the levels. The drift budget stays the mode's.
+
 `quality.timing` shows where the phase's time goes: for the fixed texts' score requests, the honesty
 replies and the honesty rescores, the requests' seconds, the engine's own prefill and decode
 seconds (`crit_telemetry`), the rest of each request's time (transfer and the server's own work),
@@ -674,6 +686,24 @@ measure. `followup` records the part as not run (`no_prompt_cache`, with the rea
 run nothing, and the gate passes. crit-eval does not infer the declaration from a first pass with
 no cached tokens: a cache of whole prompts hits only when the turns run again, which is what the
 gate checks. The part is skipped when its last turn does not fit the engine's context.
+
+**The floor with a prompt cache.** A turn after the first shares its prompt's beginning with the turn before
+it, and an engine that kept that turn prefills only the rest. Each turn records those `new_tokens`, its prompt
+past the longest prefix the two prompts share (48 and 62 of about 8,200 tokens on Qwen3.8-27B), and its floor
+is the first token of a prompt whose other tokens are cached
+([headroom.py](../crit_eval/limits/headroom.py) `followup_summary`, [ceiling.py](../crit_eval/limits/ceiling.py)
+`ttft_floor_ms` with `cached_tokens`): the larger of the new tokens' arithmetic, each attending the cached
+tokens too, and one read of the weights and of the whole prompt's KV, the cached tokens' read where the new
+ones' are written. With a few dozen new tokens that is one pass over the weights. Where the engine reports
+more tokens cached than the two prompts share, the floor takes the fewer it computed, so it stays a floor; a
+turn served whole from a cache has none. `followup.ttft_ms` against the geometric mean of those floors is the
+goal `followup_ttft` and a gap (`follow-up turns' first token at its floor with a prompt cache`), priced at
+the quality mode's prompt activations like the other first tokens and with their run-to-run spread. An engine
+without a prompt cache stands far from it: two Qwen3.8-27B engines on an RTX 5090 took 1,099 and 3,496 ms
+against a floor of 13.9 ms, 1.3% and 0.4% of it. It is a goal crit-eval states, never a gate, and the run's
+priority rule and stop record leave it out (`status.stop_record_headroom` holds the five KPIs they know).
+`status` prices it for a result measured before the turns recorded their new tokens too, from the growth of
+their prompts.
 
 ## Forks in quality mode speed
 
@@ -853,6 +883,20 @@ single-stream hit rate, so every level compares like with like) and the fraction
 whose misses come from host memory about 1. Without both ceilings, or with expert misses unmeasured, the expectation
 is unmeasured and `expected_missing` says why. `status` prints the speedups, each level's ceiling's hit rate and the
 run's, on a line of their own, and `compare` beside each level's aggregate.
+
+**The concurrency goal.** The one-token ceiling leaves speculation out, so a drafting engine beats it (an engine
+drafting five tokens a round served one client at 204% of it), and it cannot be a limit. Each level therefore also
+records its ceiling with the drafts counted (`drafted_ceiling`, [batched.py](../crit_eval/limits/batched.py)
+`drafted_floor`): a round of the engine's draft width W, its W draft steps each reading the draft layers' bytes once for
+every row (`draft_bytes_per_step`, else the checkpoint's draft layers), then a verify pass of N rows of W + 1 columns
+each (every column multiplies, attends and routes its own experts; a row's KV and state are read once), every row
+emitting the tokens per round the greedy speed suite measured on the pool's cases, as the single-stream decode
+ceiling takes this drafter's acceptance. An engine that does not draft gets the one-token ceiling, and one that drafts
+without stating its width gets none (`drafted_missing`). The level of the most clients measured, its aggregate
+against that ceiling, is the goal `concurrency` and a gap (`the most clients' aggregate at its ceiling with the drafts
+counted`), with the decode's run-to-run spread; like `followup_ttft` it is stated, never a gate, and the run's priority
+rule and stop record leave it out. On the Qwen3.8-27B speed engine (width 5, 3.73 tokens per round, an RTX 5090) the
+levels stand at 77%, 62% and 33% of it at 1, 2 and 4 clients (192, 382 and 754 tok/s).
 
 A staged run measures a level while it fits the budget, each priced from the best aggregate measured so far (the
 first has no price); one that would pass it is named in `concurrency.skipped` and the sweep stops there. A certified

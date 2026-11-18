@@ -49,7 +49,12 @@ Results report facts; crit-eval does not classify or rank. The builder reasons f
   the worst set uses. crit-eval states each goal with the fraction of its limit reached and its run-to-run
   spread, and leaves their order to the run (`crit run`). From crit-eval-v7 the decode KPI,
   its goal and the stop record's decode are the [sampled decode](MEASUREMENTS.md#sampled-speed), at the
-  model's own sampling, with the greedy decode reported next to it.
+  model's own sampling, with the greedy decode reported next to it. Once the follow-up turns ran, their time to
+  first token is a goal too (`followup_ttft`), against its
+  [floor with a prompt cache](MEASUREMENTS.md#follow-up-turns-and-the-prompt-cache): stated like the others, and
+  outside the run's priority rule and stop record, which rank and account for the five above. So is the aggregate
+  of the most clients the [concurrency](MEASUREMENTS.md#concurrency) part measured (`concurrency`), against its
+  batched ceiling with the drafts counted.
 - **Gaps:** what each term (model pass, draft steps, verify pass, draft width, drafter acceptance,
   prefill at its stored-format and at its reachable ceiling, TTFT) would give at its floor, with a
   kernel trace (`status --kernels`) each prefill term too, plus missing inputs that hide a limit.
@@ -280,7 +285,11 @@ with the finish reason. No standard field turns end tokens off, so a reply that 
 typically at a tool call, is measured on the tokens it has. The server must prefill every
 timed request: a reply whose usage reports cached prompt tokens
 (`usage.prompt_tokens_details.cached_tokens`) fails. Retrieval requests, judged on their text
-alone, may be served from a prompt cache.
+alone, may be served from a prompt cache. A server whose card declares `chat-prompt-cache-v1` (crit
+serve, for an engine built on Core's prompt cache) takes that per request: every request but the
+follow-up turns and retrieval carries `"crit": {"prompt_cache": false}`, so an engine with a prompt
+cache is timed and scored on a full prefill and still serves the follow-up turns from its cache.
+Another server's cache has to be off for the run.
 Prefill and first-token times include the server's HTTP and templating. A running server cannot
 be opened at a lower context, so the lower-context gate stays unmeasured, except under
 `crit run ... eval`: it serves a run's candidate itself, first at the lower context, then builds it
@@ -412,7 +421,8 @@ crit-eval's releases only, and the release names them: between releases every ch
 stays under the protocol id of the coming release, and nothing in a change picks a version: the changes since the
 0.5.x releases (which all ran `crit-eval-v0.5.0`) ran under `crit-eval-v0.6.0`, the coming release's working id,
 which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the changes since ran under
-`crit-eval-v0.7.0`, which crit-eval 0.7.0 kept. A change that can move a
+`crit-eval-v0.7.0`, which crit-eval 0.7.0 kept; the changes since ran under `crit-eval-v0.7.1`, which crit-eval
+0.7.1 and 0.7.2 kept. A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results
@@ -460,7 +470,8 @@ with each score:
 A round stops early when a speed case's measured decode speeds spread by more than the protocol's
 `disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
 The spread is taken over the repetitions measured once the case reached steady state: requests whose speed still
-moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16
+moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16;
+in a staged run a first repetition that agreed only with stage 1's request is provisional
 (protocol `speed.steady_state`,
 [measurements](MEASUREMENTS.md)), and the case records them and the drift as `steady_state`. Repetitions that decoded different replies are
 compared only with repetitions of the same reply (`speed.output_varies`). The result keeps what was measured, with `aborted` and no status, and `run` exits with code 3.

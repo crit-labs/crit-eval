@@ -499,6 +499,7 @@ PROTOCOLS = {
     "crit-eval-v0.5.0": "14a342ae8f2b9f413c7c748f71c8831cab8bec36f607184bfd310f8b2d3472d3",  # releases 0.5.0 to 0.5.3
     "crit-eval-v0.6.0": "0ccc760244b448454b16b5eeafef260de88b7811f6a2ace55b53c3938695a812",  # release 0.6.0: modes preserve and speed
     "crit-eval-v0.7.0": "e13a0225f4998250a485d428b12b228a8dc9699faab3b9e084668b74fdbb0580",  # release 0.7.0: sampled suite in stage 1
+    "crit-eval-v0.7.1": "aa0c304e831dbf7368718b7e97b937bbf32567a132a1921ed7816b825d5ff56d",  # releases 0.7.1 and 0.7.2: honesty by exactness, staged steady state
 }
 
 
@@ -1560,6 +1561,41 @@ class RepetitionTests(unittest.TestCase):
         self.assertEqual([s["warmup"] for s in case["samples"]], [True, False])
         calls, case = self.run_case([130.0, 129.0, 0.0], 1, warmups=0, warmed=earlier)
         self.assertEqual(calls, 2)
+
+    def adapting_case(self, requests, warmups, warmed=None):
+        """One speed case whose requests decode and reach their first token as `requests` ((tok/s, ms) each, 256
+        tokens in 3 s), with a 25% disturbed limit; returns the measured case."""
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
+        queue = [self.sample(decode, ttft) for decode, ttft in requests]
+
+        def timed(engine, prompt, n):
+            return [7] * 4, dict(queue.pop(0), request_ms=3000.0, prefill_tps=None, tokens_per_round=None,
+                                 round_ms=None, output_tokens=256)
+        with patch.object(speed, "timed_generate", timed):
+            return speed.run_speed(None, {"max_context": 64}, prepared, protocol, warmups, 1, lambda m: None,
+                                   disturbed_spread=0.25, warmed=warmed)["cases"]["a"]
+
+    def test_a_repetition_that_agreed_only_with_an_earlier_stage_is_provisional(self):
+        # An engine that adapts to what it serves, staged: stage 1 decoded the case at 57 tok/s on a placement made
+        # for the cases before it, the other cases ran, and stage 2's first request is as cold (55, within 10% of 57,
+        # so measured). Its first token disagrees, so a second repetition runs at 82, the engine now adapted to the
+        # case: 55 was still warming up, 82 too (apart from 55 by more than 10%), and 86, which agrees with 82, is the
+        # measured repetition. Before, 55 stayed measured and 55, 82, 86 stopped the round as a disturbed device.
+        earlier = {"a": {"samples": [{**self.sample(57.0, 50.0), "request_ms": 3000.0}], "tokens": [7] * 4}}
+        requests = [(55.0, 60.0), (82.0, 50.0), (86.0, 50.0), (86.5, 50.0)]
+        case = self.adapting_case(requests, 0, warmed=earlier)
+        self.assertEqual([s["decode_tps"] for s in case["samples"]], [57.0, 55.0, 82.0, 86.0])
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, True, True, False])
+        self.assertEqual(case["decode_tps"], 86.0)
+        self.assertEqual((case["steady_state"]["added"], case["steady_state"]["steady"]), (2, True))
+        # A repetition that agrees with the earlier warmup and with the request after it stays measured, as before.
+        case = self.adapting_case([(56.0, 60.0), (57.5, 50.0), (57.0, 50.0)], 0, warmed=earlier)
+        self.assertEqual([s["warmup"] for s in case["samples"]], [True, False, False, False])
+        self.assertEqual(case["steady_state"]["added"], 0)
+        # Unstaged, the first measured repetition follows this call's own warmup, and is judged as before.
+        with self.assertRaises(timing.Disturbed):
+            self.adapting_case([(57.0, 50.0)] + requests, 1)
 
     def test_noise_comes_from_the_cases_measured_more_than_once(self):
         def case(*speeds):
@@ -3162,6 +3198,42 @@ class QualityTests(unittest.TestCase):
         self.assertAlmostEqual(rounded["replies"][0]["mean_abs_logprob_diff"], 0.025)
         self.assertFalse(check(0.4, "speed")["passed"])       # mean 0.2 over the bound
         self.assertFalse(check(2.5, "speed")["passed"])       # one position past 2 nats
+
+    def test_an_engine_that_states_its_exactness_is_judged_by_it_in_either_mode(self):
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        texts = [{"id": "tides", "set": "conversations", "prompt_ids": [1, 2, 3]}]
+
+        class Engine:   # the served and the scored paths 0.05 nats apart at one token
+            def reply(self, prompt, n, top_k):
+                return {"tokens": [5, 6], "logprobs": [-0.5, -0.7], "top": [[[5, -0.5]], [[6, -0.7]]]}
+
+            def score(self, prompt, continuation, top_k, prompt_rows=True):
+                return {"continuation": [{"logprob": -0.55, "top": [[5, -0.55]]}, {"logprob": -0.7, "top": [[6, -0.7]]}]}
+
+        def check(mode, decode=None, prompt=None, **info):
+            if decode:
+                info = {"exactness": {"asked": {"decode": decode, "prompt": prompt}}}
+            return quality_checks.run_honesty(Engine(), info, {"quality": texts}, protocol, lambda m: None, {}, mode=mode)
+        for mode in ("preserve", "speed"):
+            # Exact (or declared) prompt rows are the bits of the same token decoded: the two paths agree.
+            for decode, prompt in (("row-exact", "exact"), ("declared", "declared")):
+                found = check(mode, decode, prompt)
+                self.assertEqual((found["passed"], found["tolerance"], found.get("mean_tolerance")), (False, 0.001, None))
+                self.assertEqual(found["judged_by"], {"exactness": {"decode": decode, "prompt": prompt}})
+            # A lower level lets the paths round apart, within the bound; so do decode rows that follow the row count.
+            for decode, prompt in (("row-exact", "row-exact"), ("repeatable", "repeatable"), ("repeatable", "exact")):
+                found = check(mode, decode, prompt)
+                self.assertEqual((found["passed"], found["tolerance"], found["mean_tolerance"]), (True, 2.0, 0.1))
+        # An engine that states none, or states it wrongly, is judged by its quality mode.
+        self.assertEqual(check("preserve")["judged_by"], {"quality_mode": "preserve"})
+        self.assertFalse(check("preserve")["passed"])
+        self.assertTrue(check("speed", exactness={"asked": {"prompt": "exact"}})["passed"])
+        self.assertEqual(check("speed", exactness={"asked": {"decode": "bitwise", "prompt": "exact"}})["judged_by"],
+                         {"quality_mode": "speed"})
+        self.assertIsNone(quality_checks.asked_exactness({"exactness": {"asked": None, "prompt": "exact"}}))
+        gate = status._quality_gate({"quality": {"sets": {}, "honesty": check("speed", "row-exact", "exact")}})
+        self.assertIn("judged at the exact prompt rows and row-exact decode rows the engine asks: tolerance 0.001",
+                      gate["detail"])
 
     def test_honesty_reads_the_scored_list_as_the_served_list_names_it(self):
         """A token no bytes name (it reads as U+FFFD) is left out of the served top-k list; the scored list, which

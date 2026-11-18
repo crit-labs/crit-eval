@@ -77,19 +77,22 @@ def touched(experts, per_token, rows):
     return 1.0 - (1.0 - min(1.0, per_token / experts)) ** rows
 
 
-def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None):
+def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None, columns=1):
     """The floor of one decode step of `rows` rows at `context` tokens each: {"rows", "memory_ms", "compute_ms",
     "step_ms", "bound", "ceiling_tps" (rows over the step), "expert_share" (experts touched)}, or (None, missing).
     host: what a model whose weights the device cannot all hold reads from host memory ({"tiers": the run's memory
     tiers (crit_eval.limits.tiers.derive, with their link and host memory rates and the CPU's), "hit_rate": the expert
     cache's hit rate, measured or declared by host_bytes_per_pass, or None, "hit_rate_source"}); the step then records
     "host_ms" on its "host_path" (link or cpu; "host_paths_ms" both), "host_bytes", "hit_rate", "hit_rate_source" and,
-    without a hit rate, "unmeasured" (the misses beyond the capacity bound)."""
+    without a hit rate, "unmeasured" (the misses beyond the capacity bound). columns: the tokens each row computes in
+    the step, a verify pass's drafts and its pending token (drafted_floor): every column multiplies and attends, and
+    routes its own experts, while a row's KV and fixed state are read once for all its columns."""
     missing = [name for name, value in (("model weight headers", terms), ("device bandwidth (--device)", bandwidth_gbs),
                                         ("device GEMM rates (--device)", tflops)) if not value]
     if missing:
         return None, missing
-    share = touched(terms["experts"], terms["experts_per_token"], rows)
+    columns = max(1, int(columns))
+    share = touched(terms["experts"], terms["experts_per_token"], rows * columns)
     active = min(1.0, terms["experts_per_token"] / terms["experts"]) if terms["experts"] else 0.0
     tiers = host["tiers"] if host else None
     if tiers:
@@ -115,7 +118,8 @@ def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None):
                 # Each row's arithmetic on its share of the host bytes: the resident ones off the device and its own
                 # experts' misses, at the step's miss share.
                 per_row = resident_off + terms["expert_bytes"] * active * miss_share
-                cpu = max(cpu, rows * per_row * tiers["flops_per_weight_byte"] / (tiers["cpu_gflops"] * 1e9) * 1000)
+                cpu = max(cpu, rows * columns * per_row * tiers["flops_per_weight_byte"] / (tiers["cpu_gflops"] * 1e9)
+                          * 1000)
             paths["cpu"] = cpu
         if not paths:
             return None, ["host link and host memory rates (re-run crit eval probe)"]
@@ -127,17 +131,18 @@ def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None):
         if not rate:
             unpriced.append(f"{fmt} GEMM rate")
             continue
-        compute += rows * flops / (rate * 1e12) * 1000
+        compute += rows * columns * flops / (rate * 1e12) * 1000
     attention_rate = max((tflops or {}).get("bf16") or 0, (tflops or {}).get("fp8") or 0)
     if terms["attention_flops_per_pair"] and attention_rate:
-        compute += rows * context * terms["attention_flops_per_pair"] / (attention_rate * 1e12) * 1000
+        compute += rows * columns * context * terms["attention_flops_per_pair"] / (attention_rate * 1e12) * 1000
     if unpriced:
         return None, unpriced
     parts = {"memory": memory, "compute": compute, **({path: paths[path]} if path else {})}
     bound = max(parts, key=parts.get)
     step = parts[bound]
     out = {"rows": rows, "memory_ms": memory, "compute_ms": compute, "step_ms": step, "bound": bound,
-           "ceiling_tps": rows / step * 1000 if step else None, "expert_share": share if terms["experts"] else None}
+           "ceiling_tps": rows / step * 1000 if step else None, "expert_share": share if terms["experts"] else None,
+           **({"columns": columns} if columns > 1 else {})}
     if tiers:
         out.update(host_ms=paths[path] if path else 0.0, host_path=path, host_paths_ms=paths,
                    host_bytes=int(from_host), hit_rate=None if source == "unmeasured" else 1.0 - miss_share,
@@ -145,3 +150,30 @@ def step_floor(terms, rows, context, bandwidth_gbs, tflops, host=None):
         if source == "unmeasured":
             out["unmeasured"] = UNMEASURED
     return out, []
+
+
+def drafted_floor(terms, rows, context, bandwidth_gbs, tflops, host=None, width=0, tokens_per_round=None,
+                  draft_bytes_per_step=None):
+    """The floor of one batched round of an engine that drafts (protocol concurrency.ceiling, the goal's limit): width
+    draft steps, each reading the draft layers' bytes once for every row, then a verify pass of `rows` rows of width + 1
+    columns each (step_floor with columns), every row emitting tokens_per_round tokens, the run's own measured count
+    (as the single-stream decode ceiling takes this drafter's acceptance). {**step_floor's, "draft_ms", "round_ms",
+    "tokens_per_round", "ceiling_tps" (rows x tokens per round over the round), "basis"}, or (None, missing). An engine
+    that does not draft (width 0) is step_floor's one token per row per step; a drafting engine that states no width
+    (None) has no such floor."""
+    if width is None:
+        return None, ["draft_width from the adapter (a drafting engine's batched round)"]
+    if not width:
+        found, missing = step_floor(terms, rows, context, bandwidth_gbs, tflops, host)
+        return ({**found, "basis": "one token per row per step"} if found else None), missing
+    lacking = [name for name, value in (("tokens per round from the speed cases", tokens_per_round),
+                                        ("draft_bytes_per_step from the adapter or the model's draft layers",
+                                         draft_bytes_per_step)) if not value]
+    found, missing = step_floor(terms, rows, context, bandwidth_gbs, tflops, host, columns=width + 1)
+    if missing or lacking:
+        return None, missing + lacking
+    draft = width * draft_bytes_per_step / (bandwidth_gbs * 1e9) * 1000
+    round_ms = found["step_ms"] + draft
+    return {**found, "draft_ms": draft, "round_ms": round_ms, "tokens_per_round": tokens_per_round, "width": width,
+            "ceiling_tps": rows * tokens_per_round / round_ms * 1000 if round_ms else None,
+            "basis": "the run's tokens per round, width + 1 columns per row"}, []

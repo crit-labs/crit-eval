@@ -9,6 +9,90 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-11-18
+
+### Overview
+
+crit-eval 0.7.1 carries protocol crit-eval-v0.7.1, in the 0.7 series: results compare with 0.7.0 ones and the
+reference scores carry over. The honesty check judges an engine by the exactness it asks of its rows where it states
+one, so a preserve engine may trade exact prompt rows for speed and a speed engine that asks exact rows is held to
+them; an engine that states none is judged as before. Two goals with physical limits join the five KPIs in `crit eval
+status` without moving a score or a gate: the follow-up turns' first token against its floor with a prompt cache
+(`followup_ttft`), and the most clients' aggregate against its batched ceiling with the drafts counted
+(`concurrency`). An engine with a prompt cache is measured on full prefills while its follow-up turns may be served
+from the cache. Steady state no longer measures a staged case's cold first request of stage 2 on an engine that adapts
+to what it serves, and the gate pre-check's lower-context item judges as the certified gate does, on three samples, so
+one slow request no longer fails it. The default VRAM headroom is 0.25 GiB instead of 1 GiB. crit 0.20.0 ships with
+crit-eval 0.7.1.
+
+### Added
+
+- The honesty check judges an engine by the exactness it asks of its rows, where it states one. An engine built
+  from crit's plugins states in its facts the level it asks of its decode rows and of its prompt rows
+  (`exactness.asked`: `repeatable`, `row-exact`, `exact` or `declared`), and crit holds it to them. The check now
+  reads them (protocol `quality.honesty.levels`): prompt rows asked `exact` or `declared` beside decode rows asked
+  `row-exact` or higher are the bits of the same token decoded, so the served and the scored log-probabilities must
+  agree within `tolerance` (1e-3 nats) in either quality mode; at any lower level the two paths may round apart and
+  are bounded as `speed` bounds them (2 nats a position, 0.1 nats a reply's mean), in either mode. So a `preserve`
+  engine may trade exact prompt rows for speed and be judged by the drift budget alone, and a `speed` engine that
+  asks exact rows is checked to have them. An engine that states no level is judged by its quality mode as before,
+  and the levels a mode gives by default (`preserve`: exact; `speed`: repeatable) judge as that mode did, so no
+  verdict moves for an engine that sets none. `quality.honesty.judged_by` records which decided, and the quality
+  gate's detail names the levels. The protocol is `crit-eval-v0.7.1`, in the 0.7 series: the rule is new in
+  `protocol.json`; no score moves.
+- The follow-up turns' time to first token is a goal with a physical limit, `followup_ttft`: its floor with a prompt
+  cache, where a turn prefills only the tokens past the prefix it shares with the turn before it over the whole
+  conversation's KV, which is one read of the weights for a few dozen new tokens. `crit eval status` states the goal
+  and its gap (`follow-up turns' first token at its floor with a prompt cache`) and prints the turns on a `followup`
+  line, `crit eval compare` lists them, and each turn records its `new_tokens`. Until now the turns' times were in
+  the result and nowhere in the printed status, so an engine without a prompt cache showed no distance to close:
+  two Qwen3.8-27B engines on an RTX 5090 stand at 1.3% and 0.4% of this limit (1,099 and 3,496 ms against 13.9 ms).
+  It moves no score and no gate, and it prices results measured before it from the growth of the turns' prompts. The
+  run's priority rule and stop record keep their five KPIs (`status.stop_record_headroom` is unchanged).
+- Concurrency has a goal with a physical limit, `concurrency`: the aggregate of the most clients measured against its
+  batched ceiling with the drafts counted. Each level records `drafted_ceiling` (`crit_eval.limits.batched.drafted_floor`):
+  W draft steps reading the draft layers once for every row, a verify pass of W + 1 columns per row
+  (`step_floor(columns=)`), every row emitting the greedy suite's measured tokens per round. The one-token ceiling,
+  which a drafting engine beat (204% of it at one client), stays the speedup's. `crit eval status` states the goal and
+  its gap and prints each level against it; a drafting engine without a stated width, or a result measured before,
+  has the limit unknown and `missing` says why. The Qwen3.8-27B speed engine's 4 clients stand at 33% of it (250 of
+  754 tok/s). No score or gate moves; the run's priority rule and stop record leave it out.
+- A served engine with a prompt cache is measured without turning the cache off for the run: to a server whose card
+  declares `chat-prompt-cache-v1` (crit serve, for an engine on Core's prompt cache) every timed, scored and concurrent
+  request carries `"crit": {"prompt_cache": false}` and prefills its whole prompt, while the follow-up turns and
+  retrieval may be served from the cache. A server without the capability gets no such field, and a reply with cached
+  prompt tokens still fails a timed request.
+
+### Changed
+
+- The gate pre-check's lower-context item judges as the certified gate does, on fewer samples. It timed each speed
+  case once at each context and allowed twice the protocol's tolerance, so one slow request failed it, on a
+  different case each time a candidate was checked (first token 35 -> 83 ms, 26 -> 31 ms, 823 -> 922 ms on
+  layer-cut Qwen3.8-Flash-Next engines that pass the certified gate). Each case is now warmed and timed
+  `LOWER_SAMPLES` (3) times at both contexts, after the reopen too, and compared by the certified gate's own
+  `compare_lower`: medians, the tolerance the protocol's or the case's own run-to-run spread when larger, the
+  engine's own first-token time where both contexts report it. A case whose spread passes `LOWER_SPREAD_MAX` (25%)
+  is unverified rather than failed: three samples cannot tell a slower engine from a noisy one.
+- The VRAM headroom's default is 0.25 GiB (`crit_eval.VRAM_HEADROOM_GIB`), no longer 1 GiB: the device memory an
+  engine leaves free at its peak, which `crit eval context`, `crit eval run` and `crit eval precheck` use where
+  neither `--vram-headroom-gib` nor `settings.toml`'s `vram_headroom_gib` says otherwise. It is the user's knob:
+  every GiB of it is a GiB the engine's weights, KV cache or expert cache do not get, and on a model whose experts
+  do not fit the device the three quarters of a GiB are about 290 more cached experts on Qwen3.8-Flash-Next. A
+  machine whose desktop takes device memory in bursts sets it higher. The max context of a model that fits its
+  device grows by what 0.75 GiB of KV cache holds.
+
+### Fixed
+
+- Protocol crit-eval-v0.7.1 (the coming release's working id): in a staged run, steady state (`speed.steady_state`) no
+  longer measures a case's cold first request of stage 2 because it agreed with stage 1's request. Stage 1 decodes
+  each case once, and the other cases run before stage 2 measures it again, so an engine that adapts to what it serves
+  (a device expert cache, a residency that follows the routed experts) meets stage 2 as cold as stage 1: the two
+  requests agreed within 10%, the first was measured, and the case's speed rising as the engine adapted (55, 82, 86
+  tok/s) stopped the round as a disturbed device. Such a first measured repetition is now provisional: when the
+  request after it spreads from it by more than the tolerance, it stands as one more warmup and that request is judged
+  against it. An engine whose second stage agrees with its first measures as before; unstaged runs, whose warmups are
+  their own, are unchanged (Dualshok3, #16).
+
 ## [0.7.0] - 2026-11-13
 
 ### Overview
@@ -867,7 +951,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.1...HEAD
+[0.7.1]: https://github.com/crit-labs/crit-eval/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...v0.6.1
 [0.6.0]: https://github.com/crit-labs/crit-eval/compare/v0.5.3...v0.6.0

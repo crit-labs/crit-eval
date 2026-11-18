@@ -257,20 +257,52 @@ def clearly_failed(set_name, sets, thresholds, rule):
     return None
 
 
+EXACTNESS_LEVELS = ("repeatable", "row-exact", "exact", "declared")   # an engine's row exactness, from the least exact
+
+
+def asked_exactness(info):
+    """The exactness an engine asks of its rows, {"decode": level, "prompt": level}, or None where it states none:
+    its adapter's info exactness.asked (an engine built from crit's plugins states it from its configuration's
+    exactness: what a row's bits may depend on, of EXACTNESS_LEVELS)."""
+    stated = (info or {}).get("exactness")
+    asked = stated.get("asked") if isinstance(stated, dict) else None
+    if (not isinstance(asked, dict) or set(asked) != {"decode", "prompt"}
+            or any(level not in EXACTNESS_LEVELS for level in asked.values())):
+        return None
+    return dict(asked)
+
+
+def honesty_bound(rule, mode, info):
+    """How the honesty check judges an engine: (tolerance, mean_tolerance or None, what decided it). An engine that
+    states the exactness it asks of its rows is judged by it (protocol quality.honesty.levels): exact or declared
+    prompt rows beside decode rows that are row-exact or higher are the bits of the same token decoded, so the served
+    and the scored paths agree within tolerance in either quality mode; a lower level lets them round apart within
+    the levels' bound. An engine that states none is judged by its quality mode (honesty.modes)."""
+    levels, asked = rule.get("levels"), asked_exactness(info)
+    if levels and asked:
+        same = asked["prompt"] in levels["exact"] and asked["decode"] in levels["decode"]
+        bound = {} if same else levels["bound"]
+        return bound.get("tolerance", rule["tolerance"]), bound.get("mean_tolerance"), {"exactness": asked}
+    bound = (rule.get("modes") or {}).get(mode) or {}
+    return bound.get("tolerance", rule["tolerance"]), bound.get("mean_tolerance"), {"quality_mode": mode}
+
+
 def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=True, *, mode):
     """protocol quality.honesty: the engine's greedy reply over the chat API to every text of the honesty sets (an
     engine's reply(prompt, max_new_tokens, top_k)), then the same reply tokens scored as the continuation: the served
     and the scored log-probabilities must agree within tolerance, top-k alternatives included, and the top-k lists
     hold the same tokens but those within tolerance of the k-th. In a quality mode honesty.modes names (speed)
     the two paths may round apart: its tolerance bounds each position and its mean_tolerance each reply's mean
-    difference of the reply tokens' log-probabilities. extra: (id, prompt ids, served reply) of replies already served
+    difference of the reply tokens' log-probabilities. An engine that states the exactness it asks of its rows is
+    judged by that instead of the mode (honesty_bound; the verdict's judged_by says which decided). extra: (id, prompt
+    ids, served reply) of replies already served
     with their log-probabilities (the long-context curve's first point), judged the same way, their tokens scored once;
     texts False judges only those."""
     rule, top_k = protocol["quality"]["honesty"], protocol["quality"]["top_k"]
-    bound = (rule.get("modes") or {}).get(mode) or {}
-    tolerance, mean_tolerance = bound.get("tolerance", rule["tolerance"]), bound.get("mean_tolerance")
+    tolerance, mean_tolerance, judged_by = honesty_bound(rule, mode, info)
     if not callable(getattr(engine, "reply", None)):
-        return {"passed": None, "reason": "the engine replies over no chat API", "tolerance": tolerance}
+        return {"passed": None, "reason": "the engine replies over no chat API", "tolerance": tolerance,
+                "judged_by": judged_by}
     as_served = getattr(engine, "as_served", None)
     replies, failures, worst, timing = [], [], 0.0, {"replies": [], "scores": []}
     asked = [(text["id"], text["prompt_ids"], None) for text in prepared["quality"]
@@ -315,7 +347,7 @@ def run_honesty(engine, info, prepared, protocol, log, skipped, extra=(), texts=
             failures.append(f"{text_id}: the scored and served top-{top_k} lists differ at {len(lists)} tokens")
     log(f"quality honesty: {len(replies)} served replies scored again, max |difference| {worst:.2e}"
         + ("" if not failures else " - " + "; ".join(failures)))
-    return {"passed": not failures if replies else None, "tolerance": tolerance,
+    return {"passed": not failures if replies else None, "tolerance": tolerance, "judged_by": judged_by,
             **({"mean_tolerance": mean_tolerance} if mean_tolerance is not None else {}), "max_abs_logprob_diff": worst,
             "replies": replies, "failures": failures,
             "timing": {part: _phase_timing(values) for part, values in timing.items()}}

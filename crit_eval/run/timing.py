@@ -240,7 +240,8 @@ def settling(samples, sample, rule, key="decode_tps"):
     before it spread by more than rule["tolerance"], and the case's warmups are not yet done: fewer than
     rule["max_warmup_runs"], or fewer than rule["max_warmup_tokens"] tokens decoded in them,
     and in either case fewer than rule["max_warmup_requests"]. Such a request stands as one more warmup. A case's
-    first request, a request after a measured one, and requests too short to time stand as measured."""
+    first request, a request after a measured one, and requests too short to time stand as measured (but see
+    provisional(): a first measured repetition compared only with an earlier call's warmup)."""
     if not rule or not samples or any(not s.get("warmup") for s in samples):
         return False
     warm = [s for s in samples if s.get("warmup")]
@@ -254,6 +255,18 @@ def settling(samples, sample, rule, key="decode_tps"):
         return False
     found = headroom.spread([before.get(key), sample.get(key)])
     return found is not None and found > float(rule["tolerance"])
+
+
+def provisional(samples, sample, rule, carried, key="decode_tps"):
+    """Whether the case's last request, its first measured repetition, was still warming up (protocol
+    speed.steady_state): it was measured because it agreed with an earlier call's warmup (a staged run's first stage,
+    `carried` requests at the start of `samples`), between which and this call's requests the other cases ran and an
+    engine that adapts to what it serves moved away from the case; `sample`, the request after it, spreads from it by
+    more than rule["tolerance"] while the case's warmups, it counted among them, are not yet done. It then stands as
+    one more warmup, and `sample` is judged by settling() against it."""
+    if not rule or not carried or len(samples) != carried + 1 or samples[-1].get("warmup"):
+        return False
+    return settling(samples[:-1] + [{**samples[-1], "warmup": True}], sample, rule, key)
 
 
 def steady_state(samples, rule, added, key="decode_tps"):

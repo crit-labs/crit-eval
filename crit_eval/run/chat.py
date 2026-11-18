@@ -46,6 +46,9 @@ from ..quality.prepare import GREEDY_REQUEST, prepared_template, token_ids, with
 FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
          "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
 PLAIN_CAPABILITY = "chat-plain-v1"
+# A server that declares it takes crit.prompt_cache false: the request prefills every prompt token, whatever the
+# engine's prompt cache holds. Every request but those that may be served from a cache carries it.
+PROMPT_CACHE_CAPABILITY = "chat-prompt-cache-v1"
 
 
 class Server:
@@ -242,6 +245,7 @@ class ChatEngine:
                           and PLAIN_CAPABILITY in (card.get("capabilities") or []))
         if self.plain:
             self.generate_plain = self._generate_plain
+        self.switches_cache = PROMPT_CACHE_CAPABILITY in (card.get("capabilities") or [])
         self.text = load_text(context["model"], server.chat_template)
         self.by_bytes = None  # ids_by_bytes, built for the first quality reply
         self.named = None     # the ids by_bytes names, for the first scored list read as served
@@ -255,6 +259,14 @@ class ChatEngine:
         always goes."""
         return {key: value for key, value in sampling.items()
                 if self.sampling_fields is None or key in self.sampling_fields or key == "temperature"}
+
+    def extension(self, prompt_cache=False, plain=False):
+        """The request's crit object ({"crit": {...}}, or {} without one): plain decoding (chat-plain-v1), and on a
+        server whose engine has a prompt cache to turn off (chat-prompt-cache-v1) prompt_cache false for every
+        request that is not allowed one, so a timed or scored request prefills all of its prompt."""
+        crit = {**({"decode": "plain"} if plain else {}),
+                **({"prompt_cache": False} if self.switches_cache and not prompt_cache else {})}
+        return {"crit": crit} if crit else {}
 
     def info(self):
         return {"name": self.model, "configuration": {"url": self.server.url, "model": self.model},
@@ -288,8 +300,7 @@ class ChatEngine:
         body.update(self.applied(sampling or GREEDY_REQUEST))
         if logprobs:
             body.update(logprobs=True, top_logprobs=int(logprobs))
-        if plain:
-            body["crit"] = {"decode": "plain"}   # one token per target pass (chat-plain-v1)
+        body.update(self.extension(prompt_cache, plain))   # one token per target pass; no prompt cache unless allowed
         pieces, usage, finish, telemetry, entries, calls = [], None, None, None, [], {}
         started = time.monotonic()
         first = last = None
@@ -398,7 +409,7 @@ class ChatEngine:
         url = self.server.url
         response, timing = self.server.post_timed("/chat/completions", {
             "model": self.model, "messages": messages, "max_tokens": max_new_tokens, **self.applied(GREEDY_REQUEST),
-            "logprobs": True, "top_logprobs": top_k, **({"tools": tools} if tools else {})},
+            "logprobs": True, "top_logprobs": top_k, **({"tools": tools} if tools else {}), **self.extension()},
             self.deadline.seconds(len(prompt), max_new_tokens))
         # A whole reply's time bounds its prefill from above.
         self.deadline.observe(len(prompt), timing["seconds"])
@@ -582,7 +593,7 @@ class ChatEngine:
         messages, tools = self.messages(prompt)
         body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens, "stream": True,
                 "stream_options": {"include_usage": True}, **({"tools": tools} if tools else {}),
-                **self.applied(GREEDY_REQUEST)}
+                **self.applied(GREEDY_REQUEST), **self.extension()}
         timeout = self.deadline.seconds(len(prompt), max_new_tokens) * max(1, clients)
         request = urllib.request.Request(self.server.url + "/chat/completions", data=json.dumps(body).encode(),
                                          headers=self.server.headers)

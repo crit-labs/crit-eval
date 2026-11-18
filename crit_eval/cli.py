@@ -8,6 +8,7 @@ import sys
 PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
 # The quality modes and the default, defined once (crit_eval.quality.fixed imports nothing outside the standard library).
 from .quality.fixed import DEFAULT_QUALITY_MODE, QUALITY_MODES  # noqa: E402
+from . import VRAM_HEADROOM_GIB  # noqa: E402
 QUALITY_MODE_HELP = ("how much output drift from the checkpoint the engine may trade for speed, whatever format the "
                      "checkpoint is stored in; both modes judge against the same reference (its stored weights, exact "
                      f"activations). {DEFAULT_QUALITY_MODE} (the default): a budget eight times "
@@ -135,7 +136,8 @@ def main(argv=None):
                           "activations, workspaces, graphs and speed techniques (default: settings.toml "
                           "context_reserve_gib, else the protocol's reserve_gib)")
     run.add_argument("--vram-headroom-gib", type=float, default=None,
-                     help="Device memory left free when crit-eval computes the max context (default 1)")
+                     help="Device memory left free when crit-eval computes the max context (default: settings.toml "
+                          f"vram_headroom_gib, else {VRAM_HEADROOM_GIB})")
     run.add_argument("--adaptive-sampled", action=argparse.BooleanOptionalAction, default=False,
                      help="Repeat each sampled speed case at further seeds until its relative standard error reaches "
                           "the protocol's target or its repetition cap (protocol sampled_speed.adaptive), recorded in "
@@ -180,7 +182,7 @@ def main(argv=None):
     precheck.add_argument("--no-lower", action="store_true", help="Skip the lower-context reopen")
     precheck.add_argument("--vram-headroom-gib", type=float, default=None,
                           help="Device memory to find free after the load (default: settings.toml vram_headroom_gib, "
-                               "else 1)")
+                               f"else {VRAM_HEADROOM_GIB})")
     precheck.add_argument("--chat-template", metavar="FILE", help=CHAT_TEMPLATE_HELP)
     precheck.add_argument("--out", help="Write the items as JSON here")
 
@@ -189,7 +191,8 @@ def main(argv=None):
     context.add_argument("--model", required=True, help="Model directory")
     context.add_argument("--device", required=True, metavar="JSON", help="Device file from `crit eval probe`")
     context.add_argument("--vram-headroom-gib", type=float, default=None,
-                         help="Device memory left free (default: settings.toml vram_headroom_gib, else 1)")
+                         help="Device memory left free (default: settings.toml vram_headroom_gib, else "
+                              f"{VRAM_HEADROOM_GIB})")
     context.add_argument("--ram-headroom-gib", type=float, default=None,
                          help="Host memory left free, for the placement scenario (default: settings.toml "
                               "ram_headroom_gib, else 2)")
@@ -535,9 +538,11 @@ def _command(args):
 
 
 def headroom_gib(args):
-    """--vram-headroom-gib, else settings.toml's vram_headroom_gib, else 1 GiB."""
+    """--vram-headroom-gib, else settings.toml's vram_headroom_gib, else VRAM_HEADROOM_GIB."""
     from . import machine_settings
-    return args.vram_headroom_gib if args.vram_headroom_gib is not None else machine_settings().get("vram_headroom_gib", 1.0)
+    if args.vram_headroom_gib is not None:
+        return args.vram_headroom_gib
+    return machine_settings().get("vram_headroom_gib", VRAM_HEADROOM_GIB)
 
 
 def reserve_gib(args):

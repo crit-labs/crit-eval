@@ -8,8 +8,8 @@ from .pin import CONTINUATIONS
 from ..quality.prepare import sampled_request, unapplied
 from .adapters import open_engine
 from .tool_calls import case_tool_calls
-from .timing import (_summary, check_disturbed, decode_text, disagree, rate, replies, reply_sha256, settling, stalls,
-                     steady_state, timed_generate, timed_plain, timed_replay, timed_sampled)
+from .timing import (_summary, check_disturbed, decode_text, disagree, provisional, rate, replies, reply_sha256,
+                     settling, stalls, steady_state, timed_generate, timed_plain, timed_replay, timed_sampled)
 
 
 def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None, disturbed_spread=None,
@@ -46,6 +46,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             continue
         before = (warmed or {}).get(case["id"]) or {}
         samples = [{**s, "warmup": True} for s in before.get("samples", [])]
+        carried = len(samples)   # an earlier call's warmups: other cases ran between them and this call's requests
         outputs = [before["tokens"]] if before.get("tokens") is not None else []
         own = len(outputs)   # outputs before this call's: the warmup's, compared but not the case's tokens
         load = HostLoad().start()
@@ -78,6 +79,10 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
                 # (protocol speed.output_varies).
                 sample["reply_sha256"] = reply_sha256(tokens)
             sample["warmup"] = i < warm
+            # A first measured repetition compared only with an earlier call's warmup was provisional: when the
+            # request after it moves away from it, it was still warming up (protocol speed.steady_state).
+            if not sample["warmup"] and provisional(samples, sample, steady, carried):
+                samples[-1]["warmup"], warm, added = True, warm + 1, added + 1
             if not sample["warmup"] and settling(samples, sample, steady):
                 sample["warmup"], warm, added = True, warm + 1, added + 1
             samples.append(sample)
