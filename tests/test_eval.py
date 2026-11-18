@@ -2717,6 +2717,17 @@ class ContextTests(unittest.TestCase):
             self.assertAlmostEqual(floors["cpu"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 20e6))
             self.assertAlmostEqual(floors["split"], max((RESIDENT + expert // 4) / 1e9, 3 * expert / 4 / 34e6))
             self.assertIn("CPU expert lane (integer block rows): 20 / 15 / 9 GB/s", context.render_placement(laned))
+            # A probe that measured the turn from the device to the host and back adds one a routed layer to the
+            # floors with misses on the CPU (its rows wait for the host's answer); the link's floor has none.
+            turned = context.placement(model, {**device, "host_turn_us": 500.0}, context.GIB, ram, settings, 8192)
+            turns = turned["host_turns_ms"]
+            self.assertGreaterEqual(turns, 0.5)
+            self.assertAlmostEqual(turns % 0.5, 0.0)   # half a millisecond a routed layer
+            for path in ("cpu", "split"):
+                self.assertAlmostEqual(turned["plain_pass_floor_ms"][path], found["plain_pass_floor_ms"][path] + turns)
+            self.assertEqual(turned["plain_pass_floor_ms"]["link"], found["plain_pass_floor_ms"]["link"])
+            self.assertIn("turns to the host and back, 500 us each", context.render_placement(turned))
+            self.assertIn("no turn to the host priced", context.render_placement(found))
             self.assertTrue(found["host_holds_every_expert"])
             self.assertNotIn("static split", context.render_placement(found))
             # Host memory that holds the experts but not the tables puts the tables on disk; less, the experts too.

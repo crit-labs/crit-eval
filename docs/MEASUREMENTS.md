@@ -216,6 +216,17 @@ the same window (`with_link_cpu`, `with_link_link`). The placement prices misses
 lane's one-token rate (never above the read rate) and a CPU/link split at the two concurrent rates' sum; a
 probe without the lane prices them at the read rate, an upper bound FP32 rows do not reach.
 
+The turn to the host (`host_turn_us`) is what a layer pays before the CPU can compute any of its misses and after
+it has: its rows go to the host and the answer comes back, the device waiting meanwhile. The probe times a row
+written on the device, copied to pageable host memory, copied back and synchronized (the median of 64 turns). The
+placement adds one turn a routed layer to the floors with misses on the CPU (`cpu`, `split`; `host_turns_ms` is that
+part); the link's floor has no turn. It is a floor like the others: the probe's device is idle and its process holds
+no registered memory, and a loaded engine pays more (an RTX 5090 under WSL2: 131 us in the probe, 6.3 ms a pass over
+48 routed layers, where an engine with a 65 GiB registered store measured 378 to 415 us a turn). So the floors still
+rank the CPU first on that machine (26.1 ms against the link's 31.0) where the engine's own timing takes the link,
+and the miss path is the engine's to measure: `crit plugins offload` gives expert-offload `misses: auto` there. A
+probe that measured no turn prices none, and the placement says so.
+
 **Prefill ceiling.** `prepare` counts arithmetic per token from safetensors or GGUF headers and config
 ([crit_eval/limits/ceiling.py](../crit_eval/limits/ceiling.py)): 2 × rows × columns for every
 projection in its stored format (BF16, FP8 or NVFP4; a GGUF's block types at the FP8 rate, the

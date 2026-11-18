@@ -441,6 +441,33 @@ void host_expert_with_link(int threads, size_t bytes, double* cpu, double* link)
     cudaFreeHost(host);
 }
 
+// One turn from the device to the host and back, in microseconds: a layer whose missed experts the CPU computes
+// hands its rows to the host and waits for the answer, once a layer of a pass, whatever the CPU's own rate. A row
+// written on the device, copied to pageable host memory as a framework's tensor is (a blocking copy: the device's
+// work so far is done), copied back and synchronized; the median of `turns` after 8 that are not counted. Tens of
+// microseconds where the device is the machine's own, most of a millisecond where it is reached through a virtual
+// machine.
+double host_turn_us(int turns) {
+    const size_t bytes = 16384;   // a row of a few thousand floats
+    void* device = nullptr;
+    if (cudaMalloc(&device, bytes) != cudaSuccess) return 0.0;
+    std::vector<char> host(bytes);
+    std::vector<double> found;
+    for (int i = 0; i < turns + 8; ++i) {
+        cudaDeviceSynchronize();
+        const auto start = Clock::now();
+        cudaMemset(device, i & 255, bytes);
+        cudaMemcpy(host.data(), device, bytes, cudaMemcpyDeviceToHost);
+        host[0] = static_cast<char>(host[0] + 1);
+        cudaMemcpy(device, host.data(), bytes, cudaMemcpyHostToDevice);
+        cudaDeviceSynchronize();
+        if (i >= 8) found.push_back(std::chrono::duration<double, std::micro>(Clock::now() - start).count());
+    }
+    cudaFree(device);
+    std::sort(found.begin(), found.end());
+    return found.empty() ? 0.0 : found[found.size() / 2];
+}
+
 // Raw tensor-core rates: mma.sync throughput per input and accumulator format, every SM busy, operands in registers.
 // Kinds: 0 bf16->f32, 1 f16->f32, 2 f16->f16, 3 e4m3->f32, 4 e2m1 x e2m1 block-scaled (nvfp4) -> f32,
 // 5 e2m1 x e4m3 (kind::f8f6f4) -> f32.
@@ -702,12 +729,13 @@ int main(int argc, char** argv) {
                   "\"host_threads\": %d, \"host_memory_gbs\": {\"read\": %.1f, \"write\": %.1f, \"copy\": %.1f, "
                   "\"read_one_thread\": %.1f}, \"cpu_gflops\": {\"fp32\": %.1f, \"fp32_one_thread\": %.1f}, \"cpu_isa\": \"%s\", "
                   "\"host_expert_gbs\": {\"tokens_1\": %.1f, \"tokens_3\": %.1f, \"tokens_8\": %.1f, \"threads\": %d, "
-                  "\"with_link_cpu\": %.1f, \"with_link_link\": %.1f}, \"host_expert_isa\": \"%s\"",
+                  "\"with_link_cpu\": %.1f, \"with_link_link\": %.1f}, \"host_expert_isa\": \"%s\", "
+                  "\"host_turn_us\": %.1f",
                   threads, host_memory_gbs(0, host_bytes, threads, 5), host_memory_gbs(1, host_bytes, threads, 5),
                   host_memory_gbs(2, host_bytes, threads, 5), host_memory_gbs(0, host_bytes, 1, 5),
                   cpu_gflops(threads, 3), cpu_gflops(1, 3), kIsa,
                   host_expert_gbs(1, cores, lane_bytes, 3), host_expert_gbs(3, cores, lane_bytes, 3),
-                  host_expert_gbs(8, cores, lane_bytes, 3), cores, with_cpu, with_link, kIntIsa);
+                  host_expert_gbs(8, cores, lane_bytes, 3), cores, with_cpu, with_link, kIntIsa, host_turn_us(64));
     cublasLtHandle_t lt;
     if (cublasLtCreate(&lt)) {
         std::printf("{\"error\": \"cublasLtCreate failed\"}\n");

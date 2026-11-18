@@ -9,6 +9,28 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.2] - 2026-11-18
+
+### Overview
+
+crit-eval 0.7.2 keeps protocol crit-eval-v0.7.1: no score moves. `crit eval probe` measures the device-to-host turn
+(`host_turn_us`), and the placement prices that turn once a routed layer in the floors of a plain pass whose expert
+misses the CPU computes. It reads the routed layers through crit-core's `routed_layers`, so it needs crit-core 0.21.0
+or later; crit 0.21.0 ships with crit-eval 0.7.2.
+
+### Added
+
+- `crit eval probe` measures the turn from the device to the host and back (`host_turn_us`: a row written on the
+  device, copied to pageable host memory, copied back and synchronized, the median of 64), and the placement adds
+  one turn a routed layer to the floors of a plain pass with misses computed on the CPU (`plain_pass_floor_ms.cpu`
+  and `.split`, with that part as `host_turns_ms`). A layer whose misses the CPU computes hands its rows to the host
+  and waits for the answer whatever the CPU's own rate. On an RTX 5090 under WSL2 the placement priced the CPU at
+  18.3 ms a pass and the link at 30.7, while the loaded engine measured 464 us a missed expert on the CPU (378 of
+  it the turn) against 102 over the link and took the link. The probe's turn there is 131 us (an idle device, no
+  registered memory), which moves the CPU's floor to 26.1 ms: closer, still a floor, so the miss path stays the
+  engine's to measure (crit's `crit plugins offload` now gives `misses: auto`). A device file without the
+  measurement prices no turn, as before, and `crit eval probe`'s `outdated` names it.
+
 ## [0.7.1] - 2026-11-18
 
 ### Overview
@@ -951,7 +973,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.1...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.2...HEAD
+[0.7.2]: https://github.com/crit-labs/crit-eval/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/crit-labs/crit-eval/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...v0.7.0
 [0.6.1]: https://github.com/crit-labs/crit-eval/compare/v0.6.0...v0.6.1

@@ -194,6 +194,10 @@ def combine(samples):
         # The CPU expert lane: crit's integer block rows at 1, 3 and 8 tokens an expert on one thread per core, and at
         # 3 beside expert-sized link copies (both rates over the same window): what a CPU tier computing misses reaches.
         "host_expert_gbs": medians(samples, "host_expert_gbs"), "host_expert_isa": first.get("host_expert_isa"),
+        # One turn from the device to the host and back in microseconds: what each layer of a pass pays whose
+        # missed experts the CPU computes.
+        "host_turn_us": (metrics.median([s["host_turn_us"] for s in samples if s.get("host_turn_us")])
+                         if any(s.get("host_turn_us") for s in samples) else None),
         "memory_total_bytes": max((s["memory_total_bytes"] for s in samples if s.get("memory_total_bytes")), default=None),
         # The least free memory any run saw: the max context must fit the device as it is shared.
         "memory_free_bytes": min((s["memory_free_bytes"] for s in samples if s.get("memory_free_bytes")), default=None),
@@ -296,7 +300,8 @@ def probe_device(binary, device, repeats, log):
 MEASURED = {"mma_tflops": "raw tensor-core rates (fp16_acc, fp4_fp8 prompt activations)",
             "host_to_device_gbs": "host-to-device rates (weights kept in host memory)",
             "host_memory_gbs": "host memory rates", "cpu_gflops": "CPU rates",
-            "host_expert_gbs": "the CPU expert lane (integer block rows, alone and beside link copies)"}
+            "host_expert_gbs": "the CPU expert lane (integer block rows, alone and beside link copies)",
+            "host_turn_us": "the turn from the device to the host and back (a layer's rows to the CPU tier)"}
 
 
 def outdated(device):
@@ -308,7 +313,7 @@ def outdated(device):
     backend = ceiling.device_backend(device)
     # A HIP probe measures no raw matrix-instruction rates (probe/device_probe_hip.cpp).
     reasons = [f"no {what}" for key, what in MEASURED.items() if not device.get(key)
-               and not (backend == "hip" and key == "mma_tflops")]
+               and not (backend == "hip" and key in ("mma_tflops", "host_turn_us"))]
     source = SOURCES.get(backend, SOURCE)
     if device.get("probe_sha256") != hashlib.sha256(source.read_bytes()).hexdigest():
         reasons.append("measured by another probe source" if device.get("probe_sha256") else "no probe_sha256")
