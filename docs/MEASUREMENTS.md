@@ -87,6 +87,23 @@ their declared types, and every required one; **truncated** when the output-toke
 which is not counted as invalid; **invalid** otherwise, with the first reason in `status`. Each case records
 `tool_calls` (`format`, `valid`, `invalid`, `truncated`, `calls`); a template in another format leaves it unmeasured.
 
+**Energy** (reported, not judged; [energy.py](../crit_eval/run/energy.py)): two engines at the same tok/s can draw
+very different power. While a round's speed suites run, a side thread reads the engine's GPUs through NVML (the
+library nvidia-smi reads) every 50 ms: the energy counter (`nvmlDeviceGetTotalEnergyConsumption`) where every GPU's
+driver has it, else the power draw (`nvmlDeviceGetPowerUsage`) integrated between readings (`energy.source`
+`energy_counter` or `power`); several GPUs of a device set are added up. Before the suite's first request the round
+reads the device at rest with the engine loaded for 2 s (`energy.idle_watts`). Each timed request is split at its first
+token: the prefill from the call to the first token, the decode from the first token to the last. Each greedy and
+sampled speed case records `energy` over its measured repetitions: `joules_per_prompt_token` (the prefills' joules
+over their prompt tokens, a server's own count for a served engine), `joules_per_output_token` (the decodes' joules
+over the tokens after the first, as decode tok/s counts them), `average_watts` over the requests, `peak_watts` (the
+highest power reading over them) and the joules and seconds they hold. Each suite's `energy` holds the geometric
+mean of joules per output token over its cases and of joules per prompt token over `prefill_cases`, and `status`
+prints them with the idle draw. The figures are the whole device's, idle draw included, and a power reading the
+driver averages over its own window lags a short request. Without NVML, with `CUDA_VISIBLE_DEVICES` hiding every GPU,
+a GPU NVML cannot find or a driver that reports neither figure, `energy` is `unmeasured` with the reason, and so is a
+case whose requests a resumed round's journal answered. No gate or score reads it.
+
 ## Sampled speed
 
 Real requests sample, and an engine that speculates only on greedy requests decodes them one token

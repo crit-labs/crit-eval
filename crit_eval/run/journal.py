@@ -274,6 +274,10 @@ class Journal:
             self.counts["replayed_seconds"] += row["seconds"]
             self.replays += 1
             engine.served.append(row)
+            if engine.real is not None:
+                # Loaded partway through the replay (an attribute only the engine has): its own deadline, the one
+                # the stages' rates read from now on, learns this request too, as it learned those before the load.
+                _observe(engine.real, [row])
             self._write({**row, "engine": engine.index, "replayed": True})
             if row.get("error"):
                 raise _error(row["error"])

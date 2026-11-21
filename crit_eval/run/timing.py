@@ -123,12 +123,57 @@ DISTURBED_MIN_REQUEST_MS = 100  # shorter requests vary with timer and scheduler
 QUIET_HOST_CORES = 2.0
 
 
-def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps"):
+def engine_memory(engine):
+    """The engine's own memory as Core reports it (its telemetry's `memory`: the device's givers, what each gave back
+    and took again, and its steps' counts), or None from an engine that reports none."""
+    report = getattr(engine, "telemetry", None)
+    if not callable(report):
+        return None
+    try:
+        found = report() or {}
+    except Exception:   # a probe never fails the run
+        return None
+    memory = found.get("memory") if isinstance(found, dict) else None
+    return memory if isinstance(memory, dict) else None
+
+
+def memory_changes(before, after):
+    """What the engine's memory did between two engine_memory reads, as a clause of a Disturbed message: each giver's
+    bytes given back and taken again (Core's eviction order: an expert cache's slots, kept prompts), and its steps'
+    segments refused, past the arena or past the headroom. '' where a read is missing or nothing moved."""
+    if not before or not after:
+        return ""
+    said = []
+    was = before.get("givers") or {}
+    for name, now in sorted((after.get("givers") or {}).items()):
+        old = was.get(name) or {}
+        released = int(now.get("released") or 0) - int(old.get("released") or 0)
+        regrown = int(now.get("regrown") or 0) - int(old.get("regrown") or 0)
+        times = int(now.get("releases") or 0) - int(old.get("releases") or 0)
+        if released or regrown:
+            label = name.split(":")[0] + (":idle" if name.endswith(":idle") else "")
+            said.append(f"{label} gave back {released / 1e9:.2f} GB in {times} release{'s' if times != 1 else ''} "
+                        f"and took {regrown / 1e9:.2f} GB again")
+    steps, old = after.get("steps") or {}, before.get("steps") or {}
+    for key, what in (("refused", "step segments refused"), ("overflows", "step segments past the arena"),
+                      ("breaches", "step segments past the headroom")):
+        count = int(steps.get(key) or 0) - int(old.get(key) or 0)
+        if count > 0:
+            said.append(f"{count} {what}")
+    if not said:
+        return ("; the engine's memory held still over the case (no giver gave back or took memory, no step "
+                "passed its arena)") if (after.get("givers") or after.get("steps")) else ""
+    return "; the engine's memory over the case: " + "; ".join(said)
+
+
+def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps", memory=None):
     """Raise Disturbed when the measured `key` (decode tok/s, or round_ms for sampled repetitions, whose texts and
     so their tokens per round differ; at the median drafts per round where the rounds' widths vary,
     width_adjusted_rounds) of one case spreads (max - min over the median) by more than `limit`. Quiet
     rounds recorded at most about 10%; a disturbed one 37%. other_cores: CPU cores other processes kept busy during
-    the case (HostLoad), named in the message."""
+    the case (HostLoad), named in the message. memory: (before, after) engine_memory reads around the case, whose
+    changes the message names (memory_changes): an expert cache that gave back and regrew is the engine's own
+    variation, which the device's free memory alone does not show."""
     measured = [s for s in samples if not s.get("warmup")]
     if not limit or not measured or metrics.median([s["request_ms"] for s in measured]) < DISTURBED_MIN_REQUEST_MS:
         return
@@ -152,8 +197,10 @@ def check_disturbed(case_id, samples, limit, other_cores=None, key="decode_tps")
             cause = ("the device was disturbed, or the engine varies on its own (cold reads of file-backed weights or "
                      "tables, host threads). Measure again when nothing else uses the device; if it varies again on a "
                      "quiet host, look inside the engine")
+        changes = memory_changes(*memory) if memory else ""
+        elastic = bool(memory and memory[1] and memory[1].get("givers"))
         raise Disturbed(f"speed {case_id}: {what} varied {spread:.0%} between repetitions (limit {limit:.0%}){load}; "
-                        + cause + _memory_note())
+                        + cause + changes + _memory_note(elastic))
 
 
 def replies(samples):
@@ -193,10 +240,12 @@ def width_adjusted_rounds(samples):
 LOW_DEVICE_MEMORY = 1 << 30  # below it a full device may page its memory to the host (WDDM) or stall allocations
 
 
-def _memory_note():
+def _memory_note(elastic=False):
     """What a Disturbed message adds about the device's memory: its free bytes as nvidia-smi sees them, and when they
     are below LOW_DEVICE_MEMORY, that the engine's own memory may be the disturbance. Under Windows' WDDM a device
-    past its memory pages to host RAM instead of failing, and the requests slow unevenly as on a shared device."""
+    past its memory pages to host RAM instead of failing, and the requests slow unevenly as on a shared device. An
+    elastic engine (one whose memory has givers: an expert cache fills what is free, Core keeping the headroom) reads
+    low by design, and the message says so instead."""
     from .host import device_memory
     try:
         found = device_memory()
@@ -206,6 +255,9 @@ def _memory_note():
         return ""
     free, total = found["free_bytes"], found.get("total_bytes")
     note = f" (device memory: {free / 1e9:.2f}" + (f" of {total / 1e9:.1f}" if total else "") + " GB free"
+    if free < LOW_DEVICE_MEMORY and elastic:
+        return note + (": low by design, since the engine's elastic memory fills what is free and Core keeps its "
+                       "headroom; its memory's changes say whether it moved)")
     if free < LOW_DEVICE_MEMORY:
         return note + (": nearly full, so the engine's own memory may be the disturbance; a device past its memory "
                        "pages to host RAM under Windows' WDDM and slows unevenly. Check its peak memory first)")

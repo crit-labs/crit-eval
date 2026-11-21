@@ -432,7 +432,10 @@ class FormatTests(unittest.TestCase):
         import onnxruntime
         import torch
         from onnx import TensorProto, helper, numpy_helper
-        from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+        try:
+            from onnxruntime.quantization.matmul_nbits_quantizer import MatMulNBitsQuantizer
+        except ImportError as missing:   # onnxruntime's quantizer imports onnx_ir, which onnxruntime does not require
+            self.skipTest(f"onnxruntime's MatMulNBits quantizer does not import here: {missing}")
         from optimum.exporters.onnx import main_export
         from crit_core.model import open_model
         exported, quantized = self.root / "onnx", self.root / "onnx-q4"

@@ -50,6 +50,11 @@ adapter may keep host-side weights (for example pinned expert records) in the pr
 to the next engine it opens for the same model. Under `crit run ... eval` the served candidate's engines
 are built in one resident host process for the same reason: the run's context is built again where
 the lower context ran, and an adapter that keeps host-side weights in the process finds them there.
+An adapter that keeps such weights frees them in an optional module-level `release()`, which `crit eval ab` calls
+once after its last round; `ab` loads an adapter both engines share once, so its engines find what the other one
+kept, and records each engine's load time per round (`load_seconds`). Core's adapter keeps its plugins' host-side
+stores this way (a large MoE's experts packed in host memory), so `ab --package` builds its engines again every round
+without building those again.
 Build everything on the device fresh for each engine:
 KV cache, expert or weight caches, workspaces and graphs. Device state carried over from an earlier
 engine would bias the lower-context comparison.

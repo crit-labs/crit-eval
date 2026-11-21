@@ -4,6 +4,8 @@
 //   #clock <cupti_ns> <realtime_ns>   pairs CUPTI's clock with CLOCK_REALTIME (at start and at exit)
 //   #device <sm_count> <name>
 //   <start_ns> <end_ns> <grid_x*grid_y*grid_z> <block_threads> <name>
+//   #copy <start_ns> <end_ns> <bytes> <kind>   a memory copy (CUpti_ActivityMemcpyKind: 1 host to device, 2 device
+//                                               to host, 8 device to device, ...), which no kernel record shows
 // Timestamps are CUPTI's. The driver takes its phase marks on the same clock, through crit_ktrace_timestamp(); the
 // clock lines convert them to the host's realtime clock for marks taken on it (which drifts against CUPTI's by tens
 // of milliseconds over a trace under WSL). Linux only.
@@ -41,6 +43,14 @@ void CUPTIAPI buffer_completed(CUcontext, uint32_t, uint8_t* buffer, size_t, siz
     CUpti_Activity* record = nullptr;
     std::lock_guard<std::mutex> lock(g_mu);
     while (cuptiActivityGetNextRecord(buffer, valid, &record) == CUPTI_SUCCESS) {
+        if (record->kind == CUPTI_ACTIVITY_KIND_MEMCPY) {
+            const auto* c = reinterpret_cast<const CUpti_ActivityMemcpy6*>(record);
+            if (g_out)
+                fprintf(g_out, "#copy %llu %llu %llu %u\n", static_cast<unsigned long long>(c->start),
+                        static_cast<unsigned long long>(c->end), static_cast<unsigned long long>(c->bytes),
+                        static_cast<unsigned>(c->copyKind));
+            continue;
+        }
         if (record->kind != CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL && record->kind != CUPTI_ACTIVITY_KIND_KERNEL) continue;
         const auto* k = reinterpret_cast<const CUpti_ActivityKernel11*>(record);
         if (g_out)
@@ -87,6 +97,7 @@ extern "C" int InitializeInjection() {
     clock_line();
     cuptiActivityRegisterCallbacks(buffer_requested, buffer_completed);
     cuptiActivityEnable(CUPTI_ACTIVITY_KIND_CONCURRENT_KERNEL);
+    cuptiActivityEnable(CUPTI_ACTIVITY_KIND_MEMCPY);
     atexit(finish);
     return 1;
 }

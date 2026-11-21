@@ -57,6 +57,36 @@ class KernelTraceTest(unittest.TestCase):
         self.assertIn("only 96 blocks for 170 SMs", text)
         self.assertIn("50% of peak", text)
 
+    def test_copies_while_no_kernel_runs_are_the_links_not_the_hosts(self):
+        # A prompt whose experts cross the link layer by layer: the device waits on each layer's copies, which a
+        # trace of kernels alone left as host time.
+        with tempfile.TemporaryDirectory() as directory:
+            write_trace(directory, 1, 0, [
+                (100_000, 200_000, 340, "expert_kernel"),
+                (600_000, 700_000, 340, "expert_kernel"),
+            ])
+            path = Path(directory) / "trace-1.txt"
+            path.write_text(path.read_text() + "#copy 200000 600000 4000000 1\n"    # 0.4 ms: the device only copies
+                                               "#copy 650000 750000 1000000 1\n"    # 0.05 ms beside a kernel
+                                               "#copy 1500000 1600000 2048 2\n")    # after the first token
+            marks = {"info": {"name": "toy"},
+                     "cases": [{"id": "c", "prompt_tokens": 10, "output_tokens": 2, "rounds": 1,
+                                "prefill_start": 0, "prefill_first": 1_000_000, "prefill_end": 2_000_000,
+                                "start": 2_000_000, "first": 2_500_000, "end": 3_000_000}]}
+            self.assertEqual(len(kernels.read_traces(directory)), 2)   # kernels and the device, as before
+            found, device, copies = kernels.read_traces(directory, copies=True)
+            self.assertEqual(copies[0], (200_000, 600_000, 4_000_000, 1))
+            result = kernels.analyze(found, device, marks, copies=copies)
+        prefill = result["cases"]["c"]["prefill"]
+        self.assertEqual(prefill["copies"]["count"], 3)
+        self.assertEqual(prefill["copies"]["bytes"], {"host_to_device": 5_000_000, "device_to_host": 2048})
+        self.assertAlmostEqual(prefill["copies"]["ms"], 0.6)
+        self.assertAlmostEqual(prefill["copies"]["alone_ms"], 0.55)
+        self.assertAlmostEqual(prefill["gpu_before_first_ms"], 0.2)
+        self.assertAlmostEqual(prefill["link_before_first_ms"], 0.45)   # 0.4 alone, then 0.05 past the last kernel
+        self.assertIn("copying alone", kernels.render({"engine": {"name": "toy"}, **result}))
+        self.assertNotIn("copies", result["cases"]["c"]["decode"])
+
     def test_overlapping_launch_is_charged_only_after_its_predecessor(self):
         with tempfile.TemporaryDirectory() as directory:
             # norm_kernel launches early (programmatic dependent launch) and waits 0.9 ms on gemm_kernel.

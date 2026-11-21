@@ -59,11 +59,11 @@ def _decode(spec, tensor, current=None):
     return current
 
 
-def _state(obj, path, skip=()):
-    """(description, tensors) of every attribute of cache or cache layer `obj` but `skip`."""
+def _state(obj, path, skip=(), only=None):
+    """(description, tensors) of every attribute of cache or cache layer `obj` but `skip` (of `only`, if given)."""
     tensors = {}
     return {name: _encode(value, f"{path}{name}", tensors) for name, value in vars(obj).items()
-            if name not in skip}, tensors
+            if name not in skip and (only is None or name in only)}, tensors
 
 
 def _apply(obj, spec, tensor):
@@ -74,13 +74,17 @@ def _apply(obj, spec, tensor):
 class PromptState:
     """The reference's cache after a prompt (the transformers Cache its own forward created, one entry per decoder
     layer), stored in `folder` as one safetensors file per decoder layer and one for the cache's own attributes, in
-    FP32 as the reference computed them, with index.json (identity, files and their sha256) written last. Between
-    uses a layer's tensors are meta placeholders of their shapes: the forward still reads lengths from them, only the
-    layer being run holds its tensors on the device."""
+    FP32 as the reference computed them, with index.json (identity, files and their sha256) written last. A layer's
+    file holds what that decoder layer's own runs write (`paged`, {layer: attribute names}, shared by the states of
+    one scoring): between uses its tensors are meta placeholders of their shapes, from which the forward still reads
+    lengths, and only the layer being run holds them on the device. Whatever else the model's forward keeps on a
+    cache layer (a position history it extends every pass, say) stays where it is, with the cache's own attributes
+    (_Own): the forward reads its values before any layer runs."""
 
-    def __init__(self, folder, identity, ids, memory=None):
+    def __init__(self, folder, identity, ids, memory=None, paged=None):
         self.folder, self.identity, self.ids, self.memory = Path(folder), identity, ids, memory
         self.cache, self.done, self.files = None, 0, {}
+        self.paged, self._entered = {} if paged is None else paged, {}
 
     def ready(self):
         index = self.folder / "index.json"
@@ -147,12 +151,14 @@ class PromptState:
         self.cache = cache
 
     def restore(self, cache, device):
-        """Make `cache`, freshly created by the forward, this prompt's: its own attributes as stored, every layer's
-        tensors placeholders until the layer runs."""
+        """Make `cache`, freshly created by the forward, this prompt's: its own attributes and what the forward keeps
+        on its layers as stored, every layer's tensors placeholders until the layer runs."""
         self.adopt(cache)
         spec, tensors = self._read("cache.safetensors")
-        _apply(cache, spec, lambda path: tensors[path].to(device))
-        self._grow(len([n for n in self.files if n.startswith("layer-")]))
+        _apply(cache, spec["cache"], lambda path: tensors[path].to(device))
+        self._grow(max(len([n for n in self.files if n.startswith("layer-")]), len(spec["layers"])))
+        for layer, kept in zip(cache.layers, spec["layers"]):
+            _apply(layer, kept, lambda path: tensors[path].to(device))
         for index in range(len(cache.layers)):
             name = self._layer(index)
             if name in self.files:
@@ -185,29 +191,44 @@ class PromptState:
             raise CacheUnsupported("the cache holds fewer layers than the model has decoder layers")
 
     def enter(self, index, device):
-        """Before decoder layer `index` runs: its stored tensors (if any) on the device."""
+        """Before decoder layer `index` runs: its stored tensors (if any) on the device. What the layer then holds is
+        noted, so that leave() knows which attributes the run writes."""
         name = self._layer(index)
         if name in self.files:
             self._grow(index + 1)
             spec, tensors = self._read(name)
             _apply(self.cache.layers[index], spec, lambda path: tensors[path].to(device))
+        layers = self.cache.layers
+        self._entered[index] = ({key: _fingerprint(value) for key, value in vars(layers[index]).items()}
+                                if index < len(layers) else {})
 
     def leave(self, index, keep):
-        """After decoder layer `index` ran: stored back (keep) or dropped, placeholders in its place."""
+        """After decoder layer `index` ran: the attributes its runs write (`paged`, this run's added) stored back
+        (keep) or dropped, placeholders in their place. Its other attributes are what the model's forward keeps on
+        it, and stay (a layer that leaves without having entered pages all of them)."""
         self._grow(index + 1)
         layer = self.cache.layers[index]
+        entered = self._entered.pop(index, {})
+        names = self.paged.setdefault(index, set())
+        names.update(key for key, value in vars(layer).items() if entered.get(key) != _fingerprint(value))
         if keep:
-            spec, tensors = _state(layer, f"{index}.")
+            spec, tensors = _state(layer, f"{index}.", only=names)
             self._write(self._layer(index), spec, tensors)
         else:
             spec, tensors = self._header(self._layer(index))
         self._placeholders(layer, spec, tensors)
 
     def seal(self):
-        """Store the cache's own attributes and the index: the prompt's state is complete."""
+        """Store the cache's own attributes, what the forward keeps on its layers, and the index: the prompt's state
+        is complete."""
         import hashlib
         spec, tensors = _state(self.cache, "cache.", skip=("layers",))
-        self._write("cache.safetensors", spec, tensors)
+        kept = []
+        for index, layer in enumerate(self.cache.layers):
+            layer_spec, layer_tensors = _state(layer, f"layers.{index}.", skip=self.paged.get(index, ()))
+            kept.append(layer_spec)
+            tensors.update(layer_tensors)
+        self._write("cache.safetensors", {"cache": spec, "layers": kept}, tensors)
         for name in [name for name, sha in self.files.items() if sha is None]:   # sealed states live on disk
             data = self._bytes(name)
             self.memory.drop(self._file(name))
@@ -287,25 +308,49 @@ def _fingerprint(value):
     return ("object", id(value))
 
 
-class _Own:
-    """A cache's own attributes (all but its layers) at one point: what each pass after it reads."""
+_ABSENT = object()   # an attribute a cache layer does not hold: no fingerprint matches it
 
-    def __init__(self, cache):
+
+class _Own:
+    """A cache's own state at one point, what each pass after it reads: its attributes but its layers, and what the
+    model's forward keeps on the layers (each layer's attributes but those its runs write, `paged`, which PromptState
+    stores per layer). `paged` grows as layers first run; a name it takes over is the layer's from then on."""
+
+    def __init__(self, cache, paged):
+        self.paged = paged
         self.order = list(vars(cache))
         self.values = {key: value for key, value in vars(cache).items() if key != "layers"}
         self.mark = _fingerprint(self.values)
+        self.layers = {(index, name): value for index, layer in enumerate(cache.layers)
+                       for name, value in vars(layer).items() if name not in paged.get(index, ())}
+        self.marks = {key: _fingerprint(value) for key, value in self.layers.items()}
 
-    def held_by(self, cache):
-        return _fingerprint({key: value for key, value in vars(cache).items() if key != "layers"}) == self.mark
+    def _kept(self, skip=None):
+        """The layer attributes it holds that are still the forward's, but those of layer `skip`."""
+        return [(index, name) for index, name in self.layers
+                if index != skip and name not in self.paged.get(index, ())]
+
+    def held_by(self, cache, running=None):
+        """Whether `cache` still holds this state, the attributes of decoder layer `running` aside (its run may write
+        them)."""
+        if _fingerprint({key: value for key, value in vars(cache).items() if key != "layers"}) != self.mark:
+            return False
+        layers = cache.layers
+        return all(_fingerprint(vars(layers[index]).get(name, _ABSENT)) == self.marks[index, name]
+                   for index, name in self._kept(running))
 
     def apply(self, cache):
         """Make them the cache's again, in their order; their objects must be as they were."""
-        if _fingerprint(self.values) != self.mark:
+        kept = self._kept()
+        if _fingerprint(self.values) != self.mark or any(_fingerprint(self.layers[key]) != self.marks[key]
+                                                        for key in kept):
             raise _OrderUnsafe("the cache's own state was changed in place")
         attributes = vars(cache)
         layers = attributes["layers"]
         attributes.clear()
         attributes.update((key, layers if key == "layers" else self.values[key]) for key in self.order)
+        for index, name in kept:
+            setattr(layers[index], name, self.layers[index, name])
 
 
 @contextmanager

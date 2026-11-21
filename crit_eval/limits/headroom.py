@@ -665,7 +665,12 @@ def prefill_terms(result, trace, rates, prefill_cases):
             rows["draft"] = (spent["draft"], 0.0)
         first = entry.get("first_token_ms")
         if first is not None and entry.get("gpu_before_first_ms") is not None:
-            rows["host"] = (max(0.0, first - entry["gpu_before_first_ms"]), 0.0)
+            # The time the device only copied (weights over the link) is the link's, not the host's: a trace from
+            # before copies were recorded files it under host.
+            link = entry.get("link_before_first_ms") or 0.0
+            if link:
+                rows["link"] = (link, 0.0)
+            rows["host"] = (max(0.0, first - entry["gpu_before_first_ms"] - link), 0.0)
         total = first if first is not None else entry.get("wall_ms")
         cases[case_id] = {"prompt_tokens": case["prompt_tokens"], "trace_ms": total,
                           "named_ms": (entry.get("classified_ms") or {}).get("names", 0.0),
@@ -696,6 +701,7 @@ def prefill_terms(result, trace, rates, prefill_cases):
     if speedups and len(speedups) == len(prefill_cases):
         names = {"other": "other kernels at zero", "draft": "draft work in the prefill at zero",
                  "host": "the host's share of the first token at zero",
+                 "link": "the first token's copies while no kernel ran at zero",
                  "matmul:unknown": "matmul kernels of no known format at zero"}
         for term in dict.fromkeys(k for s in speedups.values() for k in s):
             gain = metrics.geometric_mean([s.get(term, 1.0) for s in speedups.values()]) - 1

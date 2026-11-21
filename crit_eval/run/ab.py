@@ -6,6 +6,11 @@ run-to-run spread inside one session, so two results measured apart cannot confi
 order (A B, then B A), loading and closing each engine in turn. It reports every round's scores and the
 paired ratio B / A per round; the median and spread of those ratios are facts about the pair, measured
 under the same conditions.
+
+The engines are built again every round, but the model stays loaded between them where the adapter keeps it: an
+adapter may hold host-side weights in the process for the next engine of the same model (docs/ADAPTER.md), as
+Core's adapter does for a crit package (`--package`, its plugins' kept stores), and frees them in its optional
+module-level release(), which `ab` calls once after its last round. Each round records each engine's load time.
 """
 import datetime
 import time
@@ -31,32 +36,53 @@ def run_ab(adapter_a, config_a, adapter_b, config_b, model, data, out, rounds=2,
     continuations = load_continuations(data, prepared)
     warmups = protocol["speed"]["warmup_runs"] if warmups is None else warmups
     repetitions = protocol["speed"]["repetitions"] if repetitions is None else repetitions
-    engines = {"a": (load_adapter(adapter_a), dict(config_a or {})), "b": (load_adapter(adapter_b), dict(config_b or {}))}
+    # One module for both engines when they share an adapter (two configurations, or two packages through Core's
+    # adapter): what it keeps in the process between its engines is then one store for both.
+    modules = {}
+    for adapter in (adapter_a, adapter_b):
+        if Path(adapter).resolve() not in modules:
+            modules[Path(adapter).resolve()] = load_adapter(adapter)
+    engines = {"a": (modules[Path(adapter_a).resolve()], dict(config_a or {})),
+               "b": (modules[Path(adapter_b).resolve()], dict(config_b or {}))}
     result = {"started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
               "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
               "warmup_runs": warmups, "repetitions": repetitions, "context_tokens": context_tokens, "rounds": [],
               "engines": {}}
-    for r in range(rounds):
-        order = ("a", "b") if r % 2 == 0 else ("b", "a")
-        row = {"order": list(order)}
-        for key in order:
-            module, config = engines[key]
-            started = time.perf_counter()
-            engine, info = open_engine(module, model, config, speculative=True, context_tokens=context_tokens)
-            try:
-                speed = run_speed(engine, info, prepared, protocol, warmups, repetitions,
-                                  lambda message, k=key: log(f"round {r + 1} {k}: {message}"), continuations)
-            finally:
-                engine.close()
-            result["engines"].setdefault(key, {"name": info["name"], "configuration": info["configuration"]})
-            row[key] = {kpi: speed.get(kpi) for kpi in KPIS} | {"complete": speed["complete"],
-                                                                "decode_text": speed["decode_text"],
-                                                                "seconds": time.perf_counter() - started}
-        result["rounds"].append(row)
+    try:
+        for r in range(rounds):
+            order = ("a", "b") if r % 2 == 0 else ("b", "a")
+            row = {"order": list(order)}
+            for key in order:
+                module, config = engines[key]
+                started = time.perf_counter()
+                engine, info = open_engine(module, model, config, speculative=True, context_tokens=context_tokens)
+                loaded = time.perf_counter() - started
+                try:
+                    speed = run_speed(engine, info, prepared, protocol, warmups, repetitions,
+                                      lambda message, k=key: log(f"round {r + 1} {k}: {message}"), continuations)
+                finally:
+                    engine.close()
+                result["engines"].setdefault(key, {"name": info["name"], "configuration": info["configuration"]})
+                row[key] = {kpi: speed.get(kpi) for kpi in KPIS} | {"complete": speed["complete"],
+                                                                    "decode_text": speed["decode_text"],
+                                                                    "load_seconds": loaded,
+                                                                    "seconds": time.perf_counter() - started}
+            result["rounds"].append(row)
+    finally:
+        release(module for module, _ in engines.values())
     result["paired"] = paired(result["rounds"])
     result["ended_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     write_json(out, result)
     return result
+
+
+def release(modules):
+    """Each adapter's release() once (an adapter module that kept host-side weights between its engines frees them),
+    where it has one."""
+    for module in {id(module): module for module in modules}.values():
+        done = getattr(module, "release", None)
+        if callable(done):
+            done()
 
 
 def paired(rounds):
@@ -82,7 +108,8 @@ def render(result):
         for key in ("a", "b"):
             r = row[key]
             cells.append(f"{key.upper()}: decode {_fmt(r['decode_score'], '.1f')}, prefill {_fmt(r['prefill_score'], ',.0f')}, "
-                         f"ttft {_fmt(r['ttft_score_ms'], ',.0f')} ms")
+                         f"ttft {_fmt(r['ttft_score_ms'], ',.0f')} ms"
+                         + (f", loaded in {r['load_seconds']:.1f} s" if r.get("load_seconds") is not None else ""))
         lines.append(f"round {i} ({' '.join(k.upper() for k in row['order'])}): " + "; ".join(cells))
     for kpi, label in (("decode_score", "decode"), ("prefill_score", "prefill"), ("ttft_score_ms", "ttft (speed)")):
         p = result["paired"][kpi]

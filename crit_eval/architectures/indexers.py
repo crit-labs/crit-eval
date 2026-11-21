@@ -38,18 +38,36 @@ import math
 import sys
 import types
 
-# sha256 of the source of each forward a form replaces, as the transformers release the form was checked against
-# (tests/test_eval_indexers.py) has it.
+# sha256 of the source of each forward a form replaces, as each transformers release the form was checked against
+# (tests/test_eval_indexers.py) has it, and that release.
 CHECKED = {
-    "Qwen4ExpTextQSAIndexer": "cc3b0347832752a530a86a4b69e5147daea9b58d29f756e8f60a580bf519f093",   # transformers 5.20.2
-    "DeepseekV4IndexerScorer": "7e1489dad5000d0243a37d6d2bb97a4ee1017d13a63a01d7b941c947dcd4b092",  # transformers 5.20.2
+    "Qwen4ExpTextQSAIndexer": {
+        "cc3b0347832752a530a86a4b69e5147daea9b58d29f756e8f60a580bf519f093": "5.20.2",
+        "5b998d399ae7028c935532f744ce948f86648efef846a384aa5256af2c852a67": "5.23.0",
+    },
+    "DeepseekV4IndexerScorer": {
+        "7e1489dad5000d0243a37d6d2bb97a4ee1017d13a63a01d7b941c947dcd4b092": "5.20.2",   # 5.23.0 the same
+    },
 }
+# The indexer sources whose loop returns its selection as a boolean mask whatever the attention mask (from 5.23); the
+# earlier one gives an additive float mask for a float attention mask.
+BOOLEAN_SELECTION = {"5b998d399ae7028c935532f744ce948f86648efef846a384aa5256af2c852a67"}
 # Bytes of one block's FP32 scores in indexer_scorer_forward (three such tensors are alive at once).
 SCORER_BYTES = 1 << 30
 
 
 def source_hash(function):
     return hashlib.sha256(inspect.getsource(function).encode()).hexdigest()
+
+
+_BOOLEAN = {}
+
+
+def boolean_selection(cls):
+    """Whether `cls`'s own forward returns a boolean selection whatever the attention mask (BOOLEAN_SELECTION)."""
+    if cls not in _BOOLEAN:
+        _BOOLEAN[cls] = source_hash(cls.forward) in BOOLEAN_SELECTION
+    return _BOOLEAN[cls]
 
 
 def qsa_indexer_forward(self, hidden_states, position_embeddings, attention_mask, past_key_values):
@@ -112,7 +130,7 @@ def qsa_indexer_forward(self, hidden_states, position_embeddings, attention_mask
                 selected_block_indices = scores.topk(min(self.block_topk, n), dim=0).indices
                 selected[batch, query, block_token_indices.index_select(0, selected_block_indices).flatten()] = True
     selected_token_mask = selected.unsqueeze(1)
-    if attention_mask.is_floating_point():
+    if attention_mask.is_floating_point() and not boolean_selection(type(self)):
         min_dtype = torch.finfo(attention_mask.dtype).min
         selected_token_mask = torch.where(selected_token_mask, attention_mask.new_zeros(()), min_dtype)
     return selected_token_mask
@@ -149,7 +167,8 @@ def exact_forms(model):
     bound = set()
     for module in model.modules():
         name = type(module).__name__
-        if name in FORMS and source_hash(type(module).forward) == CHECKED[name]:
+        found = source_hash(type(module).forward) if name in FORMS else None
+        if found in CHECKED.get(name, ()):
             module.forward = types.MethodType(FORMS[name], module)
             bound.add(name)
     return sorted(bound)

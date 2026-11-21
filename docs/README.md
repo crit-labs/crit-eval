@@ -397,8 +397,8 @@ engine whose requests the journal holds is never loaded; one with requests left 
 journal's requests first. From the first request the journal does not hold, the round measures live; when the round
 takes another path than the journal's (a request with other inputs), the rest is live and the result says where
 (`journal.diverged`). A round that stopped on a disturbed device answers only up to the start of the part it stopped
-in, so the disturbed case is measured again. Host load (`host_other_cpu_cores`) is unmeasured over requests the
-journal answered.
+in, so the disturbed case is measured again. Host load (`host_other_cpu_cores`) and energy (`energy`) are unmeasured
+over requests the journal answered.
 
 The journal answers only a round of the same identity: protocol and crit-eval version, model and suite, adapter
 bytes or server, configuration, parts, warmups and repetitions, stages and budget, required context, quality and
@@ -422,7 +422,7 @@ stays under the protocol id of the coming release, and nothing in a change picks
 0.5.x releases (which all ran `crit-eval-v0.5.0`) ran under `crit-eval-v0.6.0`, the coming release's working id,
 which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the changes since ran under
 `crit-eval-v0.7.0`, which crit-eval 0.7.0 kept; the changes since ran under `crit-eval-v0.7.1`, which crit-eval
-0.7.1 and 0.7.2 kept. A change that can move a
+0.7.1, 0.7.2 and 0.7.3 kept. A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results
@@ -479,7 +479,9 @@ Measure again when the device is quiet; `--keep-disturbed` finishes the round an
 shorter than 100 ms are not judged, since timer jitter dominates them. Each speed case records
 `host_other_cpu_cores`, the CPU cores other processes kept busy while it ran (host busy time minus
 crit-eval's own process); the disturbed message and a failed `lower_context` gate name it, since engines
-that compute on the host slow down with other programs.
+that compute on the host slow down with other programs. Each speed case also records `energy`, the GPU's joules per
+prompt and per output token and its average and peak watts, and the result's `energy` how they were read and the
+device's idle draw before the suite ([speed](MEASUREMENTS.md#speed); reported, not judged).
 
 `crit eval status result.json` (also printed by `run`, stored as `status`) reports the gates,
 goals, each KPI against its limit, the gaps and missing inputs, with no verdict or ranking.
@@ -491,7 +493,8 @@ whole requests) mixes KPIs by the suite's case mix: a fact, not a weighting.
 
 Absolute scores drift a few percent over a day. Compare candidates with `crit eval ab`, which
 runs both engines (two adapters, or one with two configurations) in one session in alternating
-order (A B, then B A) and reports the paired ratio per round, its median and spread. Compare
+order (A B, then B A) and reports the paired ratio per round, its median and spread; an adapter's host-side
+weights stay loaded between the rounds ([adapter](ADAPTER.md)). Compare
 only results with the same data, device file and crit-eval revision. `compare` warns when
 model or suite identities differ but does not enforce matching hardware, and the
 model identity does not hash every weight byte, so keep the exact identity in the run records.
