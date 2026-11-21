@@ -5,8 +5,6 @@
   crit-eval
 </h1>
 
----
-
 ### Speed and quality measurement tool to compare inference engines honestly.
 
 <p align="center">
@@ -17,15 +15,13 @@
   <a href="https://github.com/crit-labs/crit-eval/blob/main/LICENSE"><img src="https://raw.githubusercontent.com/crit-labs/.github/main/brand/button-license.svg" alt="License" height="34" /></a>
 </p>
 
-[Summary](#summary) • [Quick start](#quick-start) • [What `crit-eval` solves](#what-crit-eval-solves) •
-[What `crit-eval` measures](#what-eval-measures) • [Commands](#commands) • 
-[Limitations](#limitations) • [Documentation](#documentation)
-
 </div>
 
 ---
 
-<a id="summary"></a>
+<br>
+<br>
+<br>
 
 ## Summary
 
@@ -38,8 +34,6 @@
 > [crit-hub](https://github.com/crit-labs/crit-hub) are measured with its hub profile.
 
 ---
-
-<a id="quick-start"></a>
 
 ## Quick start
 
@@ -67,8 +61,6 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 
 ---
 
-<a id="what-crit-eval-solves"></a>
-
 ## What `crit-eval` solves
 
 **There is no shared way to measure a bespoke inference engine.**
@@ -90,8 +82,6 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 
 ---
 
-<a id="what-eval-measures"></a>
-
 ## What `crit-eval` measures
 
 | KPI or record | In the result | What it records |
@@ -109,6 +99,7 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 | prefill by term | `crit-eval status --kernels` | With a kernel trace, each prefill term (matmul per weight format, attention, recurrence, other kernels, host) against its floor, a gap per term, and a speculative round split into verify pass and draft steps |
 | time to first token by part | `headroom.ttft` | Each case's time to first token split into the engine's own prefill and first token and the rest (server, tokenizer, HTTP) |
 | stalls | `status.kpis.stalls` | Each speed case's longest and p99 gap between streamed chunks after the first token, in ms and in decode rounds (reported, not judged) |
+| energy | `status.kpis.energy`, `energy`, each speed case's `energy` | Joules per prompt token and per output token, average and peak watts per speed case from NVML's energy counter (or power readings), and the device's idle draw before the suite; unmeasured without NVML (reported, not judged) |
 | tool calls | `status.kpis.tool_calls` | Tool calls in the agent cases' output up to the first end token, in the chat template's format: valid, invalid, and truncated by the output limit (reported, not judged) |
 | quality noise and attribution | `quality.sets.*.budget_spread`, `quality.attribution` | Each set's share of the drift budget with its spread over its positions; with `--attribute-drift`, each matrix group's share of the budget |
 | free device memory | `context.device_memory` | Device memory left free with the engine built for the required context, beside the capacity gate |
@@ -127,8 +118,6 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 
 ---
 
-<a id="commands"></a>
-
 ## Commands
 
 | Command | Does |
@@ -146,8 +135,6 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 
 ---
 
-<a id="limitations"></a>
-
 ## Limitations
 
 | Area | Current status |
@@ -162,8 +149,6 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 | Comparability | Results compare only under the same protocol series and profile, on prepared data of the same checkpoint. |
 
 ---
-
-<a id="documentation"></a>
 
 ## Documentation
 

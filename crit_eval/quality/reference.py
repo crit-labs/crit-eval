@@ -1026,7 +1026,7 @@ class StreamingReference:
             if calls is None or job.waiting:
                 before.apply(cache)
                 return False
-        prompt.own.append(_Own(prompt.state.cache))
+        prompt.own.append(_Own(prompt.state.cache, prompt.state.paged))
         for follower in prompt.followers:
             if follower.shared == job.chunk + 1:
                 self._fork(follower, prompt)
@@ -1058,7 +1058,7 @@ class StreamingReference:
         state.enter(index, self.device)
         with _watched(state.cache) as seen:
             out = layer(*args, **kwargs)
-        if not own.held_by(state.cache):
+        if not own.held_by(state.cache, index):
             raise _OrderUnsafe("a decoder layer changes the cache's own state")
         early = sorted(j for j in seen if j != index and prompt.done[j] != job.chunk + (j < index))
         if early:
@@ -1074,10 +1074,13 @@ class StreamingReference:
 
     def _fork(self, follower, leader):
         """Give `follower` its cache as the leader's after the chunks they share, the leader having just handed the
-        last of them to the layers: a fresh cache from the forward with the leader's own attributes copied, every
-        layer the leader has already left after those chunks in place (_fork_layer copies the others as it leaves
-        them). The follower's next chunk can then be captured once the layers its forward reads are copied."""
+        last of them to the layers: a fresh cache from the forward with the leader's own attributes and what its
+        forward keeps on the layers copied, every layer the leader has already left after those chunks in place
+        (_fork_layer copies the others as it leaves them). The follower's next chunk can then be captured once the
+        layers its forward reads are copied."""
         spec, tensors = _state(leader.state.cache, "cache.", skip=("layers",))
+        kept = [_state(layer, f"{index}.", skip=leader.state.paged.get(index, ()))
+                for index, layer in enumerate(leader.state.cache.layers)]
         state = follower.state
         self._implementation(self.chunked if follower.long else "eager")
         try:
@@ -1085,7 +1088,10 @@ class StreamingReference:
         except RESUME_ERRORS as exc:
             raise CacheUnsupported(f"the model's forward cannot resume its cache ({exc})") from exc
         _apply(state.cache, spec, lambda path: tensors[path].to(self.device))
-        follower.own = [None] * (follower.shared - 1) + [_Own(state.cache)]
+        state._grow(len(kept))
+        for layer, (layer_spec, held) in zip(state.cache.layers, kept):
+            _apply(layer, layer_spec, lambda path, held=held: held[path].to(self.device))
+        follower.own = [None] * (follower.shared - 1) + [_Own(state.cache, state.paged)]
         for index, done in enumerate(follower.done):
             if done == follower.shared:
                 self._place_forked(follower, index)
@@ -1175,10 +1181,10 @@ class StreamingReference:
         with torch.no_grad():
             self._load_outer()
             try:
-                prompts, jobs = [], []
+                prompts, jobs, paged = [], [], {}
                 sharing = _shared_chunks(chunks, long) if self.share_prefixes else [(None, 0)] * len(texts)
                 for t, (ids, (leader, shared)) in enumerate(zip(texts, sharing)):
-                    state = PromptState(scratch / f"text-{t:03d}", {}, list(ids), self.memory)
+                    state = PromptState(scratch / f"text-{t:03d}", {}, list(ids), self.memory, paged)
                     prompts.append(_Prompt(state, t in long, count, None if leader is None else prompts[leader], shared,
                                            chunk))
                     jobs += [_Job(prompts[-1], piece, c) for c, piece in enumerate(prompts[-1].chunks) if c >= shared]
@@ -1212,7 +1218,9 @@ class StreamingReference:
     def _text_rounds(self, texts, chunks, long, scratch, log, check):
         """score_texts' chunk-major order: round c runs every text's chunk c through all layers. Returns per text its
         chunks' last layer outputs."""
-        states = [PromptState(scratch / f"text-{t:03d}", {}, list(ids), self.memory) for t, ids in enumerate(texts)]
+        paged = {}
+        states = [PromptState(scratch / f"text-{t:03d}", {}, list(ids), self.memory, paged)
+                  for t, ids in enumerate(texts)]
         outputs = [[] for _ in texts]
         for c in range(max(map(len, chunks), default=0)):
             todo = [t for t in range(len(texts)) if c < len(chunks[t])]

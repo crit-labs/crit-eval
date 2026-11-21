@@ -64,6 +64,11 @@ class DeviceReferenceTests(unittest.TestCase):
             self.skipTest("no CUDA toolkit")
         if not shutil.which("nvidia-smi"):
             self.skipTest("no CUDA device")
+        from crit_eval.run.energy import Unavailable, engine_devices
+        try:
+            engine_devices()   # where CUDA_VISIBLE_DEVICES hides every GPU, the binary finds no device either
+        except Unavailable as hidden:
+            self.skipTest(str(hidden))
         with tempfile.TemporaryDirectory() as directory:
             binary = logprob.build(nvcc, directory, ROOT / "tests/eval/logprob_compare_tests.cu")
             done = subprocess.run([str(binary)], capture_output=True, text=True, timeout=120)

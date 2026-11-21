@@ -611,13 +611,14 @@ def _render_activations(a, stored):
 
 def _traced_first_token(room, case_id):
     """A kernel trace's fresh first token of a case (status --kernels): its time, the GPU's busy time in it and the
-    host's rest."""
+    host's rest, the time it only copied over the link apart where the trace recorded copies."""
     entry = (((room.get("prefill_terms") or {}).get("cases") or {}).get(case_id) or {})
     host = (entry.get("terms") or {}).get("host")
     if not host or entry.get("trace_ms") is None:
         return {}
-    return {"trace_first_token_ms": entry["trace_ms"], "trace_gpu_ms": entry["trace_ms"] - host["measured_ms"],
-            "trace_host_ms": host["measured_ms"]}
+    link = ((entry.get("terms") or {}).get("link") or {}).get("measured_ms") or 0.0
+    return {"trace_first_token_ms": entry["trace_ms"], "trace_gpu_ms": entry["trace_ms"] - host["measured_ms"] - link,
+            "trace_host_ms": host["measured_ms"], **({"trace_link_ms": link} if link else {})}
 
 
 def _render_attribution(attribution, worst):
@@ -650,7 +651,8 @@ def _render_ttft_parts(t):
                         + f" + outside the engine {row['outside_engine_ms']:,.1f} ms")
         if row.get("trace_first_token_ms") is not None:
             bits.append(f"traced fresh first token {row['trace_first_token_ms']:,.1f} ms = GPU {row['trace_gpu_ms']:,.1f} "
-                        f"+ host {row['trace_host_ms']:,.1f}")
+                        + (f"+ copies alone {row['trace_link_ms']:,.1f} " if row.get("trace_link_ms") else "")
+                        + f"+ host {row['trace_host_ms']:,.1f}")
         if bits:
             parts.append(f"{case_id} {_num(row.get('ttft_ms'), ',.0f')} ms: " + "; ".join(bits))
     return ["  ttft by part: " + "; ".join(parts)] if parts else []
@@ -763,6 +765,41 @@ def _render_stalls(s):
     if s["unmeasured"]:
         line += f"; unmeasured: {', '.join(s['unmeasured'])}"
     return [line + " (reported, not judged)"]
+
+
+def _energy_kpi(result):
+    """The GPU's energy over the speed suites (crit_eval.run.energy; reported, not judged): the round's idle draw and
+    how it was read, and each suite's joules per output and per prompt token. None for a result measured before it."""
+    meter = result.get("energy")
+    if not meter:
+        return None
+    if meter.get("status") != "measured":
+        return {"status": "unmeasured", "reason": meter.get("reason")}
+    suites = {name: (result.get(key) or {}).get("energy") for name, key in (("greedy", "speed"),
+                                                                            ("sampled", "sampled_speed"))}
+    return {"status": "measured", "source": meter.get("source"), "idle_watts": meter.get("idle_watts"),
+            **{name: row for name, row in suites.items() if row}}
+
+
+def _render_energy(e):
+    if e["status"] != "measured":
+        return [f"  energy   unmeasured: {e['reason']}"]
+    parts = []
+    for name in ("sampled", "greedy"):
+        row = e.get(name)
+        if not row:
+            continue
+        text = f"{name} {_num(row.get('joules_per_output_token'), '.3g')} J/output token"
+        if row.get("joules_per_prompt_token") is not None:
+            text += f", {row['joules_per_prompt_token'] * 1000:.3g} mJ/prompt token"
+        if row.get("peak_watts") is not None:
+            text += f", peak {row['peak_watts']:,.0f} W"
+        if row.get("unmeasured"):
+            text += f" (unmeasured: {', '.join(row['unmeasured'])})"
+        parts.append(text)
+    idle = e.get("idle_watts")
+    return ["  energy   " + ("; ".join(parts) or "no speed case measured")
+            + (f"; idle {idle:,.0f} W" if idle is not None else "") + " (reported, not judged)"]
 
 
 def _render_followup(f):
@@ -1096,7 +1133,8 @@ def build(result, protocol, baseline=None):
             # What Eval can check of the closed track (protocol tracks; reported, not judged).
             "track": (result.get("track") or {}).get("closed"),
             "perplexity": perplexity, "kl_divergence": kl_divergence, "stalls": _stalls_kpi(speed),
-            "tool_calls": _tool_calls_kpi(speed), "concurrency": _concurrency_kpi(result)}
+            "tool_calls": _tool_calls_kpi(speed), "concurrency": _concurrency_kpi(result),
+            "energy": _energy_kpi(result)}
     missing = list(room.get("missing", []))
     gaps = [dict(gap) for gap in room.get("gaps", [])]
     if followup_gap:   # a result measured before the run priced the follow-up turns: its gap, after every other
@@ -1524,6 +1562,8 @@ def render(status):
         lines += _render_stalls(k["stalls"])
     if k.get("tool_calls"):
         lines += _render_tool_calls(k["tool_calls"])
+    if k.get("energy"):
+        lines += _render_energy(k["energy"])
     c = k.get("context")
     if c and c.get("required"):
         line = (f"  context  {c['required']:,} tokens required ({c['source']}"

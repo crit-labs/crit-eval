@@ -42,9 +42,11 @@ def nvfp4_matrix(weight, global_scale):
     """compressed-tensors' NVFP4 tensors of an FP32 [out, in] weight: E2M1 codes (low nibble first), E4M3 scales per 16
     and the global scale, a divisor."""
     import torch
-    from crit_eval.limits.schemes import E2M1, _round_e2m1
+    from crit_eval.limits.schemes import E2M1, FP8_MAX, _round_e2m1
     blocks = weight.reshape(weight.shape[0], -1, 16)
-    stored = (blocks.abs().amax(-1) / 6 * global_scale).to(torch.float8_e4m3fn)
+    # Clamped to E4M3's largest value first, as crit_eval.limits.schemes stores a scale: a cast past it is NaN on a
+    # torch that does not saturate it (torch 2.9 does not), and three groups of this weight need more.
+    stored = (blocks.abs().amax(-1) / 6 * global_scale).clamp(max=FP8_MAX).to(torch.float8_e4m3fn)
     step = stored.float()[..., None] / global_scale
     values = _round_e2m1((blocks.abs() / torch.where(step > 0, step, 1)).clamp(max=6))
     codes = torch.tensor(E2M1).reshape(1, -1).eq(values.reshape(-1, 1)).float().argmax(-1).reshape(values.shape)

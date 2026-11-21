@@ -9,6 +9,96 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-11-21
+
+### Overview
+
+crit-eval 0.7.3 keeps protocol crit-eval-v0.7.1: no score moves. The speed cases record the GPU's energy per prompt
+and output token (reported, not judged), and the gate pre-check judges every quality text's drift by the run's
+budget. The quality modes, the row exactness levels, the default VRAM headroom and the max context's KV arithmetic
+come from crit Core, with a copy only for an older crit-core. `crit eval ab` keeps the model loaded between rounds
+where the adapter keeps it, a kernel trace records memory copies beside kernels, and a speed disturbance names what
+the engine's own memory did. A resumed round reads the rates the round it resumes measured, and the reference resumes
+transformers 5.23's qwen4_exp in chunks and keeps its exact block-indexer form there. crit 0.22.0 ships with
+crit-eval 0.7.3.
+
+### Added
+
+- Energy per token in the speed cases (reported, not judged; crit-labs/crit#59): while a round's speed suites run, a
+  side thread reads the engine's GPUs through NVML, the energy counter where the driver has it and the power draw
+  otherwise, and each greedy and sampled case records `energy`: joules per prompt token (its prefills) and per output
+  token (its decodes), average and peak watts. The result's `energy` names how it was read and the device's draw at
+  rest before the suite (`idle_watts`), each suite holds the geometric means, and `status` prints them. Two engines
+  at the same tok/s could draw very different power, and Eval did not measure it. Without NVML, with every GPU hidden
+  or on a driver that reports neither figure, `energy` is unmeasured and says why. No score or gate moves.
+
+- The gate pre-check judges drift (`precheck_quality`): every quality text the engine holds, scored and judged
+  against the reference's stored scores by the run's budget (`--quality-budget`, crit's run budget through `crit run
+  serve --check --data`), as the quality gate judges it, the honesty check left to the honesty items. A staged round
+  scores the long texts only from stage 2 on, so an engine whose approximations drift at depth failed quality most of
+  an hour into a round: a Qwen3.8-Flash-Next candidate that kept 6 of its 10 routed experts passed every pre-check
+  item and failed quality in its stage 2 Eval on the 32k-token text (mean KLD 0.59 against 0.4). Data without
+  reference scores leaves the item unverified; `--no-drift` leaves it out.
+
+### Changed
+
+- The default VRAM headroom and the arithmetic of the max context's device limit are crit Core's:
+  `VRAM_HEADROOM_GIB` is `crit_plugins.memory.HEADROOM` in GiB (0.25), and `limits.context.max_context` computes
+  the KV that fits with `crit_plugins.memory.kv_fit`, the arithmetic the engine is sized by; a crit-core from before
+  Core held them gives the same here. Every result is unchanged: the budget subtracts the same amounts in the same
+  order. The weight split, the tensor roles, the reserve and the protocol's KV precision stay Eval's.
+- The quality modes and the row exactness levels are crit Core's (`crit_plugins.exactness`): `quality.fixed`'s
+  `QUALITY_MODES` and `run.quality_checks`' `EXACTNESS_LEVELS` import them, and keep their own copy only for a
+  crit-core from before Core held them. No result changes.
+- `crit eval ab` keeps the model loaded between rounds where the adapter keeps it (crit-labs/crit#38): an adapter
+  both engines share is loaded once, so what it keeps in the process between its engines (Core's adapter: the
+  plugins' host-side stores, such as a large MoE's experts packed in host memory) serves both engines in every round,
+  and its optional `release()` frees it after the last round. Each round records each engine's load time
+  (`load_seconds`). The two engines had been loaded through two copies of the adapter, each building its own.
+- `crit eval kernels` records memory copies beside kernels (CUPTI's memcpy activity) and reports each case phase's
+  copies (count, bytes by direction, time, and the time a copy ran while no kernel did), and before a prefill's first
+  token the time the device only copied (`link_before_first_ms`). The first-token breakdown and the prefill terms
+  now show that time as the link's (`link`, "copies alone") instead of the host's. A kernel trace alone left every
+  copy in the gap between kernels: on a Qwen3.8-Flash-Next engine whose experts live in host memory a fresh 87-token
+  chat prompt read as 617 ms of host work beside 64 ms of kernels, though the placement's own floor (674 ms, bound by
+  the experts a prompt moves over the link) said where that time goes.
+- A speed case's disturbance message names what the engine's own memory did over the case, from its telemetry's
+  `memory` (crit's Core reports it): each giver's bytes given back and taken again (an expert cache's slots, kept
+  prompts) and its steps' segments refused, past the arena or past the headroom, or that it held still. On an
+  engine whose memory has givers, low free device memory reads low by design instead of "nearly full". A
+  Qwen3.8-Flash-Next build's aborted certified Eval blamed page-cache misses, host threads and WDDM paging, and
+  called 0.5 GB free nearly full, while the expert cache was giving back 2.4 GB on every prompt.
+
+### Fixed
+
+- The reference's exact form of Qwen4Exp's block indexer binds on transformers 5.23 too. 5.23 changed the indexer's
+  forward (its selection is a boolean mask whatever the attention mask), so its source no longer matched the one the
+  form was checked against and the reference fell back to transformers' per-query loop. `CHECKED` holds each
+  checked release's source (5.20.2 and 5.23.0), and the form returns the mask type its release's loop returns.
+
+- The reference resumes a model whose forward keeps state on a cache layer: whatever the forward keeps there
+  besides what the decoder layer's own run writes (transformers 5.23's qwen4_exp keeps its indexers' position
+  history on the first indexed layer, and every forward extends it) now stays resident with the cache's own
+  attributes. It is snapshotted per chunk, restored when a capture waits, and copied to a text that shares a prefix.
+  PromptState pages out only the attributes a layer's run writes. Before, it paged the whole layer, the forward
+  read a meta placeholder, and on transformers 5.23 every qwen4_exp reference scored each text whole instead of
+  in chunks, layer-major (the rows were right, the passes whole). Scores are unchanged.
+- A checkpoint's gathered rows of an FP8 tensor (`Checkpoint.rows_many`, by which the quality reference gathers a
+  matrix's stored rows and their scales) failed on a torch whose CPU indexes no FP8 tensor (torch 2.9: `"index_cpu"
+  not implemented for 'Float8_e4m3fn'`). The rows are gathered as their bytes and then read as the tensor's type, the same rows on any
+  torch.
+- A resumed round reads the rates the round it resumes measured, also after its engine loads partway through the
+  replay. The engine loads when Eval reads an attribute only the engine has (the honesty check's `as_served`), and
+  from then on the stages' rates read the engine's own request deadline, which had learned the journal's requests
+  up to the load and none it answered after. An interrupted staged round whose honesty replies gave its only
+  prefill observations went on to stage 3, its resumed round fitted no rate and stopped after stage 1, and the
+  journal measured live from there (tests/test_run_eval.py in crit failed now and then on a busy host). Each request
+  the journal answers after the load is now observed by the engine's deadline too.
+- The energy meter dates a reading by the calls of the figure it integrates (the energy counter, else the power) and
+  no other. A reading's time was the midpoint of every GPU's power and counter calls together, so a stall between
+  them (the host busy elsewhere) dated the counter by the power's calls: over the 2 s idle window a stall of about
+  5 ms read a constant 250 W as 248.8 W, and tests/test_eval_energy.py failed now and then on a busy host.
+
 ## [0.7.2] - 2026-11-18
 
 ### Overview
@@ -973,7 +1063,8 @@ so crit-eval 0.2.0 needs crit-core 0.12.
   clock drifted against it far enough under WSL to count a warmup's decode kernels as the next prefill's (short
   cases showed decode GEMVs instead of prompt GEMMs).
 
-[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/crit-labs/crit-eval/compare/v0.7.3...HEAD
+[0.7.3]: https://github.com/crit-labs/crit-eval/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/crit-labs/crit-eval/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/crit-labs/crit-eval/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/crit-labs/crit-eval/compare/v0.6.1...v0.7.0

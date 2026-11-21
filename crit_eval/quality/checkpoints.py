@@ -277,8 +277,9 @@ class Checkpoint(TensorCheckpoint):
             if not len(index):
                 found.append(torch.empty((0, *shape[1:]), dtype=getattr(torch, name)))
                 continue
-            picked = torch.from_numpy(out).view(getattr(torch, name))
-            found.append(picked[torch.from_numpy(inverse.reshape(-1))].reshape(len(index), *shape[1:]))
+            # Gathered as bytes, then read as the tensor's type: torch indexes no FP8 tensor on the CPU (index_cpu).
+            picked = torch.from_numpy(out)[torch.from_numpy(inverse.reshape(-1))]
+            found.append(picked.view(getattr(torch, name)).reshape(len(index), *shape[1:]))
         return found
 
     def header(self, key):

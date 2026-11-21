@@ -19,8 +19,12 @@ STORE = "reference"
 # selected an engine may trade for speed, never how that checkpoint is quantized or stored. Both judge against the
 # same scores, the checkpoint's stored weights decoded exactly with FP32 activations. speed: a
 # budget eight times preserve's (quality.mode_thresholds), near-tie output differences allowed (forks); preserve: a
-# budget that keeps the output close to the checkpoint's.
-QUALITY_MODES = ("preserve", "speed")
+# budget that keeps the output close to the checkpoint's. The modes are crit Core's (crit_plugins.exactness), which every
+# engine and run states; a crit-core from before Core held them gives the same two here.
+try:
+    from crit_plugins.exactness import QUALITY_MODES
+except ImportError:
+    QUALITY_MODES = ("preserve", "speed")
 # The mode a run judges in when it names none.
 DEFAULT_QUALITY_MODE = "speed"
 

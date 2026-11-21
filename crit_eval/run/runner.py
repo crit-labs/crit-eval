@@ -7,7 +7,7 @@ from pathlib import Path
 from .. import CONTRACT, EVAL_DIR, __version__, load_json, machine_settings, portable_path, write_json
 from ..quality import fixed
 from ..limits import headroom
-from . import host, journal
+from . import energy, host, journal
 from ..reports import status
 from ..limits.batched import batch_terms
 from ..limits.ceiling import best_rates, model_ceiling, model_config
@@ -402,6 +402,12 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     log(f"loaded {info['name']} in {result['load_ms'] / 1000:.1f} s")
 
     counters = Counters(engine)
+    # The GPUs' power over the speed suites, on a side thread (crit_eval.run.energy; reported, not judged).
+    meter = energy.Meter(gpus).start() if "speed" in parts else None
+    if meter is not None:
+        log(f"energy: unmeasured ({meter.reason})" if meter.reason else
+            f"energy: GPU {', '.join(map(str, meter.devices))} through NVML's "
+            + ("energy counter" if meter.source == "energy_counter" else "power readings"))
 
     def ceiling_inputs():
         """The batched ceiling's inputs (crit_eval.limits.batched): the model's step terms, bandwidth and rates, and
@@ -561,6 +567,9 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         # round resuming it never makes.
         result["engine_loads"]["last"] = engine_loads(engine)
     finally:
+        if meter is not None:
+            meter.stop()
+            result["energy"] = meter.record()
         engine.close()
     if counters.windows:
         # The engine's own expert cache counters over each speed suite (protocol headroom.tiers).

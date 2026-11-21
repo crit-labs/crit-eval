@@ -499,7 +499,7 @@ PROTOCOLS = {
     "crit-eval-v0.5.0": "14a342ae8f2b9f413c7c748f71c8831cab8bec36f607184bfd310f8b2d3472d3",  # releases 0.5.0 to 0.5.3
     "crit-eval-v0.6.0": "0ccc760244b448454b16b5eeafef260de88b7811f6a2ace55b53c3938695a812",  # release 0.6.0: modes preserve and speed
     "crit-eval-v0.7.0": "e13a0225f4998250a485d428b12b228a8dc9699faab3b9e084668b74fdbb0580",  # release 0.7.0: sampled suite in stage 1
-    "crit-eval-v0.7.1": "aa0c304e831dbf7368718b7e97b937bbf32567a132a1921ed7816b825d5ff56d",  # releases 0.7.1 and 0.7.2: honesty by exactness, staged steady state
+    "crit-eval-v0.7.1": "aa0c304e831dbf7368718b7e97b937bbf32567a132a1921ed7816b825d5ff56d",  # releases 0.7.1 to 0.7.3: honesty by exactness, staged steady state
 }
 
 
@@ -1261,6 +1261,15 @@ class PrefillTermTests(unittest.TestCase):
         self.assertAlmostEqual(whole["matmul"]["floor_ms"], 37.5)
         self.assertAlmostEqual(whole["matmul"]["floor_own_ms"], 75.0)
         self.assertAlmostEqual(whole["matmul"]["achieved_tflops"], 10000 * 2e9 / 0.9 / 1e12)
+        # A trace that recorded copies: the time the device only copied is the link's, not the host's.
+        copied = self.trace({"matmul:nvfp4": 300.0, "other": 80.0}, busy=380.0)
+        copied["cases"]["long"]["prefill"]["link_before_first_ms"] = 500.0
+        linked = headroom.prefill_terms(result, copied, rates, ["long"])["cases"]["long"]["terms"]
+        self.assertEqual(linked["link"], {"measured_ms": 500.0, "floor_ms": 0.0})
+        self.assertEqual(linked["host"], {"measured_ms": 120.0, "floor_ms": 0.0})
+        self.assertEqual(status._traced_first_token({"prefill_terms": {"cases": {"long": {
+            "trace_ms": 1000.0, "terms": linked}}}}, "long"),
+            {"trace_first_token_ms": 1000.0, "trace_gpu_ms": 380.0, "trace_host_ms": 120.0, "trace_link_ms": 500.0})
         # A trace without every prefill-scored case states no gap per term and names the ones it lacks.
         partial = headroom.prefill_terms(result, trace, rates, ["long", "longer"])
         self.assertEqual((partial["gaps"], partial["untraced"]), ([], ["longer"]))
@@ -2045,6 +2054,30 @@ class SampledSpeedTests(unittest.TestCase):
                 timing.check_disturbed("a", disturbed, 0.25, other_cores=1.2, key="round_ms")
             with self.assertRaisesRegex(timing.Disturbed, "the device was disturbed, or the engine varies on its own"):
                 timing.check_disturbed("a", disturbed, 0.25, other_cores=4.0, key="round_ms")
+        # Core's memory around the case: an expert cache that gave back and regrew is named, and a low free memory of
+        # an elastic engine reads low by design, not nearly full.
+        before = {"givers": {"expert-offload:1": {"rank": 1, "released": 1 * 10**9, "regrown": 1 * 10**9,
+                                                  "releases": 2}},
+                  "steps": {"refused": 0, "overflows": 0, "breaches": 0}}
+        after = {"givers": {"expert-offload:1": {"rank": 1, "released": 3.4 * 10**9, "regrown": 3.4 * 10**9,
+                                                 "releases": 5}},
+                 "steps": {"refused": 0, "overflows": 1, "breaches": 0}}
+        with patch.object(host, "device_memory", return_value={"free_bytes": 90 * 2**20, "total_bytes": 32 * 2**30}):
+            with self.assertRaises(timing.Disturbed) as caught:
+                timing.check_disturbed("a", disturbed, 0.25, key="round_ms", memory=(before, after))
+        said = str(caught.exception)
+        self.assertIn("expert-offload gave back 2.40 GB in 3 releases and took 2.40 GB again", said)
+        self.assertIn("1 step segments past the arena", said)
+        self.assertIn("low by design", said)
+        self.assertNotIn("nearly full", said)
+        self.assertIn("held still", timing.memory_changes(after, after))
+        self.assertEqual(timing.memory_changes(None, after), "")
+
+        class Memory:
+            def telemetry(self):
+                return {"memory": after}
+        self.assertEqual(timing.engine_memory(Memory()), after)
+        self.assertIsNone(timing.engine_memory(object()))
 
         class Served(Engine):
             """Behind a server: seed 3's reply ends early at a tool call, its few passes streamed slowly."""
@@ -2547,6 +2580,39 @@ class StatusTests(unittest.TestCase):
             self.assertEqual(len(result["paired"]["decode_score"]["ratios"]), 2)
             self.assertIn("B vs A decode", ab.render(result))
             self.assertTrue((data / "ab.json").is_file())
+
+    def test_paired_runs_keep_the_adapters_model_between_rounds_and_release_it_once(self):
+        # An adapter that keeps host-side weights in the process for its next engine of the model (as Core's does for
+        # a crit package): ab builds both engines again every round, the weights once, and frees them after the last.
+        with tempfile.TemporaryDirectory() as directory:
+            data = Path(directory)
+            fixture(data)
+            events = data / "events.txt"
+            adapter = data / "keeping" / "adapter.py"
+            adapter.parent.mkdir()
+            adapter.write_text(
+                "from crit_eval.examples.mock_adapter import create_eval_engine as mock\n"
+                f"EVENTS = {str(events)!r}\n"
+                "KEPT = []\n\n\n"
+                "def note(line):\n"
+                "    with open(EVENTS, 'a', encoding='utf-8') as out:\n"
+                "        out.write(line + chr(10))\n\n\n"
+                "def create_eval_engine(context):\n"
+                "    if not KEPT:\n"
+                "        KEPT.append('weights')\n"
+                "        note('built')\n"
+                "    note('opened')\n"
+                "    return mock(context)\n\n\n"
+                "def release():\n"
+                "    KEPT.clear()\n"
+                "    note('released')\n", encoding="utf-8")
+            config = {"max_context": 128}
+            result = ab.run_ab(adapter, config, adapter, {**config, "draft_tokens": 2}, "unused-model", data,
+                               data / "ab.json", rounds=2, warmups=0, repetitions=1, log=lambda message: None)
+            self.assertEqual(events.read_text(encoding="utf-8").split(),
+                             ["built", "opened", "opened", "opened", "opened", "released"])
+            self.assertTrue(all(row[key]["load_seconds"] >= 0 for row in result["rounds"] for key in ("a", "b")))
+            self.assertIn("loaded in", ab.render(result))
 
     def test_declared_native_libraries_are_hashed_into_the_result(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4077,6 +4143,48 @@ class ReferenceTests(unittest.TestCase):
                          [(None, 0), (0, 2), (0, 1), (None, 0)])
         self.assertEqual(prompt_state._shared_chunks([[[1], [2]], [[1], [2]]], {1}), [(None, 0), (None, 0)])
 
+    def test_state_the_forward_keeps_on_a_cache_layer_stays_with_the_caches_own(self):
+        # A forward that keeps a position history on a cache layer and reads its values before any layer runs (as
+        # transformers 5.23's qwen4_exp keeps its indexers' positions on the first indexed layer): the history is the
+        # forward's, so it is never paged out with the layer's own tensors, and every order (layer-major, sharing a
+        # prefix, chunk-major) scores the rows of the model without it, its chunks placed by the history.
+        import torch
+        from transformers import DynamicCache, Qwen3Model
+        from crit_eval.quality import prompt_state, reference
+        torch.manual_seed(5)
+        prefix = torch.randint(2, 128, (150,)).tolist()
+        texts = [prefix + torch.randint(2, 128, (30,)).tolist(), torch.randint(2, 128, (37,)).tolist(),
+                 prefix + torch.randint(2, 128, (25,)).tolist(), torch.randint(2, 128, (90,)).tolist()]
+        original = Qwen3Model.forward
+
+        def keeping(self, input_ids=None, past_key_values=None, position_ids=None, use_cache=None, **kwargs):
+            if past_key_values is None and use_cache:
+                past_key_values = DynamicCache(config=self.config)
+            if past_key_values is not None:
+                layer = past_key_values.layers[1]
+                seen = getattr(layer, "history", None)
+                start = 0 if seen is None else int(seen[-1]) + 1   # the history's values, not its length
+                position_ids = torch.arange(start, start + input_ids.shape[1], device=input_ids.device)[None]
+                layer.history = position_ids[0] if seen is None else torch.cat([seen, position_ids[0]])
+            return original(self, input_ids=input_ids, past_key_values=past_key_values, position_ids=position_ids,
+                            use_cache=use_cache, **kwargs)
+        name, model = next(self.tiny_models())
+        with tempfile.TemporaryDirectory() as folder, patch.object(reference, "PROMPT_CHUNK", 64):
+            model.float().eval().save_pretrained(folder)
+            plain, _, _ = self.score_texts(folder, texts, share_prefixes=False)
+            with patch.object(Qwen3Model, "forward", keeping):
+                runs = {"layer-major": self.score_texts(folder, texts, share_prefixes=False),
+                        "shared": self.score_texts(folder, texts),
+                        "chunk-major": self.score_texts(folder, texts, share_prefixes=False, _layer_major=unittest.mock.Mock(
+                            side_effect=prompt_state._OrderUnsafe("forced")))}
+        for order, (rows, logged, _) in runs.items():
+            self.assertFalse(any("each text runs whole" in line for line in logged), (order, logged))
+            for a, b in zip(rows, plain):
+                self.assertLess(float((a[0] - b[0]).abs().max()), 1e-5, order)
+                self.assertEqual(a[1].tolist(), b[1].tolist(), order)
+        self.assertTrue(any("text 3 shares its first 128 tokens with text 1" in line for line in runs["shared"][1]), runs["shared"][1])
+        self.assertFalse(any("chunk by chunk" in line for line in runs["layer-major"][1]), runs["layer-major"][1])
+
     def test_the_reference_stores_its_own_spread_on_the_long_texts(self):
         # protocol quality.spread: texts of at least from_tokens tokens are scored again under TF32 matmuls, and how
         # far that run lands from the stored scores is stored per set and path; on the CPU (no TF32) the runs agree.
@@ -4352,9 +4460,11 @@ class ReferenceTests(unittest.TestCase):
                 with patch.object(checkpoints, "GATHER_THREADS", threads):
                     found = checkpoint.rows_many(requests)
                 for (key, index), rows in zip(requests, found):
-                    expected = tables[key][index]
-                    self.assertEqual((rows.dtype, rows.shape), (expected.dtype, expected.shape), key)
-                    self.assertTrue(torch.equal(rows.view(torch.uint8), expected.view(torch.uint8)), key)
+                    # The stored rows as bytes: torch indexes no FP8 tensor on the CPU (index_cpu).
+                    expected = tables[key].view(torch.uint8)[index]
+                    self.assertEqual((rows.dtype, rows.shape), (tables[key].dtype, (len(index), *tables[key].shape[1:])),
+                                     key)
+                    self.assertTrue(torch.equal(rows.view(torch.uint8), expected), key)
             self.assertTrue(torch.equal(checkpoint.rows("c.weight", torch.tensor([7, 7, 3])), tables["c.weight"][[7, 7, 3]]))
 
     def test_staged_tensors_are_the_stored_tensors(self):

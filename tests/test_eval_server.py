@@ -573,7 +573,8 @@ class ChatServerTests(unittest.TestCase):
         self.server.stream_logprobs = self.server.real_usage = True
         items = self.precheck()
         self.assertEqual(sorted(items), ["precheck_device_memory", "precheck_history", "precheck_honesty",
-                                         "precheck_long_honesty"])   # a server is not opened again: no lower context
+                                         "precheck_long_honesty", "precheck_quality"])   # no reopen: no lower context
+        self.assertEqual(items.pop("precheck_quality")["state"], "unverified")   # the data holds no reference scores
         self.assertEqual({name: item["state"] for name, item in items.items()},
                          {name: "passed" for name in items})
         self.assertEqual(items["precheck_long_honesty"]["context"], 4096)
@@ -585,6 +586,27 @@ class ChatServerTests(unittest.TestCase):
         with patch.object(chat.ChatEngine, "generate", side_effect=RuntimeError("boom")):
             with self.assertRaisesRegex(RuntimeError, "boom"):
                 self.precheck()
+
+    def test_the_precheck_judges_every_quality_text_by_the_runs_drift_budget(self):
+        # A staged round scores the long sets only from stage 2 on: the pre-check judges them all in minutes.
+        self.server.stream_logprobs = self.server.real_usage = True
+        self.store()
+        item = self.precheck()["precheck_quality"]
+        self.assertEqual(item["state"], "passed", item)
+        self.assertEqual(item["budget_used"], 0.0)
+        self.assertIn("skipped long-5000", item["detail"])   # past the engine's 4,096 tokens
+        scored = [body for body in self.server.scored if body.get("prompt_rows", True)]
+        self.assertEqual(len(scored), 2)   # conversations and long-3000, every position
+        # Scores off the reference's fail it, and a run's own tighter budget fails what the mode's passes.
+        self.store(shift=0.5)
+        item = self.precheck()["precheck_quality"]
+        self.assertEqual(item["state"], "failed", item)
+        self.assertIn("kld", item["detail"].lower())
+        self.store(shift=0.01)
+        self.assertEqual(self.precheck()["precheck_quality"]["state"], "passed")
+        tight = self.precheck(quality_budget={"kld_mean_max": 1e-9, "kld_p99_max": 1e-9})["precheck_quality"]
+        self.assertEqual(tight["state"], "failed", tight)
+        self.assertNotIn("precheck_quality", self.precheck(drift=False))
 
     def test_quality_scores_the_fixed_texts_through_the_servers_score_call(self):
         self.store()

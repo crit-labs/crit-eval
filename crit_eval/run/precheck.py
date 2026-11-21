@@ -4,8 +4,9 @@
 A certified round takes most of an hour and judges a gate once it has measured everything before it. The pre-check
 asks only what those gates ask, each once: served and scored log-probabilities of the honesty texts and of one
 long reply at the curve's first point (honesty), the request history around them (request_history, its forks judged
-in quality mode speed), the device memory left after the load (resources), and, on an engine that can be opened again,
-the speed cases at a lower context against the required one (lower_context). Its verdicts are hints with the
+in quality mode speed), every quality text scored against the reference by the run's drift budget (quality: a
+staged round judges the long texts only from stage 2 on), the device memory left after the load (resources), and,
+on an engine that can be opened again, the speed cases at a lower context against the required one (lower_context). Its verdicts are hints with the
 protocol's own rules, never a gate. The lower-context comparison is the certified gate's (long_context.compare_lower)
 on fewer samples: each case warmed once and timed LOWER_SAMPLES times at both contexts (after the reopen too), its
 tolerance the protocol's or the case's own run-to-run spread when that is larger, its first token the engine's own
@@ -70,6 +71,44 @@ def long_reply_item(engine, info, prepared, protocol, settings, required, mode, 
     item = honesty_item("precheck_long_honesty", verdict)
     item["context"] = point
     return item, point
+
+
+def quality_item(engine, info, prepared, protocol, data, mode, budget, log):
+    """The quality gate's drift judgment: every quality text the engine holds scored and judged against the
+    reference's stored scores by the run's budget (run_quality, its honesty check left to the honesty items). A staged
+    round scores the long sets only from stage 2 on, so an engine whose approximations drift at depth (fewer routed
+    experts, a narrower KV) otherwise fails quality most of an hour into a round."""
+    from ..quality import fixed
+    from ..quality.reference import REFERENCE_VERSION
+    from .quality_checks import quality_thresholds, run_quality, stored_spread
+    if not callable(getattr(engine, "score", None)):
+        return _item("precheck_quality", "unverified", "the engine scores no text")
+    identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
+                **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
+    reference = fixed.load(data, identity)
+    if reference is None:
+        return _item("precheck_quality", "unverified", "the data holds no reference scores (crit eval reference)")
+    thresholds = quality_thresholds(protocol, budget, mode=mode)
+    found = run_quality(engine, info, prepared, protocol, lambda line: log("precheck " + line), reference, thresholds,
+                        stored_spread(data, prepared, protocol, identity), mode=mode, honesty=False)
+    if found.get("status") != "scored":
+        return _item("precheck_quality", "unverified", found.get("reason") or "no quality text was scored")
+    sets = found["sets"]
+    used = {name: s["budget_used"] for name, s in sets.items() if s.get("budget_used") is not None}
+    worst = max(used, key=used.get) if used else None
+    facts = {"budget_used": used.get(worst), "worst_set": worst} if worst else {}
+    failed = [f"{name}: " + "; ".join(s["failures"]) for name, s in sets.items() if not s["passed"]]
+    skipped = [f"{name} ({why})" for name, why in (found.get("skipped") or {}).items()]
+    if failed:
+        return _item("precheck_quality", "failed", ("; ".join(failed) + (f" (stopped: {found['stopped_early']})"
+                                                                        if found.get("stopped_early") else ""))[:2000],
+                     **facts)
+    detail = f"{len(sets)} set paths within the drift budget"
+    if worst:
+        detail += f", the worst {worst} using {used[worst]:.0%} of it"
+    if skipped:
+        detail += "; skipped " + ", ".join(skipped)
+    return _item("precheck_quality", "passed", detail, **facts)
 
 
 def history_item(engine, prepared, protocol, cases, fresh, served, mode):
@@ -149,12 +188,14 @@ def memory_item(memory, headroom_bytes):
 
 
 def run_precheck(adapter, model, data, context_tokens, quality_mode=DEFAULT_QUALITY_MODE, config=None, url=None,
-                 served_model=None, chat_template=None, lower=True, vram_headroom_bytes=None, log=print):
+                 served_model=None, chat_template=None, lower=True, vram_headroom_bytes=None, quality_budget=None,
+                 drift=True, log=print):
     """The pre-check's items. adapter: an eval-v1 adapter file or an object that opens engines as an adapter module
     does (create_eval_engine); url instead: the engine behind that server, which cannot be opened again (no
     lower-context item). context_tokens: the context the engine is built for. quality_mode: the run's (protocol
-    quality.modes; speed unless the run names preserve). lower: also open the engine at the lower context (it
-    closes the first engine first)."""
+    quality.modes; speed unless the run names preserve). quality_budget: the run's drift limits over the mode's
+    (partial is fine). drift: also score the quality texts against the reference (quality_item). lower: also open the
+    engine at the lower context (it closes the first engine first)."""
     if quality_mode not in QUALITY_MODES:
         raise SystemExit(f"quality mode must be one of {', '.join(QUALITY_MODES)}")
     protocol = load_json(EVAL_DIR / "protocol.json")
@@ -176,7 +217,11 @@ def run_precheck(adapter, model, data, context_tokens, quality_mode=DEFAULT_QUAL
         items.append(long_item)
         served = ["the honesty replies"] + ([f"a {point:,}-token prompt"] if point else [])
         items.append(history_item(engine, prepared, protocol, cases, fresh, served, quality_mode))
+        # The speed samples before the quality scores: the lower context is compared with the required one as the
+        # engine first served it, not with what a long score leaves behind.
         at_required = speed_samples(engine, cases) if lower and not url else None
+        if drift:
+            items.append(quality_item(engine, info, prepared, protocol, Path(data), quality_mode, quality_budget, log))
     finally:
         engine.close()
     if at_required is not None:

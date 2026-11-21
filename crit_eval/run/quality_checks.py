@@ -93,7 +93,7 @@ def set_limits(thresholds, spread, factor):
     return limits, raised
 
 
-def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode):
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode, honesty=True):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.run.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.quality.fixed.load, None when the data has none). Each set is judged on
@@ -104,7 +104,7 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     are scored in the prepared order and judged as each completes; a set far over the budget (clearly_failed) stops
     the scoring, and the result says so (stopped_early). spread: the reference's own spread per set and path
     (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). mode: the quality mode,
-    for the honesty check's bound."""
+    for the honesty check's bound. honesty False: the sets alone, no honesty check (the gate pre-check runs its own)."""
     rule = protocol["quality"]
     # A served engine scores through the paths it serves with; an in-process adapter's score() is development evidence:
     # reported, never a gate result (protocol quality.development).
@@ -195,7 +195,8 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if not parts:
         return {**out, "status": "skipped", "skipped": skipped,
                 "reason": f"no quality text fits the engine's {info['max_context']:,}-token context"}
-    honesty = run_honesty(engine, info, prepared, protocol, log, skipped, mode=mode)
+    honesty = (run_honesty(engine, info, prepared, protocol, log, skipped, mode=mode) if honesty else
+               {"passed": None, "reason": "not checked with the sets"})
     passed = all(s["passed"] for s in sets.values()) and honesty["passed"] is not False
     timing = {"scores": _phase_timing(timings), "metrics_seconds": judged, "texts": timings,
               **({"honesty": honesty.pop("timing")} if "timing" in honesty else {})}
@@ -257,7 +258,12 @@ def clearly_failed(set_name, sets, thresholds, rule):
     return None
 
 
-EXACTNESS_LEVELS = ("repeatable", "row-exact", "exact", "declared")   # an engine's row exactness, from the least exact
+# An engine's row exactness, from the least exact, and its phases: crit Core's levels (crit_plugins.exactness); a
+# crit-core from before Core held them gives the same levels here.
+try:
+    from crit_plugins.exactness import LEVELS as EXACTNESS_LEVELS, PHASES
+except ImportError:
+    EXACTNESS_LEVELS, PHASES = ("repeatable", "row-exact", "exact", "declared"), ("decode", "prompt")
 
 
 def asked_exactness(info):
@@ -266,7 +272,7 @@ def asked_exactness(info):
     exactness: what a row's bits may depend on, of EXACTNESS_LEVELS)."""
     stated = (info or {}).get("exactness")
     asked = stated.get("asked") if isinstance(stated, dict) else None
-    if (not isinstance(asked, dict) or set(asked) != {"decode", "prompt"}
+    if (not isinstance(asked, dict) or set(asked) != set(PHASES)
             or any(level not in EXACTNESS_LEVELS for level in asked.values())):
         return None
     return dict(asked)

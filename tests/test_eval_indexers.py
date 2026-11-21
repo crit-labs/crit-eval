@@ -134,8 +134,8 @@ class QsaIndexerTests(unittest.TestCase):
         self.same(hidden, rope, padded, cache)
 
     def test_the_form_binds_only_to_the_source_it_was_checked_against(self):
-        self.assertEqual(indexers.source_hash(qwen4.Qwen4ExpTextQSAIndexer.forward),
-                         indexers.CHECKED["Qwen4ExpTextQSAIndexer"],
+        self.assertIn(indexers.source_hash(qwen4.Qwen4ExpTextQSAIndexer.forward),
+                      indexers.CHECKED["Qwen4ExpTextQSAIndexer"],
                          "transformers changed the indexer: check the form against it again and update CHECKED")
         holder = torch.nn.ModuleList([self.module])
         self.assertEqual(indexers.exact_forms(holder), ["Qwen4ExpTextQSAIndexer"])
@@ -225,8 +225,8 @@ class IndexerScorerTests(unittest.TestCase):
         torch.cuda.empty_cache()
 
     def test_the_form_binds_only_to_the_source_it_was_checked_against(self):
-        self.assertEqual(indexers.source_hash(deepseek4.DeepseekV4IndexerScorer.forward),
-                         indexers.CHECKED["DeepseekV4IndexerScorer"],
+        self.assertIn(indexers.source_hash(deepseek4.DeepseekV4IndexerScorer.forward),
+                      indexers.CHECKED["DeepseekV4IndexerScorer"],
                          "transformers changed the scorer: check the form against it again and update CHECKED")
         module = self.scorer(4, 16, 64, "cpu")
         self.assertEqual(indexers.exact_forms(torch.nn.ModuleList([module])), ["DeepseekV4IndexerScorer"])

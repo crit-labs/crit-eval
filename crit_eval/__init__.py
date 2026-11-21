@@ -18,7 +18,7 @@ if _registry is not None:
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.7.2"
+__version__ = "0.7.3"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.
@@ -49,8 +49,14 @@ def protocol_series(identifier):
 DEFAULT_CONTEXT_TOKENS = 200_000
 # The device memory an engine leaves free at its peak, unless settings.toml's vram_headroom_gib says otherwise: what
 # keeps a desktop's own use of the device from pushing the engine's memory into host memory. It is the user's
-# knob: every GiB of it is a GiB the engine's weights, KV cache or expert cache do not get.
-VRAM_HEADROOM_GIB = 0.25
+# knob: every GiB of it is a GiB the engine's weights, KV cache or expert cache do not get. The default is crit Core's
+# (crit_plugins.memory.HEADROOM, which its loader leaves free); a crit-core from before it held the one default gives
+# the same 0.25 GiB here.
+try:
+    from crit_plugins.memory import HEADROOM as _HEADROOM
+    VRAM_HEADROOM_GIB = _HEADROOM / (1 << 30)
+except ImportError:
+    VRAM_HEADROOM_GIB = 0.25
 # The crit project whose settings.toml holds the machine's settings, when crit names it: crit run and crit eval set it to
 # the project they use (crit run's --project; crit's checkout, or for a crit installed without one the folder it runs
 # in), so an installed crit's Eval reads the same settings as its runs.

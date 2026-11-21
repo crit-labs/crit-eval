@@ -2,6 +2,7 @@
 recorded times when a round resumes, engines loaded only for the requests left (fake engine, no GPU)."""
 from pathlib import Path
 import json
+import random
 import sys
 import tempfile
 import time
@@ -80,6 +81,42 @@ def _cut(path, to):
 
 
 REQUESTS = [([1, 2, 3], 4), ([7], 6), ([10, 11], 3), ([20], 5)]
+
+
+class Served(Engine):
+    """A served engine: its request deadline (crit_eval.run.deadline) observes what it serves, timed its own way,
+    never quite as the token arrivals are."""
+    as_served = None   # an attribute only the engine has
+
+    def __init__(self):
+        from crit_eval import EVAL_DIR, load_json
+        from crit_eval.run.deadline import RequestDeadline
+        super().__init__()
+        self.deadline = RequestDeadline(load_json(EVAL_DIR / "protocol.json")["requests"]["timeout"])
+
+    def info(self):
+        return {**super().info(), "served": True}
+
+    def generate(self, prompt, n, on_tokens):
+        out = super().generate(prompt, n, on_tokens)
+        self.deadline.observe(len(prompt), random.uniform(0.01, 0.02), n, random.uniform(0.01, 0.02))
+        return out
+
+
+def served(context):
+    engine = Served()
+    return engine, engine.info()
+
+
+def measure_served(path, resume=None, touch=None):
+    """REQUESTS on a served engine, reading its as_served before request `touch`: the engine and its deadline."""
+    with journal.Journal(path, IDENTITY, resume=resume, log=lambda m: None) as written:
+        engine, _ = written.open(served, {})
+        for i, (prompt, n) in enumerate(REQUESTS):
+            if i == touch:
+                assert engine.as_served is None
+            engine.generate(prompt, n, lambda tokens: None)
+        return engine, vars(engine.deadline)
 
 
 class JournalTests(unittest.TestCase):
@@ -210,39 +247,23 @@ class JournalTests(unittest.TestCase):
         self.assertEqual(written.counts["replayed_calls"], 5)
 
     def test_a_served_engine_the_journal_answers_keeps_the_deadline_it_observed(self):
-        import random
-        from crit_eval import EVAL_DIR, load_json
-        from crit_eval.run.deadline import RequestDeadline
-        rule = load_json(EVAL_DIR / "protocol.json")["requests"]["timeout"]
-
-        class Served(Engine):
-            def __init__(self):
-                super().__init__()
-                self.deadline = RequestDeadline(rule)
-
-            def info(self):
-                return {**super().info(), "served": True}
-
-            def generate(self, prompt, n, on_tokens):
-                out = super().generate(prompt, n, on_tokens)
-                # The engine times a request its own way, never quite as the token arrivals do.
-                self.deadline.observe(len(prompt), random.uniform(0.01, 0.02), n, random.uniform(0.01, 0.02))
-                return out
-
-        def served(context):
-            engine = Served()
-            return engine, engine.info()
-
-        def measure(path, resume=None):
-            with journal.Journal(path, IDENTITY, resume=resume, log=lambda m: None) as written:
-                engine, _ = written.open(served, {})
-                for prompt, n in REQUESTS:
-                    engine.generate(prompt, n, lambda tokens: None)
-                return engine, vars(engine.deadline)
         with tempfile.TemporaryDirectory() as folder:
-            first, observed = measure(Path(folder) / "a.journal.jsonl")
-            again, replayed = measure(Path(folder) / "b.journal.jsonl", resume=Path(folder) / "a.journal.jsonl")
+            first, observed = measure_served(Path(folder) / "a.journal.jsonl")
+            again, replayed = measure_served(Path(folder) / "b.journal.jsonl", resume=Path(folder) / "a.journal.jsonl")
         self.assertIsNone(again.real)
+        self.assertEqual(replayed, observed)
+
+    def test_an_engine_loaded_partway_through_the_replay_keeps_the_deadline_the_round_observed(self):
+        # Eval reads an attribute only the engine has after the first request (as the honesty check reads
+        # as_served), so the replayed engine loads there; the requests the journal answers after it are the
+        # round's too. Its deadline missed them: a resumed round's stages fitted no prefill rate where the round it
+        # resumed had one, stopped after stage 1 where that one went on to stage 3, and left the journal there.
+        with tempfile.TemporaryDirectory() as folder:
+            first, observed = measure_served(Path(folder) / "a.journal.jsonl", touch=1)
+            again, replayed = measure_served(Path(folder) / "b.journal.jsonl", resume=Path(folder) / "a.journal.jsonl",
+                                             touch=1)
+        self.assertIsNotNone(again.real)            # loaded for the attribute, after the first request
+        self.assertEqual(again.real.calls, 0)       # every request answered from the journal
         self.assertEqual(replayed, observed)
 
     def test_a_round_interrupted_in_its_curve_resumes_with_the_speed_it_measured(self):
@@ -278,11 +299,16 @@ class JournalTests(unittest.TestCase):
         self.assertGreater(resumed["journal"]["replayed_calls"], 0)
         # The speed cases are the interrupted round's measurements, read back to the bit: the round's clock gives
         # back the readings it took.
-        # Host load is unmeasured over requests the journal answered.
+        # Host load and the GPUs' energy are unmeasured over requests the journal answered (where the host has a GPU
+        # the interrupted round measured its energy).
+        unmeasured = ("host_other_cpu_cores", "energy")
+
         def measured(cases):
-            return {k: {key: v for key, v in case.items() if key != "host_other_cpu_cores"} for k, case in cases.items()}
+            return {k: {key: v for key, v in case.items() if key not in unmeasured} for k, case in cases.items()}
         self.assertEqual(measured(resumed["speed"]["cases"]), measured(first["speed"]["cases"]))
         self.assertEqual({c["host_other_cpu_cores"] for c in resumed["speed"]["cases"].values()}, {None})
+        self.assertEqual({(c.get("energy") or {"status": "unmeasured"})["status"]
+                          for c in resumed["speed"]["cases"].values()}, {"unmeasured"})
         self.assertTrue(resumed["context"]["points"])
         self.assertEqual(resumed["stages"]["reached"], first["stages"]["reached"])
 

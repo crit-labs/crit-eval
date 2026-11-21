@@ -182,12 +182,14 @@ def _child(spec):
 
 # --- analysis -------------------------------------------------------------------------------------------------
 
-def read_traces(directory, clock="realtime"):
+def read_traces(directory, clock="realtime", copies=False):
     """Kernels from every traced process: (start_ns, end_ns, blocks, threads, name), on the host realtime clock, or as
-    recorded with clock "cupti" or "rocprofiler" (phase marks taken on the tracer's clock, tracer_clock)."""
-    kernels, device = [], {"sms": None, "name": None}
+    recorded with clock "cupti" or "rocprofiler" (phase marks taken on the tracer's clock, tracer_clock). copies:
+    also the memory copies the CUDA tracer records, (start_ns, end_ns, bytes, kind) on the same clock, as a third
+    item (kind CUpti_ActivityMemcpyKind's: COPY_KINDS)."""
+    kernels, moved, device = [], [], {"sms": None, "name": None}
     for path in sorted(Path(directory).glob("trace-*.txt")):
-        clocks, rows = [], []
+        clocks, rows, copied = [], [], []
         for line in path.read_text(errors="replace").splitlines():
             if line.startswith("#clock "):
                 cupti, real = map(int, line.split()[1:3])
@@ -196,15 +198,67 @@ def read_traces(directory, clock="realtime"):
                 parts = line.split(" ", 2)
                 if int(parts[1]) > 0:
                     device = {"sms": int(parts[1]), "name": parts[2] if len(parts) > 2 else None}
+            elif line.startswith("#copy "):
+                parts = line.split()
+                if len(parts) == 5:
+                    copied.append(tuple(int(p) for p in parts[1:]))
             elif line and not line.startswith("#"):
                 parts = line.split(" ", 4)
                 if len(parts) == 5:
                     rows.append((int(parts[0]), int(parts[1]), int(parts[2]), int(parts[3]), parts[4]))
-        if rows and (clocks or clock != "realtime"):
+        if (rows or copied) and (clocks or clock != "realtime"):
             offset = 0 if clock != "realtime" else round(statistics.mean(clocks))
             kernels += [(s + offset, e + offset, b, t, n) for s, e, b, t, n in rows]
+            moved += [(s + offset, e + offset, n, kind) for s, e, n, kind in copied]
     kernels.sort()
-    return kernels, device
+    moved.sort()
+    return (kernels, device, moved) if copies else (kernels, device)
+
+
+# CUpti_ActivityMemcpyKind: the copies a trace names by direction.
+COPY_KINDS = {1: "host_to_device", 2: "device_to_host", 3: "host_to_array", 4: "array_to_host", 5: "array_to_array",
+              6: "array_to_device", 7: "device_to_array", 8: "device_to_device", 9: "host_to_host", 10: "peer"}
+
+
+def _union(spans):
+    """[(start, end)] merged where they overlap, in start order."""
+    out = []
+    for start, end in sorted(spans):
+        if out and start <= out[-1][1]:
+            out[-1] = (out[-1][0], max(out[-1][1], end))
+        else:
+            out.append((start, end))
+    return out
+
+
+def _uncovered(spans, cover):
+    """ns of `spans` (merged) that no span of `cover` overlaps: a copy's time while no kernel ran."""
+    total, cover = 0, _union(cover)
+    for start, end in _union(spans):
+        left = end - start
+        for c0, c1 in cover:
+            if c1 <= start or c0 >= end:
+                continue
+            left -= min(end, c1) - max(start, c0)
+        total += max(0, left)
+    return total
+
+
+def copy_terms(copies, kernels, lo, hi):
+    """The copies that start inside [lo, hi): their count, bytes by direction, the time any copy ran and the time a
+    copy ran while no kernel did (the device waiting on the link, which the time between kernels otherwise files as
+    host work)."""
+    inside = [c for c in copies if lo <= c[0] < hi]
+    if not inside:
+        return {}
+    by = {}
+    for _, _, n, kind in inside:
+        name = COPY_KINDS.get(kind, f"kind_{kind}")
+        by[name] = by.get(name, 0) + n
+    spans = [(s, min(e, hi)) for s, e, _, _ in inside]
+    busy = sum(e - s for s, e in _union(spans))
+    alone = _uncovered(spans, [(k[0], k[1]) for k in kernels if k[0] < hi and k[1] > lo])
+    return {"count": len(inside), "bytes": by, "ms": busy / 1e6, "alone_ms": alone / 1e6}
 
 
 def _mangled(name):
@@ -297,7 +351,10 @@ def exclusive(inside):
     return out
 
 
-def analyze(kernels, device, marks, device_ceilings=None):
+def analyze(kernels, device, marks, device_ceilings=None, copies=()):
+    """The traced kernels by phase and case. copies: the trace's memory copies (read_traces copies=True): each case
+    phase's copies (copy_terms), and before a prefill's first token the time the device only copied
+    (link_before_first_ms), which is not the host's."""
     names = demangle(k[4] for k in kernels)
     rules = (marks.get("info") or {}).get("kernel_work")
     peaks = best_rates(device_ceilings)[0]   # each format's best probed rate, GEMM or raw tensor cores
@@ -332,12 +389,19 @@ def analyze(kernels, device, marks, device_ceilings=None):
                                         # The largest kernels neither a rule nor a name classes: candidates for rules.
                                         "unclassed": [{"kernel": short_name(n), "ms": t} for n, t in
                                                       sorted(unclassed.items(), key=lambda x: -x[1])[:UNCLASSED]]}
+            moved = copy_terms(copies, kernels, lo, hi)
+            if moved:
+                cases[case["id"]][phase]["copies"] = moved
             if phase == "prefill" and "prefill_first" in case:
-                # The fresh request's time to its first token, and the GPU's busy time inside it: the rest is the
-                # engine's host work, launches and synchronization (crit_eval.reports.status: the TTFT breakdown).
+                # The fresh request's time to its first token, the GPU's busy time inside it and the time it only
+                # copied (weights over the link): the rest is the engine's host work, launches and synchronization
+                # (crit_eval.reports.status: the TTFT breakdown).
                 first_ms = (case["prefill_first"] - lo) / 1e6
-                gpu = sum(ns for k, ns in inside if k[0] < case["prefill_first"]) / 1e6
-                cases[case["id"]][phase].update(first_token_ms=first_ms, gpu_before_first_ms=min(gpu, first_ms))
+                gpu = min(sum(ns for k, ns in inside if k[0] < case["prefill_first"]) / 1e6, first_ms)
+                cases[case["id"]][phase].update(first_token_ms=first_ms, gpu_before_first_ms=gpu)
+                if copies:
+                    link = (copy_terms(copies, kernels, lo, case["prefill_first"]) or {}).get("alone_ms", 0.0)
+                    cases[case["id"]][phase]["link_before_first_ms"] = min(link, first_ms - gpu)
             agg = phases[phase]
             agg["wall_ms"] += wall
             agg["kernel_ms"] += busy
@@ -426,6 +490,8 @@ def render(result, top=TOP):
                          + (f" ({named:.1f} ms classed by name)" if named else "")
                          + (f"; first token {entry['first_token_ms']:.1f} ms, GPU busy {entry['gpu_before_first_ms']:.1f} ms"
                             " of it" if entry.get("first_token_ms") is not None else "")
+                         + (f", copying alone {entry['link_before_first_ms']:.1f} ms"
+                            if entry.get("link_before_first_ms") else "")
                          + unclassed_note(entry.get("unclassed")))
     lines.append("by case, top kernels per phase:")
     for case, phases in result["cases"].items():
@@ -461,12 +527,12 @@ def trace(adapter, model, data, out, config=None, cases=None, nvcc=None, device=
         marks = load_json(Path(directory) / "marks.json")
         if work:
             marks["info"]["kernel_work"] = list(work) + list(marks["info"].get("kernel_work") or [])
-        kernels, device_info = read_traces(directory, marks.get("clock", "realtime"))
+        kernels, device_info, copies = read_traces(directory, marks.get("clock", "realtime"), copies=True)
     if not kernels:
         raise SystemExit(f"no kernels were recorded: the engine may not run on {backend}, or the tracer could not attach")
     result = {"contract": CONTRACT, "kind": "kernels", "engine": marks["info"], "toolkit": portable_path(compiler),
               **({"backend": backend} if backend != "cuda" else {}),
-              **analyze(kernels, device_info, marks, device)}
+              **analyze(kernels, device_info, marks, device, copies)}
     write_json(out, result)
     return result
 

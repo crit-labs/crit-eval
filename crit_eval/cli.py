@@ -164,7 +164,8 @@ def main(argv=None):
 
     precheck = subs.add_parser("precheck", help="In minutes, the gates a candidate most often fails a whole round on: "
                                                 "honesty of short replies and of one long reply, the request history "
-                                                "around them, device memory and (with an adapter) the lower context")
+                                                "around them, drift of every quality text from the reference, device "
+                                                "memory and (with an adapter) the lower context")
     engine = precheck.add_mutually_exclusive_group(required=True)
     engine.add_argument("--package", help="A crit engine package, opened through Core's loader")
     engine.add_argument("--adapter", help="Python file exporting create_eval_engine(context)")
@@ -179,6 +180,10 @@ def main(argv=None):
     precheck.add_argument("--quality-mode", choices=QUALITY_MODES, default=DEFAULT_QUALITY_MODE,
                           help=f"The run's quality mode (default {DEFAULT_QUALITY_MODE}): "
                                "speed bounds honesty as Eval does and lets history part at near-ties; preserve does neither")
+    precheck.add_argument("--quality-budget", metavar="JSON",
+                          help="The run's drift limits over the mode's, as crit eval run takes them")
+    precheck.add_argument("--no-drift", action="store_true",
+                          help="Skip scoring the quality texts against the reference (the quality item)")
     precheck.add_argument("--no-lower", action="store_true", help="Skip the lower-context reopen")
     precheck.add_argument("--vram-headroom-gib", type=float, default=None,
                           help="Device memory to find free after the load (default: settings.toml vram_headroom_gib, "
@@ -481,7 +486,9 @@ def _command(args):
                              config=adapter_config(args.adapter, args.config, "--config") if args.adapter else {},
                              url=args.url, served_model=args.served_model,
                              chat_template=read_template(args.chat_template), lower=not args.no_lower,
-                             vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)))
+                             vram_headroom_bytes=round(headroom_gib(args) * (1 << 30)),
+                             quality_budget=(json_option(args.quality_budget, "--quality-budget")
+                                             if args.quality_budget else None), drift=not args.no_drift)
         if args.out:
             Path(args.out).write_text(json.dumps({"items": items}, indent=1), encoding="utf-8")
         failed = [item["name"] for item in items if item["state"] == "failed"]

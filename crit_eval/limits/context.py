@@ -35,6 +35,22 @@ GIB = 1 << 30
 DRAFT_HEAD = re.compile(r"(^|\.)head\.weight$")   # a draft layer's own output head (shared_head.head)
 
 
+def _kv_fit(free_bytes, kv_bytes_per_token, *, headroom, reserve, held, granularity):
+    """The KV cache that fits the device: crit Core's arithmetic (crit_plugins.memory.kv_fit), which the engine it
+    loads is sized by too; a crit-core from before Core held it computes the same here."""
+    try:
+        from crit_plugins.memory import kv_fit
+    except ImportError:
+        budget = free_bytes - headroom - reserve
+        for amount in held:
+            budget -= amount
+        if not kv_bytes_per_token:
+            return {"budget": budget, "tokens": None}
+        return {"budget": budget, "tokens": 0 if budget <= 0 else budget // kv_bytes_per_token // granularity * granularity}
+    return kv_fit(free_bytes, kv_bytes_per_token, headroom=headroom, reserve=reserve, held=held,
+                  granularity=granularity)
+
+
 def weight_split(model, config):
     """Stored bytes by where they have to live: `resident` (read on every pass, kept in device memory),
     `experts` (read sparsely, may move to host memory or disk), `draft` (part of resident), `embedding`
@@ -184,7 +200,9 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
     fixed = config.fixed_state_bytes(element)
     reserve = int(float(settings["reserve_gib"]) * GIB)
     drafter_bytes = sum(row["weight_bytes"] for row in companions)
-    budget = free - int(vram_headroom_bytes) - reserve - split["resident"] - fixed - drafter_bytes
+    fit = _kv_fit(free, kv, headroom=int(vram_headroom_bytes), reserve=reserve,
+                  held=(split["resident"], fixed, drafter_bytes), granularity=granularity)
+    budget = fit["budget"]
     out["basis"] = {"device": (device or {}).get("device"), "memory_free_bytes": free,
                     "memory_total_bytes": (device or {}).get("memory_total_bytes"),
                     "vram_headroom_bytes": int(vram_headroom_bytes), "reserve_bytes": reserve,
@@ -201,7 +219,7 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
                          f"and a {reserve / 1e9:.1f} GB reserve")
         return out
     if kv:
-        out["device_limit"] = budget // kv // granularity * granularity
+        out["device_limit"] = fit["tokens"]
         tokens, bound = min((limit, "model"), (out["device_limit"], "device"))
     else:
         tokens, bound = limit, "model"  # no cache grows with the context

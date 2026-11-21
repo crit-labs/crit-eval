@@ -7,8 +7,9 @@ from ..reports import metrics
 from .pin import CONTINUATIONS
 from ..quality.prepare import sampled_request, unapplied
 from .adapters import open_engine
+from . import energy
 from .tool_calls import case_tool_calls
-from .timing import (_summary, check_disturbed, decode_text, disagree, provisional, rate, replies, reply_sha256,
+from .timing import (_summary, check_disturbed, decode_text, engine_memory, disagree, provisional, rate, replies, reply_sha256,
                      settling, stalls, steady_state, timed_generate, timed_plain, timed_replay, timed_sampled)
 
 
@@ -33,6 +34,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
     stop_ids = set(prepared["stop_ids"])
     text = decode_text(info, continuations)
     pinned = (continuations or {}).get("cases", {}) if text["source"] == "pinned" else {}
+    energy.measure_idle()   # the device at rest before the suite's first request (once a round)
     for case in prepared["speed"]:
         prompt, n = case["prompt_ids"], case["output_tokens"]
         if len(prompt) + n > info["max_context"]:
@@ -50,6 +52,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
         outputs = [before["tokens"]] if before.get("tokens") is not None else []
         own = len(outputs)   # outputs before this call's: the warmup's, compared but not the case's tokens
         load = HostLoad().start()
+        memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
         continuation = pinned.get(case["id"])
         if pinned and (continuation is None or len(continuation) != n):
             raise SystemExit(f"{CONTINUATIONS} has no {n}-token continuation for speed case {case['id']}")
@@ -72,9 +75,9 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             if i >= warm + repetitions and not disagree(samples, outputs, tolerance):
                 break
             if continuation is not None:
-                _, sample = timed_replay(engine, prompt, continuation)
+                _, sample = energy.metered(timed_replay, engine, prompt, continuation)
             else:
-                tokens, sample = timed_generate(engine, prompt, n)
+                tokens, sample = energy.metered(timed_generate, engine, prompt, n)
                 # Which reply this request decoded: repetitions of different replies are not a disturbance
                 # (protocol speed.output_varies).
                 sample["reply_sha256"] = reply_sha256(tokens)
@@ -93,7 +96,9 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             own += warm
         first = first or first_request(samples[0] if samples else {})
         other = load.cores()
-        check_disturbed(case["id"], samples, disturbed_spread, other)
+        # The GPU's energy over the measured requests (crit_eval.run.energy; reported, not judged).
+        drawn = energy.case(samples, len(prompt))
+        check_disturbed(case["id"], samples, disturbed_spread, other, memory=(memory, engine_memory(engine)))
         summary = _summary([s for s in samples if not s["warmup"]])
         tokens = outputs[own] if continuation is None else outputs[-2]
         crossed = [i for i, t in enumerate(tokens) if t in stop_ids]
@@ -119,13 +124,14 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             "tool_calls": case_tool_calls(case, tokens, next(s for s in samples if not s["warmup"]), prepared),
             # CPU cores other processes kept busy during the case: engines computing on the host slow down with them.
             "host_other_cpu_cores": None if other is None else round(other, 2),
+            **({"energy": drawn} if drawn is not None else {}),
         }
         log(f"speed {case['id']}: decode {rate(summary['decode_tps'], 1)}"
             + (" (pinned continuation)" if continuation is not None else "")
             + (f" after {added} more warmup(s) while it moved {cases[case['id']]['steady_state']['drift'] or 0:+.0%}"
                if added else "")
             + f", prefill {rate(summary['prefill_tps'], 0)}, tokens/round {summary['tokens_per_round'] or 0:.2f}, "
-            f"round {summary['round_ms'] or 0:.2f} ms"
+            f"round {summary['round_ms'] or 0:.2f} ms" + energy.joules_text(drawn)
             + (f", other processes {other:.1f} CPU cores" if other is not None and other >= 0.5 else ""))
         if after_first is not None:
             after_first(cases[case["id"]])
@@ -178,6 +184,7 @@ def speed_summary(cases, protocol, warmups, repetitions, text):
     prefill = [cases[i]["prefill_tps"] for i in protocol["speed"].get("prefill_cases", [])
                if cases.get(i, {}).get("status") == "measured" and cases[i].get("prefill_tps")]
     shortest = min((c for c in measured if c.get("ttft_ms")), key=lambda c: c["prompt_tokens"], default=None)
+    drawn = energy.summary(cases, protocol["speed"].get("prefill_cases", []))
     return {
         "warmup_runs": warmups, "repetitions": repetitions, "decode_text": text,
         # The first token of the shortest prompt: what a request costs before its prompt does (protocol stages 1).
@@ -192,6 +199,8 @@ def speed_summary(cases, protocol, warmups, repetitions, text):
         if prefill and len(prefill) == len(protocol["speed"].get("prefill_cases", [])) else None,
         "ttft_score_ms": metrics.geometric_mean([c["ttft_ms"] for c in measured if c.get("ttft_ms")]),
         "complete": len(measured) == len(cases),
+        # Joules per output and per prompt token over the cases (crit_eval.run.energy; reported, not judged).
+        **({"energy": drawn} if drawn else {}),
         "cases": cases,
     }
 
@@ -237,6 +246,7 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
     more = rule.get("adaptive") or {}
     target, cap = float(more.get("target_se", 0.03)), int(more.get("max_repetitions", repetitions))
     cases = {}
+    energy.measure_idle()
     for case in prepared["speed"]:
         prompt, n = case["prompt_ids"], case["output_tokens"]
         if len(prompt) + n > info["max_context"]:
@@ -244,6 +254,7 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
             continue
         samples = []
         load = HostLoad().start()
+        memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
         # A first measured repetition whose time per target pass still moves away from the request before it stands
         # as one more warmup, and its seed is asked again (protocol sampled_speed.steady_state).
         warm, added, i = warmups, 0, 0
@@ -261,7 +272,7 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                 if reported:
                     checked[case["id"]] = {"logprobs": reported, "seed": request.get("seed")}
             else:
-                _, sample, _ = timed_sampled(engine, prompt, n, request)
+                _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, request)
             sample["warmup"] = i < warm
             if (not sample["warmup"] and full_length(sample) and settling(samples, sample, steady, key="round_ms")
                     and full_length(samples[-1])):
@@ -274,17 +285,19 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                                                           or (metrics.case_error(speeds())[0] or 0.0) > target):
             # The next seed after those measured (2, 3, ...): one more text, until the case's error reaches the target.
             seed = seed_at(repetitions + extra)
-            _, sample, _ = timed_sampled(engine, prompt, n, sampled_request(settings, seed))
+            _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, sampled_request(settings, seed))
             sample.update(warmup=False, seed=seed)
             samples.append(sample)
             extra += 1
         error, deviation = metrics.case_error(speeds())
         other = load.cores()
+        drawn = energy.case(samples, len(prompt))
         # Only replies decoded to their full length show the device: one a server ended early, at an end token or a
         # tool call, has its time per pass from a few tokens and from how the server streamed the call.
         full = [s for s in samples if not s["warmup"] and full_length(s)]
         if len(full) >= 2:
-            check_disturbed(case["id"], full, disturbed_spread, other, key="round_ms")
+            check_disturbed(case["id"], full, disturbed_spread, other, key="round_ms",
+                            memory=(memory, engine_memory(engine)))
         summary = _summary([s for s in samples if not s["warmup"]])
         cases[case["id"]] = {"status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n,
                              **summary, "samples": samples,
@@ -293,12 +306,14 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                              # The case's relative standard error over its measured texts, the repetitions it took,
                              # and how many target_se would take at its spread.
                              "decode_se": error, "repetitions": repetitions + extra,
-                             "repetitions_for_target": metrics.repetitions_for(deviation, target)}
+                             "repetitions_for_target": metrics.repetitions_for(deviation, target),
+                             **({"energy": drawn} if drawn is not None else {})}
         log(f"sampled speed {case['id']}: decode {rate(summary['decode_tps'], 1)}, "
-            f"tokens/round {summary['tokens_per_round'] or 0:.2f}"
+            f"tokens/round {summary['tokens_per_round'] or 0:.2f}" + energy.joules_text(drawn)
             + (f", standard error {error:.1%} over {repetitions + extra} repetitions" if error is not None else ""))
     measured = [c for c in cases.values() if c["status"] == "measured"]
     rounds = [c["tokens_per_round"] for c in measured if c.get("tokens_per_round")]
+    drawn = energy.summary(cases, protocol["speed"].get("prefill_cases", []))
     return {"status": "measured", "sampling": settings, "sampling_source": prepared.get("sampling_source"),
             "warmup_runs": warmups, "repetitions": repetitions,
             "adaptive": {"target_se": target, "max_repetitions": cap} if adaptive else None, "target_se": target,
@@ -307,6 +322,7 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
             "decode_se": metrics.score_error([[s["decode_tps"] for s in c["samples"] if not s["warmup"]]
                                               for c in measured]),
             "tokens_per_round": metrics.geometric_mean(rounds) if rounds else None,
+            **({"energy": drawn} if drawn else {}),
             "complete": len(measured) == len(cases), "cases": cases}
 
 
