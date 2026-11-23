@@ -4,10 +4,13 @@ single-stream figure or other gate sees it.
 
 A level of N clients is one closed loop: the clients start together and each sends its next request when its previous
 reply has ended, requests_per_client in all, over a pool of distinct prompts (the short speed cases, then the held-out
-prompts), greedy and output_tokens long (ChatEngine.cohort). Per level: the aggregate completion tokens over the level's
-wall interval (crit_eval.run.outcomes.validate_cohort), the requests in flight at once at the peak and the replies
-streaming at once (whether the requests ran together), each request's time to first token and decode speed, each
-speed-case reply against that case's serial greedy reply (in quality mode speed, each difference judged as
+prompts), output_tokens long (ChatEngine.cohort). Each level runs twice: greedy, whose replies the gate compares and
+whose requests in flight and replies streaming at once say whether the requests ran together, then sampled at the
+prepared sampling (each prompt at its own seed), which every speed figure is taken from: decode speed is sampled
+decode, and the greedy aggregate stays beside it as `greedy`, a comparison only. Per level: the aggregate completion
+tokens over the level's wall interval (crit_eval.run.outcomes.validate_cohort), the requests in flight at once at the
+peak and the replies streaming at once (whether the requests ran together), each request's time to first token and
+decode speed, each speed-case reply against that case's serial greedy reply (in quality mode speed, each difference judged as
 protocol forks judges one), the level's aggregate against the batched ceiling (crit_eval.limits.batched), and its
 speedup over the 1-client level beside the speedup the cost model expects (protocol concurrency.speedup; reported, not
 judged)."""
@@ -18,6 +21,35 @@ from ..reports import metrics
 from .estimate import duration
 from .forks import ForkJudge
 from .outcomes import RequestRecord, StreamOutcome, validate_cohort
+from .speed import cannot_sample
+from ..quality.prepare import sampled_request
+
+# A level's speed figures: the sampled run's (summarize's keys).
+SPEED_KEYS = ("wall_seconds", "completion_tokens", "aggregate_tps", "ttft_ms_p50", "ttft_ms_p95", "decode_tps_p50",
+              "expert_hit_rate", "ceiling", "ceiling_missing", "fraction_of_ceiling", "expected_at",
+              "expected_at_missing")
+# What says a run's requests ran together and qualified (summarize's keys).
+RUN_KEYS = ("qualified", "errors", "peak_concurrency", "streaming_peak", "ran_together")
+
+
+def sampled_level(gate, drawn, reason):
+    """A level from its greedy run (`gate`: the consistency gate's replies and whether they ran together) and its
+    sampled run (`drawn`, None with `reason` where the engine cannot sample): every speed figure the sampled run's,
+    the greedy aggregate and per-request decode kept as `greedy`, comparison only."""
+    level = {key: value for key, value in gate.items() if key not in SPEED_KEYS}
+    level["greedy"] = {"aggregate_tps": gate["aggregate_tps"], "decode_tps_p50": gate["decode_tps_p50"],
+                       "comparison_only": "greedy decode: comparison only, never a speed"}
+    if drawn is None:
+        # The ceilings price the model, not a measurement: the greedy run's stand.
+        level.update({key: gate.get(key) for key in SPEED_KEYS if key.startswith(("ceiling", "expected_at"))})
+        level.update({key: None for key in SPEED_KEYS if not key.startswith(("ceiling", "expected_at"))},
+                     sampled_missing=reason)
+        return level
+    level.update({key: drawn.get(key) for key in SPEED_KEYS})
+    level["qualified"] = gate["qualified"] and drawn["qualified"]
+    level["errors"] = (gate["errors"] + [f"sampled: {e}" for e in drawn["errors"]])[:20]
+    level["sampled"] = {key: drawn[key] for key in RUN_KEYS}
+    return level
 
 
 def pool(prepared, protocol, max_context):
@@ -231,6 +263,8 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
         log(f"concurrency: unmeasured ({reason})")
         return {"status": "unmeasured", "reason": reason, "max_concurrent_requests": capacity}
     per, output = int(rule["requests_per_client"]), int(rule["output_tokens"])
+    unsampled = cannot_sample(engine, prepared)
+    seed_of = {p["id"]: i + 1 for i, p in enumerate(prompts)}   # each prompt at its own seed, at every level
     serial = {cid: case.get("tokens") for cid, case in ((result.get("speed") or {}).get("cases") or {}).items()
               if case.get("status") == "measured" and case.get("tokens")}
     serial_source = "speed part"
@@ -261,23 +295,35 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
            "ceiling_basis": "one token per row per step",
            # The run's single-stream hit rate the expectations are priced at, for a model with weights off the device.
            **({"hit_rate": host["hit_rate"], "hit_rate_source": host["hit_rate_source"]} if host else {}),
-           "output_tokens": output, "pool": [p["id"] for p in prompts], "mean_context": mean_context, "levels": {},
+           "output_tokens": output, "pool": [p["id"] for p in prompts], "mean_context": mean_context,
+           "sampling": prepared.get("sampling") if unsampled is None else None,
+           **({"sampled_missing": unsampled} if unsampled else {}), "levels": {},
            "skipped": {}}
     rate = None   # the best aggregate measured so far, which prices the next level
     for clients in planned:
         prompts_of = [[prompts[(c + r) % len(prompts)] for r in range(per)] for c in range(clients)]
-        seconds = (clients * per * output / rate if rate else None)
+        # Two runs a level where the engine samples: greedy for the gate, sampled for the speed.
+        seconds = (clients * per * output / rate * (1 if unsampled else 2) if rate else None)
         if fits is not None and not fits(f"concurrency@{clients}", seconds):
             out["skipped"][str(clients)] = f"over budget: about {duration(seconds)}"
             break
-        found = engine.cohort([[p["prompt_ids"] for p in row] for row in prompts_of], output)
-        level = summarize(found, clients, prompts_of, serial, strings, ceiling if terms else None, mean_context, judge)
+        asked = [[p["prompt_ids"] for p in row] for row in prompts_of]
+        found = engine.cohort(asked, output)
+        gate = summarize(found, clients, prompts_of, serial, strings, ceiling if terms else None, mean_context, judge)
+        drawn = None
+        if unsampled is None:
+            drawn = summarize(engine.cohort(asked, output, [[sampled_request(prepared["sampling"], seed_of[p["id"]])
+                                                             for p in row] for row in prompts_of]),
+                              clients, prompts_of, {}, strings, ceiling if terms else None, mean_context)
+        level = sampled_level(gate, drawn, unsampled)
         out["levels"][str(clients)] = level
-        rate = max(rate or 0.0, level["aggregate_tps"] or 0.0) or rate
+        # The next level's time is priced at the fastest aggregate yet, the greedy one where nothing sampled.
+        rate = max(rate or 0.0, level["aggregate_tps"] or gate["aggregate_tps"] or 0.0) or rate
         consistent = level["consistency"]
         log(f"concurrency {clients}: "
-            + (f"{level['aggregate_tps']:.1f} tok/s aggregate" if level["aggregate_tps"] else "not qualified ("
-               + "; ".join(level["errors"][:2]) + ")")
+            + (f"{level['aggregate_tps']:.1f} tok/s sampled aggregate" if level["aggregate_tps"] else
+               f"sampled aggregate unmeasured ({level['sampled_missing']})" if level.get("sampled_missing") else
+               "not qualified (" + "; ".join(level["errors"][:2]) + ")")
             + f", peak {level['peak_concurrency']} in flight, {level['streaming_peak']} streaming at once"
             + (f", first token p50 {level['ttft_ms_p50']:,.0f} ms" if level["ttft_ms_p50"] is not None else "")
             + (f", decode p50 {level['decode_tps_p50']:.1f} tok/s per request" if level["decode_tps_p50"] else "")

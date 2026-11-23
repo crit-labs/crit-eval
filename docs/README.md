@@ -4,7 +4,7 @@
 
 crit-eval combines physics-based performance targets with common speed and quality tests.
 Measured bandwidth and compute throughput set the limits each engine aims to approach.
-[Core](https://github.com/crit-labs/crit/blob/main/core/README.md) provides the
+[Core](https://github.com/crit-labs/crit/blob/main/inference/core/README.md) provides the
 runtime, [Inference](https://github.com/crit-labs/crit/blob/main/inference/README.md) supplies techniques,
 [Kernels](https://github.com/crit-labs/crit/blob/main/kernels/README.md) helps select kernels, and crit-eval measures the resulting engine.
 Every engine runs it the same way: `crit eval` fixes the prompts, output lengths, stop handling
@@ -122,7 +122,7 @@ with `load_model_text(model, chat_template=SOURCE)`.
 `--model` takes a GGUF as it comes: one `.gguf` file, the first part of a `gguf-split` set, or a
 folder holding one of them. Nothing else is needed. GGUF's converter writes the model's
 description into the GGUF's metadata, and Core derives the files the rest of crit reads from it
-([crit_core.model](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/model/README.md#gguf)): `config.json` from the
+([crit_core.model](https://github.com/crit-labs/crit/blob/main/inference/core/python/crit_core/model/README.md#gguf)): `config.json` from the
 architecture's shape and RoPE keys, by the config rules crit-eval gives Core for each architecture
 ([gguf_config.py](../crit_eval/architectures/gguf_config.py)), `tokenizer.json` and `tokenizer_config.json` from the
 vocabulary, merges and special tokens, the chat templates from `tokenizer.chat_template`, and
@@ -192,9 +192,9 @@ quantized model as stored. A multimodal projector (`mmproj-*.gguf`) beside it is
 Face checkpoint (Optimum, `torch.onnx`), with the model's description files beside them as
 usual. Core reads a state dict's pickle without running it, so a file that would run code under
 `torch.load` is refused
-([crit_core.model](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/model/README.md#pytorch-state-dicts)), and names an
+([crit_core.model](https://github.com/crit-labs/crit/blob/main/inference/core/python/crit_core/model/README.md#pytorch-state-dicts)), and names an
 ONNX graph's weights as the checkpoint it came from
-([ONNX](https://github.com/crit-labs/crit/blob/main/core/python/crit_core/model/README.md#onnx)). Where a repository ships safetensors
+([ONNX](https://github.com/crit-labs/crit/blob/main/inference/core/python/crit_core/model/README.md#onnx)). Where a repository ships safetensors
 beside either, the safetensors are the weights.
 
 Quantized checkpoints are read as stored, whatever writes them
@@ -422,7 +422,8 @@ stays under the protocol id of the coming release, and nothing in a change picks
 0.5.x releases (which all ran `crit-eval-v0.5.0`) ran under `crit-eval-v0.6.0`, the coming release's working id,
 which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the changes since ran under
 `crit-eval-v0.7.0`, which crit-eval 0.7.0 kept; the changes since ran under `crit-eval-v0.7.1`, which crit-eval
-0.7.1, 0.7.2 and 0.7.3 kept. A change that can move a
+0.7.1, 0.7.2 and 0.7.3 kept; the changes since ran under `crit-eval-v0.8.0` and then `crit-eval-v0.8.1`, and
+crit-eval 0.8.1 kept `crit-eval-v0.8.1` (no release kept `crit-eval-v0.8.0`). A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results

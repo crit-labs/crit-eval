@@ -9,6 +9,84 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-11-23
+
+### Overview
+
+crit-eval 0.8.1 releases protocol crit-eval-v0.8.1, which starts a new series: results do not compare with v0.7.x.
+Every decode speed Eval reports is now sampled decode (the sampled suite, held-out prompts, each long-context curve
+point and each concurrency level); a greedy decode stays in the result as a comparison only, never a speed. Retrieval
+judges a reasoning model's answer after a 128-token reasoning budget on a package that ends reasoning at a budget,
+and the retrieval archive is worded neutrally. Quality mode `speed` prices 16-bit matrices in 8 bits. A speed case
+that a model's chat template overflows is unmeasurable for that model, and the result says it is partial. A staged
+Eval judges the lower context against the required context measured again right after it, the same way. The
+reference scores models whose forward does not chain its layers, such as looped decoders. The limits read a model's mechanisms through `crit-models`. crit-eval's tests run in CI. crit
+0.23.0 ships with crit-eval 0.8.1, which needs crit-core and crit-models 0.23.0 or later.
+
+### Added
+
+- A CI workflow (`.github/workflows/ci.yml`): crit-eval's tests on pull requests and pushes to main, on Linux with Python 3.11 and 3.14 and the dependencies crit's CI pins, with crit-core and crit-models from crit's main (as crit's CI takes crit-eval's main). The tests ran only where someone ran them. 520 tests, about 160 s on one thread; the ones that need a GPU skip. Not run on GitHub yet, and no Windows job: the suite was not run on Windows with these pins.
+
+### Changed
+
+- Protocol crit-eval-v0.8.1 also words the retrieval archive neutrally: the identifiers of three stations, not their secret identifiers. A safety-trained model refused to list secret values at 200,000 tokens (it listed them at 4,096 and 32,768), which says nothing about how its engine reads a long context. The suite changes, so prepared data is prepared again; its quality texts, and so their reference scores, do not.
+- Protocol crit-eval-v0.8.1: retrieval judges a reasoning model's answer. On an engine whose package ends reasoning at a budget (`chat-thinking-budget-v1`), every request retrieval judges carries `thinking_budget_tokens` = `context.retrieval.thinking_tokens` (128) and is judged on the reply without its reasoning: a curve point's greedy request within its own 256 output tokens (the first, asked with log-probabilities, on a greedy request of its own with the budget), a retrieval point's with its 64 output tokens after the reasoning budget. An engine without the capability is asked and judged as before. Before, a model that reasons before it answers (one did at its lowest effort) spent the 64 tokens reasoning and failed retrieval however well its engine read the context. Same series as v0.8.0: prepared data and references stay valid.
+- A staged (certified) Eval judges the lower context against the required context measured again right after it, on an engine opened at the requirement the same way (one warm-up, one sample a case, after the long-context curve), not against the speed cases measured at the run start: an engine measured hot after the curve read 15% slower to first token at the lower context while separate loads at both contexts measured the same. The comparison with the first measurement stays in the result (`context.lower.against_first_measurement`). Both are measured the same way, so the comparison reads the context change alone.
+- The reference scores a model whose forward does not call each decoder layer once, in order, on the previous layer's
+  output (a span of layers run again, block states mixed into later inputs), where it scored such a forward as if it
+  chained its layers, wrong and without an error: a two-token probe detects it, and its texts run through the
+  model's own forward in chunks that resume its cache, each decoder layer loaded when called and kept while a share of
+  the device's memory stays free (the chunk sized from that margin, never a fixed byte count); the identity records
+  `layers: called`. An eager attention that takes a position bias or sinks a row runs in blocks of rows with those
+  inputs cut to the block, and stored tensors that are no matrices reach transformers' converters as stored.
+- A speed case whose fixed conversation, rendered by the model's chat template, overflows the case's prompt tokens is
+  not measurable for that model (protocol `speed.unmeasurable_cases`): prepare records it under `speed_unmeasurable`
+  with the reason where it used to stop, and the decode, prefill and TTFT scores aggregate over the cases left. Such
+  a result is partial: `status` leads with `PARTIAL:` and the cases (status JSON `partial`), and a baseline change is
+  not computed between results scored over different case sets. Every model that can run a case keeps the same
+  prompt.
+
+- The limits read a model's mechanisms (layer kinds, routed layers, the KV a token adds, the fixed state, experts,
+  latent attention) through `crit-models` (`crit_models.config.architecture`), where crit moved them from its Core;
+  the numbers are the same (every rule and limit term checked on the checkpoint configs and models on hand).
+  crit-eval depends on `crit-models` beside `crit-core`, each with a lower bound (the release's version: neither the
+  mechanisms in crit-models nor Core's sampled concurrency cohort is in a released crit-core).
+- Decode speed is sampled decode only. Without a measured sampled suite, status reports decode as unmeasured (with
+  the reason, also under `missing`) instead of falling back to the greedy suite: `decode_sampled` is null, the
+  decode goal and stop-record score and the end-to-end score are null, and a baseline change of decode is not
+  computed. `decode_greedy` always carries `comparison_only`, status renders it as "comparison only, never a speed",
+  and `crit eval compare` names its row the same way.
+- Protocol crit-eval-v0.8.0 (results do not compare with v0.7.x): every decode speed Eval reports is sampled.
+  - The held-out prompts decode a sampled reply at the prepared sampling (repetition r at seed r + 1) instead of
+    greedily, unsupported on an engine that cannot sample, and the generality gate sets their change beside the
+    sampled suite's.
+  - Each long-context curve point keeps its greedy request (first token, retrieval, the honesty check's long reply)
+    and adds one sampled request on the same prompt (seed 1, servable from a prompt cache) that times the point's
+    decode, tokens per round and round time; the greedy decode stays as the point's `greedy`, comparison only.
+  - Each concurrency level runs twice: greedy for the consistency gate and whether the requests ran together, then
+    sampled (each prompt at its own seed) for the aggregate, first tokens, decode, ceiling fraction and speedup; the
+    greedy aggregate stays as `greedy`, comparison only. A cohort takes per-request sampling
+    (`cohort(clients, max_new_tokens, sampling)`, also Core's package adapter).
+  - The estimates price the extra curve request; status labels the curve, held-out and concurrency figures sampled.
+- A resumed round answers the engine's `sampling_fields` from its journal (recorded with the engine's open line):
+  before, every sampled part read it from the live engine, which hung a resumed round whose server was gone.
+- Quality mode `speed` prices the matrices a checkpoint stores in 16 bits in 8 bits, as its starting arithmetic
+  holds them: the prefill and first-token limits gain the `+w8` ceilings (each activation's again with the 16-bit
+  matrices re-encoded to FP8, W8A8 at the FP8 rate; `stored+w8` alone for a checkpoint with no quantized matrices,
+  which was priced at BF16 in both modes), which `speed` admits and `preserve` does not, and a decode pass that
+  reads more than the model files' pass with every 16-bit matrix in 8 bits is a decode gap
+  (`headroom.speed_weights`, `headroom.speed_pass_bytes`). `preserve`'s limits are unchanged.
+
+### Fixed
+
+- prepare: a prompt renders from its messages paired as a server is sent them (tool results by their call ids). A
+  template that names a tool result by its call rendered 3 tokens short of the server.
+- The chat client's HTTP error carries the server's message (its body), so an aborted Eval says what was refused.
+- reference: `chunked_sink_attention` takes fewer rows a block past `SCORE_KEYS` keys, since its eager attention holds
+  several copies of a block's FP32 scores (gigabytes at 32k keys). A forward called out of order releases the
+  resident layer whose next call is furthest away, and keeps free the larger of its margin and 1.5 times the chunk
+  before's peak: a looped span missed on every call, and a 32k text ran out of device memory.
+
 ## [0.7.3] - 2026-11-21
 
 ### Overview

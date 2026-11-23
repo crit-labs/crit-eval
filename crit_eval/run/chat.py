@@ -76,9 +76,25 @@ class Server:
         # The longest tail first: frames that share a head and end alike are told apart by their whole tail.
         self.frames.sort(key=lambda frame: -len(frame[1]))
 
+    def _open(self, request, timeout):
+        """The opener's response; an HTTP error raised again with the server's own message (its body, cut) in it."""
+        try:
+            return self.opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as error:
+            try:
+                raw = error.read()
+            except Exception:   # noqa: BLE001 - the error stands without its body
+                raw = b""
+            said = raw.decode("utf-8", "replace").strip()[:1000]
+            if not said:
+                raise
+            import io   # the body stays readable for the handlers that read it (exc.read())
+            raise urllib.error.HTTPError(error.url, error.code, f"{error.msg}: {said}", error.headers,
+                                         io.BytesIO(raw)) from None
+
     def get(self, path, timeout):
         request = urllib.request.Request(self.url + path, headers=self.headers)
-        with _bounded(timeout, path), self.opener.open(request, timeout=timeout) as response:
+        with _bounded(timeout, path), self._open(request, timeout) as response:
             return json.load(response)
 
     def health(self, timeout):
@@ -86,7 +102,7 @@ class Server:
         the API URL without a trailing /v1."""
         root = self.url[:-len("/v1")] if self.url.endswith("/v1") else self.url
         request = urllib.request.Request(root + "/health", headers=self.headers)
-        with _bounded(timeout, "/health"), self.opener.open(request, timeout=timeout) as response:
+        with _bounded(timeout, "/health"), self._open(request, timeout) as response:
             return json.load(response)
 
     def post(self, path, body, timeout):
@@ -96,7 +112,7 @@ class Server:
         """(the response, {"seconds": until it was read, "response_bytes", "parse_seconds"})."""
         request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), headers=self.headers)
         started = time.monotonic()
-        with _bounded(timeout, path), self.opener.open(request, timeout=timeout) as response:
+        with _bounded(timeout, path), self._open(request, timeout) as response:
             raw = response.read()
         read = time.monotonic()
         value = json.loads(raw)
@@ -106,7 +122,7 @@ class Server:
         """The streamed events of a request; `timeout` bounds the wait for each. Lines without data, such as the
         keep-alive comments crit serve sends while the engine is quiet, are no answer."""
         request = urllib.request.Request(self.url + path, data=json.dumps(body).encode(), headers=self.headers)
-        with _bounded(timeout, path), self.opener.open(request, timeout=timeout) as response:
+        with _bounded(timeout, path), self._open(request, timeout) as response:
             waiting = time.monotonic()
             for line in response:
                 line = line.strip()
@@ -212,6 +228,15 @@ def paused_collector():
             gc.enable()
 
 
+REASONING_FIELDS = ("reasoning", "reasoning_content")   # a streamed delta's reasoning, apart from its answer
+THINKING_BUDGET_CAPABILITY = "chat-thinking-budget-v1"   # the package ends reasoning at thinking_budget_tokens
+
+
+def answer_text(delta):
+    """What one streamed delta adds to the reply's answer: reply_text without its reasoning."""
+    return reply_text({key: value for key, value in delta.items() if key not in REASONING_FIELDS})
+
+
 def reply_text(delta):
     """What one streamed delta adds to the reply: every text field but the role, and tool-call names and arguments."""
     parts = [value for key, value in delta.items() if key != "role" and isinstance(value, str)]
@@ -246,6 +271,8 @@ class ChatEngine:
         if self.plain:
             self.generate_plain = self._generate_plain
         self.switches_cache = PROMPT_CACHE_CAPABILITY in (card.get("capabilities") or [])
+        # The package ends a reply's reasoning at a budget: retrieval asks with one and judges the answer.
+        self.thinking_budget = THINKING_BUDGET_CAPABILITY in (card.get("capabilities") or [])
         self.text = load_text(context["model"], server.chat_template)
         self.by_bytes = None  # ids_by_bytes, built for the first quality reply
         self.named = None     # the ids by_bytes names, for the first scored list read as served
@@ -286,7 +313,7 @@ class ChatEngine:
         raise RuntimeError("the prompt is not one the prepared data sends to a server")
 
     def generate(self, prompt, max_new_tokens, on_tokens, prompt_cache=False, sampling=None, logprobs=None,
-                 plain=False):
+                 plain=False, thinking_tokens=None):
         """A greedy reply, or with sampling a sampled one (temperature, top_p, top_k, min_p and seed in the request
         body, protocol sampled_speed); with logprobs n each reply token's log-probability and n alternatives are
         returned as "logprobs". With prompt_cache it may be served from the server's prompt cache (a request judged
@@ -301,7 +328,10 @@ class ChatEngine:
         if logprobs:
             body.update(logprobs=True, top_logprobs=int(logprobs))
         body.update(self.extension(prompt_cache, plain))   # one token per target pass; no prompt cache unless allowed
+        if thinking_tokens and self.thinking_budget:   # the reasoning ends at the budget, the answer follows
+            body["thinking_budget_tokens"] = int(thinking_tokens)
         pieces, usage, finish, telemetry, entries, calls = [], None, None, None, [], {}
+        answer, reasoned = [], False
         started = time.monotonic()
         first = last = None
         for event in self.server.events("/chat/completions", body, self.deadline.seconds(len(prompt), max_new_tokens)):
@@ -321,7 +351,10 @@ class ChatEngine:
                     function = call.get("function") or {}
                     slot["name"] += function.get("name") or ""
                     slot["arguments"] += function.get("arguments") or ""
-                piece = reply_text(choice.get("delta") or {})
+                delta = choice.get("delta") or {}
+                reasoned = reasoned or any(isinstance(delta.get(key), str) and delta[key] for key in REASONING_FIELDS)
+                answer.append(answer_text(delta))
+                piece = reply_text(delta)
                 if piece:
                     last = time.monotonic()
                     first = first or last
@@ -345,6 +378,8 @@ class ChatEngine:
                           "finish_reason": finish, "cached_tokens": cached_tokens(usage)}}
         if calls:
             out["tool_calls"] = [calls[index] for index in sorted(calls)]
+        if reasoned:   # the reply without its reasoning, which retrieval judges
+            out["answer_tokens"] = token_ids(self.text, "".join(answer))
         # Draft telemetry crit serve passes on: drafts accepted per round, verify and draft milliseconds.
         accepted = (telemetry or {}).get("accepted")
         if isinstance(accepted, list) and all(type(a) is int for a in accepted):
@@ -391,9 +426,10 @@ class ChatEngine:
             return prompt
         raise RuntimeError(rendered(self.server.url, usage.get("prompt_tokens"), len(rendered_ids)))
 
-    def generate_sampled(self, prompt, max_new_tokens, on_tokens, sampling, logprobs=None):
-        """A sampled reply (protocol sampled_speed) at the sampling fields given."""
-        return self.generate(prompt, max_new_tokens, on_tokens, sampling=sampling, logprobs=logprobs)
+    def generate_sampled(self, prompt, max_new_tokens, on_tokens, sampling, logprobs=None, prompt_cache=False):
+        """A sampled reply (protocol sampled_speed) at the sampling fields given; prompt_cache as generate's."""
+        return self.generate(prompt, max_new_tokens, on_tokens, prompt_cache=prompt_cache, sampling=sampling,
+                             logprobs=logprobs)
 
     def _generate_plain(self, prompt, max_new_tokens, on_tokens):
         """Plain greedy on the served speculative engine (crit serve's crit.decode plain): crit-eval's exactness
@@ -553,9 +589,10 @@ class ChatEngine:
         value = next((m for m in cards if m.get("id") == self.model), {}).get("max_concurrent_requests")
         return value if type(value) is int and value >= 1 else None
 
-    def cohort(self, clients, max_new_tokens):
+    def cohort(self, clients, max_new_tokens, sampling=None):
         """One closed-loop level of the concurrency part (protocol concurrency.loop): clients[c] is client c's prompts,
-        each sent greedy when the client's previous reply has ended, every client starting at once. {"seconds": the
+        each sent when the client's previous reply has ended, every client starting at once: greedy, or with
+        sampling (sampling[c][r] the sampling fields of client c's r-th request, prepare.sampled_request) sampled. {"seconds": the
         level's wall interval, "requests": per request its client, index, prompt_tokens, the seconds from the level's
         start when it was sent, its first and last reply text arrived and its reply was read (started, first, last,
         finished), the usage's completion_tokens, finish_reason and cached_tokens, the stream's validation errors
@@ -570,7 +607,8 @@ class ChatEngine:
             for position, prompt in enumerate(prompts):
                 try:
                     rows.append({"client": index, "index": position,
-                                 **self._streamed(list(prompt), max_new_tokens, len(clients), epoch[0])})
+                                 **self._streamed(list(prompt), max_new_tokens, len(clients), epoch[0],
+                                                  sampling[index][position] if sampling else None)})
                 except BaseException as error:   # Hung or a transport failure: the level stops with it
                     failures.append(error)
                     return
@@ -588,12 +626,12 @@ class ChatEngine:
         rows.sort(key=lambda row: (row["client"], row["index"]))
         return {"seconds": seconds, "requests": rows}
 
-    def _streamed(self, prompt, max_new_tokens, clients, epoch):
-        """One greedy request of a cohort, read raw so the stream itself is validated (cohort)."""
+    def _streamed(self, prompt, max_new_tokens, clients, epoch, sampling=None):
+        """One request of a cohort, greedy or at `sampling`, read raw so the stream itself is validated (cohort)."""
         messages, tools = self.messages(prompt)
         body = {"model": self.model, "messages": messages, "max_tokens": max_new_tokens, "stream": True,
                 "stream_options": {"include_usage": True}, **({"tools": tools} if tools else {}),
-                **self.applied(GREEDY_REQUEST), **self.extension()}
+                **self.applied(sampling or GREEDY_REQUEST), **self.extension()}
         timeout = self.deadline.seconds(len(prompt), max_new_tokens) * max(1, clients)
         request = urllib.request.Request(self.server.url + "/chat/completions", data=json.dumps(body).encode(),
                                          headers=self.server.headers)

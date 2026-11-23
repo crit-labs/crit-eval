@@ -7,6 +7,8 @@ CHUNKED = "crit_chunked"
 # eager's additive masks (chunked_sink_attention).
 CHUNKED_SINKS = "crit_chunked_sinks"
 QUERY_BLOCK = 256
+# Keys a chunked_sink_attention block of QUERY_BLOCK rows reads at most: past them a block takes fewer rows.
+SCORE_KEYS = 4096
 
 
 def chunked_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, sliding_window=None,
@@ -57,23 +59,43 @@ def chunked_sink_attention(module, query, key, value, attention_mask, **kwargs):
     masks, and may extend them (compressed entries appended to the key/value axis after the sliding window, and
     their visibility, a block bias, to the mask). Visibility so comes from the mask alone, never from
     positions; every block reads every key column, and each row is the one eager computes, without the length x
-    length score matrix."""
+    length score matrix: QUERY_BLOCK rows a block up to SCORE_KEYS keys, fewer past them."""
     import sys
     import torch
     eager = getattr(sys.modules[type(module).__module__], "eager_attention_forward", None)
     if eager is None:
         raise SchemeError(f"{type(module).__name__}: attention with sinks but no eager_attention_forward in "
                           f"{type(module).__module__}; the reference cannot run its long texts in blocks")
+    length = query.shape[2]
+    # Inputs a row of its own ([batch][heads][rows][columns]: a position bias, sinks a row) are cut to the block's rows.
+    own = {name for name, value in kwargs.items()
+           if isinstance(value, torch.Tensor) and value.dim() == 4 and value.shape[-2] == length}
     pieces = []
-    for start in range(0, query.shape[2], QUERY_BLOCK):
-        stop = min(start + QUERY_BLOCK, query.shape[2])
+    step = max(16, min(QUERY_BLOCK, QUERY_BLOCK * SCORE_KEYS // max(1, key.shape[2])))
+    for start in range(0, length, step):
+        stop = min(start + step, length)
         rows = None if attention_mask is None else attention_mask[..., start:stop, :]
-        pieces.append(eager(module, query[:, :, start:stop], key, value, rows, **kwargs)[0])
+        block = {name: value[..., start:stop, :] if name in own else value for name, value in kwargs.items()}
+        pieces.append(eager(module, query[:, :, start:stop], key, value, rows, **block)[0])
     return torch.cat(pieces, dim=1), None
+
+
+# Inputs of a modeling module's eager attention that sdpa's form has no place for: its long texts run as
+# CHUNKED_SINKS (the eager attention in blocks of rows).
+EAGER_INPUTS = ("sinks", "position_bias")
 
 
 def _sink_attention(model):
     """Whether `model`'s attention has sinks (a learned logit per head in every row's softmax, a `sinks`
-    parameter): chunked attention then runs as CHUNKED_SINKS."""
+    parameter) or its modeling code's eager attention takes inputs sdpa has no place for (EAGER_INPUTS: sinks a
+    row, a position bias): chunked attention then runs as CHUNKED_SINKS."""
+    import inspect
+    import sys
     import torch
-    return any(isinstance(getattr(module, "sinks", None), torch.nn.Parameter) for module in model.modules())
+    if any(isinstance(getattr(module, "sinks", None), torch.nn.Parameter) for module in model.modules()):
+        return True
+    for name in {type(module).__module__ for module in model.modules()}:
+        eager = getattr(sys.modules.get(name), "eager_attention_forward", None)
+        if callable(eager) and any(p in inspect.signature(eager).parameters for p in EAGER_INPUTS):
+            return True
+    return False

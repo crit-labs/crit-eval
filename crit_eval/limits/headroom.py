@@ -355,11 +355,15 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
     fastest shown to pass. evidence: earlier results of the same model (a baseline) whose quality judged their own
     declared activations, beside this result's; only those judged in this result's quality mode count, since a pass
     under the speed mode's budget shows nothing for preserve's and a failure under preserve's nothing for the speed
-    mode's. None when the model stores no quantized matrices."""
+    mode's. Where the model stores matrices in 16 bits, each ceiling once more with those re-encoded to FP8 (W8A8:
+    ceiling.REENCODED), named ACTIVATION+w8 (REENCODED_SUFFIX; only stored+w8 for a model with no quantized matrices),
+    which the speed mode admits (MODE_ACTIVATIONS) and no quality evidence judges. None when the model stores neither
+    quantized nor 16-bit matrices."""
     ceiling = tiered_ceiling(result)
     formats = model_ceiling.quantized_formats(ceiling)
+    dense = model_ceiling.has_dense(ceiling)
     speed, info = result.get("speed") or {}, result.get("engine") or {}
-    if not formats or not rates:
+    if not (formats or dense) or not rates:
         return None
     measured = {cid: c for cid, c in speed.get("cases", {}).items() if c.get("status") == "measured" and c.get("ttft_ms")}
 
@@ -380,19 +384,23 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
                "cases": {cid: {"floor_ms": ms} for cid, ms in floors.items()}}
         return row, lacking
     modes, missing = {}, []
-    for activation in model_ceiling.ACTIVATIONS:
-        shares = {f: {activation: 1.0} for f in formats}
+    names = [a for a in model_ceiling.ACTIVATIONS if formats]
+    names += [a + REENCODED_SUFFIX for a in (model_ceiling.ACTIVATIONS if formats else ("stored",)) if dense]
+    for name in names:
+        shares = row_shares(name, formats)
         row, lacking = priced(shares)
         row["rates"] = {}
-        for f in formats:
+        for f, mix in shares.items():
+            activation = next(iter(mix))
             rate, key = model_ceiling.matmul_rate(rates, f, activation)
             row["rates"][f] = {"tflops": rate, "rate": key if rate else None, "source": sources.get(key) if rate else None}
         if lacking:
             row["missing"] = lacking
-        modes[activation] = {**row, "state": None, "evidence": []}
-    judged = [prompt_evidence(result, formats)] + [prompt_evidence(other, formats) for other in evidence
-                                         if other.get("model_sha256") == result.get("model_sha256")
-                                         and quality_mode(other) == quality_mode(result)]
+        modes[name] = {**row, "state": None, "evidence": []}
+    judged = ([prompt_evidence(result, formats)] + [prompt_evidence(other, formats) for other in evidence
+                                          if other.get("model_sha256") == result.get("model_sha256")
+                                          and quality_mode(other) == quality_mode(result)]
+              if formats else [(None, None, None)])
     declared, state, detail = judged[0]
     own = None
     if declared is not None:
@@ -413,10 +421,31 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
         row = own if name == "declared" else modes[name]
         reachable = {"name": name, "label": own["label"] if name == "declared" else name, "ceiling_score": score,
                      "ttft_floor_ms": row["ttft_floor_ms"], "cases": row["cases"]}
-    if declared is None:
+    if declared is None and formats:
         missing.append("prompt_activations from the adapter (the activation format of each quantized matrix group's "
                        "prompt GEMMs; with the quality gate it names the reachable prefill ceiling)")
-    return {"formats": formats, "modes": modes, "declared": own, "reachable": reachable, "missing": missing}
+    return {"formats": formats, "dense": dense, "modes": modes, "declared": own, "reachable": reachable,
+            "missing": missing}
+
+
+# A ceiling's name with the model's 16-bit matrices re-encoded to FP8 (W8A8) beside the quantized ones' activation.
+REENCODED_SUFFIX = "+w8"
+
+
+def row_shares(name, formats):
+    """The activation shares a ceiling of activation_ceilings prices: every quantized format at the named activation,
+    and with REENCODED_SUFFIX the 16-bit matrices in FP8 too (ceiling.REENCODED)."""
+    activation = name[:-len(REENCODED_SUFFIX)] if name.endswith(REENCODED_SUFFIX) else name
+    shares = {f: {activation: 1.0} for f in formats}
+    return {**shares, **model_ceiling.REENCODED} if name.endswith(REENCODED_SUFFIX) else shares
+
+
+def ceiling_label(name):
+    """A ceiling's name as the reports write it: an activation, or with REENCODED_SUFFIX that activation and the
+    16-bit matrices in FP8 (W8A8)."""
+    if not name.endswith(REENCODED_SUFFIX):
+        return name
+    return f"{name[:-len(REENCODED_SUFFIX)]} (16-bit matrices in FP8, W8A8)"
 
 
 # A quality-preserving engine keeps its prompt activations in 16 bits (quality mode preserve): the fastest of these
@@ -424,8 +453,11 @@ def activation_ceilings(result, rates, sources, prefill_cases, evidence=()):
 PRESERVE_ACTIVATIONS = ("bf16", "fp16_acc")
 # The prompt activations of the quantized matrices each quality mode admits without quality evidence (the formats
 # activation_ceilings prices): preserve's 16-bit ones; the speed mode admits every one, the stored format's own,
-# FP8 and 16-bit, whatever format the checkpoint stores, so its limits never fall below preserve's.
-MODE_ACTIVATIONS = {"preserve": PRESERVE_ACTIVATIONS, "speed": ("bf16", "fp16_acc", "fp8", "stored")}
+# FP8 and 16-bit, whatever format the checkpoint stores, so its limits never fall below preserve's, and each with the
+# matrices stored in 16 bits re-encoded to FP8 (+w8): its starting arithmetic holds every target matrix in 8 bits.
+MODE_ACTIVATIONS = {"preserve": PRESERVE_ACTIVATIONS,
+                    "speed": tuple(a + suffix for suffix in ("", REENCODED_SUFFIX)
+                                   for a in ("bf16", "fp16_acc", "fp8", "stored"))}
 
 
 def quality_mode(result):
@@ -442,19 +474,21 @@ def mode_limits(result):
     keeps the activations in 16 bits; the speed mode admits the stored
     format's too, so its limits are the stored format's (None) wherever that is the fastest priced (a device with the
     format's tensor cores), and a faster one's elsewhere (FP8 for 4-bit matrices on a device without 4-bit ones).
-    None too while the ceilings by activation are not priced (a checkpoint with no FP8 or NVFP4 matrices)."""
+    The speed mode's limits hold the matrices stored in 16 bits in FP8 too (the +w8 ceilings) wherever the model has
+    such matrices and the device multiplies FP8 faster than BF16. None too while the ceilings by activation are not
+    priced (a checkpoint with neither 16-bit nor FP8 or NVFP4 matrices)."""
     mode = quality_mode(result)
     admitted = MODE_ACTIVATIONS[mode]
     room = result.get("headroom") or {}
     found = room.get("activations") or {}
     formats = found.get("formats") or ()
     modes = found.get("modes") or {}
-    options = [(row["ceiling_score"], name, {f: {name: 1.0} for f in formats}, row.get("ttft_floor_ms"))
+    options = [(row["ceiling_score"], ceiling_label(name), row_shares(name, formats), row.get("ttft_floor_ms"))
                for name, row in modes.items() if name in admitted and row.get("ceiling_score")]
     reach = found.get("reachable")
     if reach and reach.get("ceiling_score"):
         shares = ((found.get("declared") or {}).get("activations") if reach["name"] == "declared"
-                  else {f: {reach["name"]: 1.0} for f in formats})
+                  else row_shares(reach["name"], formats))
         options.append((reach["ceiling_score"], reach["label"], shares, reach.get("ttft_floor_ms")))
     if not options:
         return None
@@ -833,7 +867,7 @@ def measured_hit_rate(result):
 
 def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tflops=None, steps=None,
               prefill_cases=(), context=None, context_settings=None, decode_speed=None, decode_name="greedy",
-              host_rates=None, model_pass=None, tiers=None, telemetry=None):
+              host_rates=None, model_pass=None, tiers=None, telemetry=None, speed_pass=None):
     """info: adapter info(); speed: run_speed() result; step_ms: median ordinary one-token step
     in ms (None when unmeasured); bandwidth_gbs: achievable device bandwidth in GB/s; ceiling:
     the prepared model arithmetic (ceiling.model_ceiling); tflops: GEMM rates by format; steps:
@@ -845,7 +879,9 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
     model's memory tiers on the device (crit_eval.limits.tiers.derive), which price an engine that declares no host
     bytes, each case at its own expert cache hit rate, and the prompts' floors (protocol headroom.tiers); telemetry: the
     engine's own expert cache counters over each speed suite (result telemetry), the hit rate where its requests report
-    none. Without either the expert misses are unmeasured: no rate is assumed."""
+    none. Without either the expert misses are unmeasured: no rate is assumed. speed_pass: in quality mode speed, the
+    bytes a pass reads with every 16-bit matrix in 8 bits (context.speed_pass_bytes), its starting arithmetic: a pass
+    that reads more is a decode gap (speed_weights_gap)."""
     decode_speed = decode_speed or speed
     width = info.get("draft_width")
     probed_gbs = bandwidth_gbs   # the fixed denominator takes the probe's, never an engine's
@@ -1001,6 +1037,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         missing.append("verify_ms and draft_ms from generate() (separates the draft steps from the verify pass)")
 
     gaps = decode_gaps(cases, score, width, draft_floor, projection)
+    gaps += speed_weights_gap(cases, score, info.get("bytes_per_pass"), speed_pass)
     gaps += acceptance_gaps(cases, score, width, bound_width, step_ms, draft_ms)
     if decode_speed is not speed:
         gaps += sampling_gaps(decode_speed, speed, score)
@@ -1033,6 +1070,7 @@ def summarize(info, speed, step_ms, bandwidth_gbs, thresholds, ceiling=None, tfl
         "end_to_end": end_to_end, "noise": _noises(speed, decode_speed, prefill_cases), "context": long_context,
         # Decode over one token per pass at the model files' bytes, whatever the engine reports (reported, not judged).
         "fixed_decode": fixed_decode(decode_speed, model_pass, probed_gbs, decode_name),
+        **({"speed_pass_bytes": speed_pass} if speed_pass else {}),
         "missing": missing, "warnings": warnings,
     }
 
@@ -1115,6 +1153,24 @@ def context_summary(info, context, ceiling, tflops, bandwidth_gbs, draft_floor, 
             "ttft": {"score_ms": ttft_score, "floor_ms": floor_score,
                      "fraction_of_floor": floor_score / ttft_score if ttft_score and floor_score else None},
             "missing": missing, "gaps": gaps}
+
+
+def speed_weights_gap(cases, score, bytes_per_pass, speed_pass):
+    """protocol headroom.speed_weights: in quality mode speed, the decode gain if each round's model pass read what a
+    pass reads with every 16-bit matrix in 8 bits (speed_pass), its time scaled by the bytes, all else as measured;
+    [] where the pass already reads no more than that (within 1%), or without the pass's bytes or its step."""
+    timed = {cid: row for cid, row in cases.items() if row.get("round_ms") and row.get("decode_tps")
+             and row.get("step_ms")}
+    if not score or not timed or not bytes_per_pass or not speed_pass or bytes_per_pass <= speed_pass * 1.01:
+        return []
+    ratio = speed_pass / bytes_per_pass
+    gain, factors = _projected_gain(timed, score, lambda cid, row: row["round_ms"] - row["step_ms"] * (1 - ratio))
+    if not gain or gain <= 0:
+        return []
+    return [{"kpi": "decode", "name": "16-bit weights read in 8 bits (quality mode speed's starting arithmetic)",
+             "projected_gain": gain, "case_speedup": factors,
+             "detail": f"a pass reads {bytes_per_pass / 1e9:.2f} GB, {speed_pass / 1e9:.2f} GB with every matrix "
+                       "stored in 16 bits held in FP8"}]
 
 
 def decode_gaps(cases, score, width, draft_floor, projection):

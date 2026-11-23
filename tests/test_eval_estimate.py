@@ -109,7 +109,8 @@ class EstimateTests(unittest.TestCase):
             "quality": sum(request(n, m) + (n + m - 1) * ROW for n, m in conversations + long)
             + sum(2 * request(n, m) + m * ROW for n, m in honesty)
             + request(2016, 32) + 32 * ROW,   # the curve's first reply scored once more
-            "context": sum(request(point - 32, 32) for point in (2048, 4096, 8192)),
+            # Each point's greedy request and the sampled one that times its decode.
+            "context": 2 * sum(request(point - 32, 32) for point in (2048, 4096, 8192)),
             "retrieval": request(1016, 8),    # 2,048 is a curve point: its reply is judged instead
             "exactness": sum(request(n, 32, per_pass=2.0) for n in cases),
             "followup_again": sum(request(n, 8) for n in (500, 520, 540)),

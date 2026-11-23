@@ -4,6 +4,12 @@
 
 ## Speed
 
+Decode speed is sampled decode: the [sampled suite](#sampled-speed)'s score at the model's own sampling is the
+decode KPI. The greedy suite below measures the same cases at temperature 0 for what compares texts (exactness
+against plain greedy, repeated requests, the pinned decode text); its decode score is reported as `decode_greedy`,
+labelled comparison-only, and is never shown as the speed. A result without a measured sampled suite has no decode
+score: status says decode is unmeasured and why.
+
 [suite/speed.json](../crit_eval/suite/speed.json) holds six greedy cases, each generating 256 tokens:
 
 | Case | Prompt | Why |
@@ -67,6 +73,12 @@ Time to first token gives prefill, the remaining tokens decode. The **decode sco
 case medians; each case also reports tokens per round. The **prefill score** is the geometric mean of prompt tokens ÷ TTFT over `long-summary`
 and `agent-long` (`prefill_cases`). The **TTFT score** is the geometric mean of TTFT in ms over
 every case, where short prompts expose fixed costs.
+
+A speed case whose fixed conversation, rendered by the model's own chat template, is longer than the case's prompt
+tokens cannot be built for that model (`unmeasurable_cases`). Prepare records it under `speed_unmeasurable` with the
+reason, and the decode, prefill and TTFT scores aggregate over the cases left. Such a result is **partial**: `status`
+says so on its first line (`PARTIAL:` and the cases), its status JSON carries `partial`, and no baseline change is
+computed between results scored over different case sets.
 
 **Stalls** (reported, not judged): a smooth decode average can hide a stream that pauses.
 Every request records the host time each streamed chunk arrives (a served engine's stream events, an adapter's
@@ -141,9 +153,9 @@ measured the same way.
 baseline change within two standard errors of the difference as within the noise. The **sampled decode score**, the geometric mean of the case medians, is the decode KPI
 from v7 on (`status.kpis.decode`, with `suite` "sampled"): its headroom and ceiling, the decode goal
 and the stop record's decode follow it, and baselines compare it at the same sampling. The greedy
-suite's decode score stays next to it (`status.kpis.greedy_decode`), and prefill, time to first
-token, held-out prompts and exactness stay on the greedy suite. A result with no measured sampled
-decode (v6, or an engine that cannot sample) keeps the decode KPI on the greedy suite.
+suite's decode score stays next to it (`status.kpis.decode_greedy`), labelled comparison-only, and prefill, time to
+first token and exactness stay on the greedy suite. A result with no measured sampled decode (v6, or an engine that
+cannot sample) has no decode score from v0.8.0 on: decode is unmeasured, never the greedy score.
 
 Every greedy request names the penalties too, at their neutral values (presence and frequency 0,
 repetition 1), where the engine applies them: a served default such as a model card's presence penalty
@@ -491,8 +503,12 @@ long-context) are priced at the fastest 16-bit prompt activations (BF16 or FP16 
 they are priced at the fastest prompt arithmetic that mode admits on the quantized matrices, the stored format's
 own, FP8 or 16-bit (`headroom.MODE_ACTIVATIONS`), or a faster one quality shows passing, so the speed mode never
 prices below `preserve`. On a device with the stored format's tensor cores that is the stored format; on one without
-4-bit tensor cores, FP8 for an NVFP4 checkpoint's 4-bit matrices. A checkpoint that stores no FP8 or NVFP4 matrices
-is priced at its stored format in both modes. Goals and `kpis` carry the mode's limits
+4-bit tensor cores, FP8 for an NVFP4 checkpoint's 4-bit matrices. The speed mode's starting arithmetic holds every
+target matrix in 8 bits, so its limits also price the matrices a checkpoint stores in 16 bits re-encoded to FP8
+(W8A8 at the FP8 rate: the `+w8` ceilings, `stored+w8` alone for a checkpoint with no quantized matrices), which no
+quality evidence judges; `preserve` prices them as stored. In `speed` a decode pass that reads more than the model
+files' pass with every 16-bit matrix in 8 bits is a decode gap of its own (`headroom.speed_weights`: each round's
+pass scaled by those bytes, reported, not judged; the result keeps those bytes as `headroom.speed_pass_bytes`). Goals and `kpis` carry the mode's limits
 (`stored_ceiling` and `stored_floor_ms` keep the stored format's), and status names the mode and, in `preserve`,
 the limits `speed` would price for the result (`kpis.prefill.speed_trade`, when above preserve's), once. The engine
 scores the same ids through crit serve's score call (`chat-score-v1`): every prompt position and the
@@ -791,7 +807,8 @@ from the one before it).
 Korean, Russian, Arabic, Hindi, German and Spanish prose, Rust code and SQL. No engine choice may
 be tuned or selected on them ([AGENTS.md](https://github.com/crit-labs/crit/blob/main/AGENTS.md)). After the speed cases (in a
 staged run, stage 1's, so every candidate's first Eval measures them), each, cut to the length the run draws for it ([prompt-length jitter](#prompt-length-jitter)), decodes
-its own greedy output (64 tokens, once; until v0.4 256 tokens, twice: over 23 Qwen3.8-27B results the held-out
+a sampled reply at the prepared sampling, repetition r at seed r + 1 (from v0.8.0; before, its own greedy output),
+64 tokens, once (until v0.4 256 tokens, twice: over 23 Qwen3.8-27B results the held-out
 score from the first 64 tokens' acceptance came within 1.4% of the 256-token one); crit-eval reports per-prompt
 decode tok/s and tokens per round and the **held-out decode score**, their geometric mean (`--only heldout` runs
 just this).
@@ -863,7 +880,12 @@ A **level** of N clients is one closed loop: the clients start together and each
 previous reply has ended, 4 requests per client. Client c's r-th request is prompt (c + r) mod the pool's size, so a
 client never repeats a prompt and clients at the same step send different ones while there are enough. The pool is
 the speed cases with prompts of at most 2,048 tokens, then the held-out prompts, each as its frozen chat messages;
-every request is greedy and 128 tokens long, and the server prefills each one (a reply with cached prompt tokens
+every request is 128 tokens long, and the server prefills each one. Each level runs twice (from v0.8.0): greedy,
+whose replies the consistency gate compares with the serial ones and which shows whether the requests ran together,
+then sampled at the prepared sampling, each prompt at its own seed (its pool position + 1, the same at every level),
+which gives every speed figure below (aggregate, first tokens, decode, ceiling fraction, speedup); the greedy
+aggregate stays beside them as `greedy`, comparison only, and an engine that cannot sample has them unmeasured
+(`sampled_missing`) (a reply with cached prompt tokens
 fails, as in the speed part). The levels are N = 1, 2, 4, 8, 16, 32 and 64, up to the server's capacity and while N x
 (the longest pool prompt + 128) fits the required context, the KV the requests hold at once.
 
@@ -873,7 +895,7 @@ fails, as in the speed part). The levels are N = 1, 2, 4, 8, 16, 32 and 64, up t
 | `peak_concurrency` | The requests in flight at once at the peak, as the clients see them |
 | `streaming_peak`, `ran_together` | The replies streaming at once at the peak (their first and last tokens' intervals overlapping), and whether that is two or more (null: each reply in one chunk, or one client) |
 | `ttft_ms_p50`, `ttft_ms_p95`, `decode_tps_p50` | Per request: time to its first reply text, and its tokens after the first over the time from first to last |
-| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply from the speed part, as far as both go: the share that match and each differing reply's first different token (with its `fork` in quality mode `speed`, [judged](#forks-in-quality-mode-speed) on the engine). A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/core/src/batch/README.md#batch-invariance)) |
+| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply from the speed part, as far as both go: the share that match and each differing reply's first different token (with its `fork` in quality mode `speed`, [judged](#forks-in-quality-mode-speed) on the engine). A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/inference/core/src/batch/README.md#batch-invariance)) |
 | `ceiling`, `fraction_of_ceiling` | The aggregate against the batched ceiling below |
 | `speedup`, `expected_speedup`, `fraction_of_expected`, `expected_missing` | The aggregate over one client's, the cost model's at the run's single-stream hit rate, the share of it reached, and why there is none |
 

@@ -17,8 +17,11 @@ The model's own forward drives every pass, so whatever its text model does befor
 layers (embedding scales, repeated residual streams, per-layer inputs, position ids, masks, a final norm or mixer)
 is its own code. A pass first records the arguments the forward hands each decoder layer, without running it; then
 each layer is loaded once and run for every sequence; finally the forward runs again with the last layer's output,
-so its own tail produces the hidden states the head scores. The forward must hand each layer the previous layer's
-output unchanged (checked). Mixture-of-experts layers use transformers' eager experts loop.
+so its own tail produces the hidden states the head scores. That needs a forward that calls each decoder layer once,
+in order, on the previous layer's output (checked, on a two-token probe). A forward that does not (a span of layers
+run again, its block states mixed into later layers' inputs) drives every text itself instead, in chunks that resume
+the cache it builds, each decoder layer loaded when it is called and kept while the device has room (CALLED_FREE_SHARE);
+the identity records it (layers: called). Mixture-of-experts layers use transformers' eager experts loop.
 
 A text runs in chunks of PROMPT_CHUNK tokens that resume the transformers Cache the forward builds, kept per decoder
 layer in FP32 scratch files (PromptState) until the text is scored. All chunks run layer-major (_layer_major): each
@@ -58,6 +61,7 @@ along the output rows) quantize each expert matrix's input with that matrix's ow
 matrix with declared activations that the modeling code multiplies any other way is refused rather than left exact.
 """
 import math
+import os
 import re
 import time
 from contextlib import contextmanager
@@ -81,6 +85,27 @@ REFERENCE_VERSION = 3
 GATHERABLE = (None, "fp8", "nvfp4")
 # Positions a fixed text scores through the head at once (a full row of logits per position, in FP64).
 SCORE_ROWS = 512
+# The share of the device's memory kept free when a forward that calls its layers out of order
+# (StreamingReference._called_texts) loads another layer: below it, the layers called longest ago are released first.
+# What a chunk of such a text takes beside the layers (its activations, the forward's own per-chunk tensors) lives in
+# that margin, so the chunk is sized from it (called_chunk).
+CALLED_FREE_SHARE = 0.2
+
+
+def _host_memory():
+    """The host's physical memory in bytes: sysconf where the platform has it, GlobalMemoryStatusEx on Windows."""
+    if hasattr(os, "sysconf"):
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+    import ctypes
+
+    class Status(ctypes.Structure):
+        _fields_ = [("length", ctypes.c_ulong), ("load", ctypes.c_ulong), ("total", ctypes.c_ulonglong),
+                    ("available", ctypes.c_ulonglong), ("page_total", ctypes.c_ulonglong),
+                    ("page_available", ctypes.c_ulonglong), ("virtual_total", ctypes.c_ulonglong),
+                    ("virtual_available", ctypes.c_ulonglong), ("extended", ctypes.c_ulonglong)]
+    status = Status(length=ctypes.sizeof(Status))
+    ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+    return int(status.total)
 # What a forward that cannot resume a stored cache raises.
 RESUME_ERRORS = (RuntimeError, NotImplementedError, TypeError, ValueError, AttributeError)
 
@@ -283,6 +308,10 @@ def _quantize_fused_inputs(module, fused):
     module.forward = quantized
 
 
+class _NotChained(SchemeError):
+    """The model's forward calls its decoder layers other than once each, in order, on the previous layer's output."""
+
+
 class _Captured(Exception):
     """Raised by the last decoder layer's stand-in once a forward has handed every layer its arguments."""
 
@@ -349,9 +378,11 @@ class StreamingReference:
 
     def _conversions(self):
         """({parameter name: (converter, {source pattern: [(base, stored key), ...]})}, {base: [stored keys]}): the
-        checkpoint's matrices that transformers' conversion mapping for the model type turns into a parameter of
+        checkpoint's tensors that transformers' conversion mapping for the model type turns into a parameter of
         another name or shape (only for checkpoints keyed by Hugging Face names; a GGUF is presented in the
-        modeling code's layout already)."""
+        modeling code's layout already). A matrix is matched under its .weight name in any stored layout and
+        decoded; any other stored tensor that is no matrix's companion (base == stored key) as stored, as
+        transformers' loader matches it."""
         if not isinstance(self.checkpoint, TensorCheckpoint):
             return {}, {}
         members = {}
@@ -365,12 +396,16 @@ class StreamingReference:
         found = {}
         if not converters:
             return found, members
+        matrices = {key[: -len(s)] for key in self.checkpoint.where for s in PRIMARY if key.endswith(s)}
         for key in self.checkpoint.where:
             suffix = next((s for s in PRIMARY if key.endswith(s)), None)
-            if suffix is None:
-                continue
-            base = key[: -len(suffix)]
-            renamed, pattern = rename_source_key(base + ".weight", renamings, converters,
+            if suffix is not None:
+                base, source = key[: -len(suffix)], key[: -len(suffix)] + ".weight"
+            elif key.rsplit(".", 1)[0] in matrices:
+                continue   # a matrix's scales and the like: decoded with it
+            else:
+                base = source = key
+            renamed, pattern = rename_source_key(source, renamings, converters,
                                                  self.skeleton.base_model_prefix, self.names)
             if pattern is None or renamed not in self.names:
                 continue
@@ -419,7 +454,8 @@ class StreamingReference:
         converter, parts = self.converted[name]
         target = self._target(name)
         joined = target in self.members
-        inputs = {pattern: [self.checkpoint.raw(key).to(device) if joined else self.checkpoint.dense(base, device)
+        inputs = {pattern: [self.checkpoint.raw(key).to(device) if joined or base == key
+                            else self.checkpoint.dense(base, device)
                             for base, key in sources] for pattern, sources in parts.items()}
         for operation in converter.operations:
             inputs = operation.convert(inputs, source_patterns=converter.source_patterns,
@@ -462,7 +498,7 @@ class StreamingReference:
             tensor = self._convert(name, self.device)
         else:
             key = self._key(name)
-            if name.rsplit(".", 1)[-1] == "weight":
+            if name.rsplit(".", 1)[-1] == "weight" and key.endswith(".weight"):   # a matrix in any stored layout
                 tensor = self.checkpoint.dense(key[: -len(".weight")], self.device)
             elif self.checkpoint.has(key) or isinstance(value, self.torch.nn.Parameter):
                 tensor = self.checkpoint.raw(key).to(self.device)
@@ -895,9 +931,9 @@ class StreamingReference:
         def stand_in(i):
             def forward(*args, **kwargs):
                 slot, hidden = _hidden(args, kwargs)
-                if i >= count or (i and (calls[i - 1] is None or hidden is not handed[-1])):
-                    raise SchemeError("the model's forward does not hand each decoder layer the previous layer's "
-                                      "output; the layer-streamed reference cannot drive it")
+                if i >= count or i != len(handed) or (i and hidden is not handed[-1]):
+                    raise _NotChained(f"the model's forward calls decoder layer {i} after {len(handed)} calls, not "
+                                      f"each layer once in order on the previous layer's output")
                 calls[i] = (args, kwargs, slot)
                 handed.append(hidden)
                 if i == count - 1:
@@ -917,6 +953,123 @@ class StreamingReference:
         out = self._forward(ids, lambda i: lambda *args, **kwargs: final if i == last else _hidden(args, kwargs)[1])
         return out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
 
+    def chained(self):
+        """Whether the model's forward calls each decoder layer once, in order, on the previous layer's output, as
+        the layer-streamed orders need (probed once, on a two-token text, with the outer modules loaded)."""
+        if getattr(self, "chain", None) is None:
+            with self.torch.no_grad():
+                self._load_outer()
+                self._implementation("eager")
+                try:
+                    self._capture([0, 1])
+                    self.chain = True
+                except _NotChained:
+                    self.chain = False
+        return self.chain
+
+    def _called_margin(self):
+        """The device bytes _called_texts keeps free: CALLED_FREE_SHARE of the device's memory (the host's on a CPU)."""
+        torch = self.torch
+        if str(self.device).startswith("cuda"):
+            total = torch.cuda.mem_get_info(self.device)[1]
+        else:
+            total = _host_memory()
+        return int(total * CALLED_FREE_SHARE)
+
+    def _called_chunk(self, chunk, length, margin):
+        """The tokens a chunk of a `length`-token text takes in _called_texts: at most `chunk`, and few enough that the
+        forward's tensors that grow with chunk x length (an eager attention's FP32 scores and their softmax over every
+        head) fit the free margin, a power of two of at least 16."""
+        heads = int(getattr(self.config, "num_attention_heads", 0) or 1)
+        fits = max(1, margin // max(1, 2 * 4 * heads * length))   # scores and probabilities, FP32 each
+        size = 1 << max(4, fits.bit_length() - 1)
+        return max(16, min(chunk, size))
+
+    def _called_texts(self, texts, chunk, long, log, check):
+        """Each text through the model's own forward in chunks of at most `chunk` tokens that resume the cache it
+        builds (on the device), every decoder layer loaded when the forward calls it and kept while room stays free:
+        the margin (_called_margin), or 1.5 times the chunk before's peak over the memory it started with where that
+        is more, made before each chunk and at each load (released first: the layer whose next call is furthest away
+        in the order each chunk calls them, as the first chunk recorded it; a looped span longer than the resident
+        layers missed on every call when the layer called longest ago went first), each chunk as large as the margin
+        holds its tensors (_called_chunk). Returns per text (its chunks' ids, their final hidden states [1][n][hidden]
+        on the CPU: the forward's own output, its tail included)."""
+        torch = self.torch
+        resident = {}   # layer index -> the loaded layer
+        margin = self._called_margin()
+        room = [margin]   # the bytes kept free: the margin, or what the chunk before took beyond its start
+        cuda = str(self.device).startswith("cuda")
+        order, at = [], [0]   # the layers a chunk calls, in order (the first chunk's), and the call under way
+
+        def furthest():
+            """The resident layer called next last (never again in a chunk: first), from call at[0] on."""
+            if not order:
+                return next(iter(resident))
+            n = len(order)
+
+            def distance(index):
+                return next((d for d in range(1, n + 1) if order[(at[0] + d) % n] == index), n + 1)
+            return max(resident, key=distance)
+
+        def free():
+            return torch.cuda.mem_get_info(self.device)[0] if str(self.device).startswith("cuda") else 1 << 62
+
+        def release(index):
+            layer = resident.pop(index)
+            self._release(layer)
+            layer.to("meta")
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        def stand_in(i):
+            def forward(*args, **kwargs):
+                check()
+                if recording[0]:
+                    order.append(i)
+                elif order and order[at[0] % len(order)] != i:   # this chunk calls them otherwise: forget the order
+                    order.clear()
+                layer = resident.pop(i, None)
+                if layer is None:
+                    while resident and free() < room[0]:
+                        release(furthest())
+                    layer = self.layer(i)
+                resident[i] = layer
+                at[0] += 1
+                return type(layer).forward(layer, *args, **kwargs)   # its own forward, not the stand-in
+            return forward
+
+        outputs, recording = [], [True]
+        try:
+            for t, ids in enumerate(texts):
+                started, pieces, cache = time.time(), [], None
+                self._implementation(self.chunked if t in long else "eager")
+                size = self._called_chunk(chunk, len(ids), margin)
+                cut = [ids[c:c + size] for c in range(0, len(ids), size)]
+                for piece in cut:
+                    check()
+                    at[0] = 0
+                    while resident and free() < room[0]:
+                        release(furthest())
+                    if cuda:
+                        torch.cuda.reset_peak_memory_stats(self.device)
+                        before = torch.cuda.memory_allocated(self.device)
+                    out = self._forward(piece, stand_in, cache, use_cache=True)
+                    recording[0] = False
+                    if cuda:   # its peak over its start, the layers it loaded included (the safe side)
+                        room[0] = max(margin, int(1.5 * (torch.cuda.max_memory_allocated(self.device) - before)))
+                    cache = getattr(out, "past_key_values", None) or getattr(out, "cache", None)
+                    hidden = out.last_hidden_state if hasattr(out, "last_hidden_state") else out[0]
+                    pieces.append(hidden.to("cpu"))
+                    del out
+                outputs.append((cut, pieces))
+                del cache
+                log(f"texts called: text {t + 1}/{len(texts)} ({len(ids):,} tokens) {time.time() - started:.1f}s, "
+                    f"{len(resident)} layers resident")
+        finally:
+            while resident:
+                release(next(iter(resident)))
+        return outputs
+
     def identity(self, model_sha):
         """What the prompt states and scores the reference stores depend on besides their ids."""
         import transformers
@@ -924,6 +1077,7 @@ class StreamingReference:
         return {"reference": REFERENCE_VERSION, "transformers": transformers.__version__,
                 "torch": self.torch.__version__, "device": device, "model_sha256": model_sha,
                 **({"activations": "declared"} if self.declared else {}),
+                **({} if self.chained() else {"layers": "called"}),
                 **({"forms": [f"{name}@{FORM_VERSIONS.get(name, 1)}" for name in self.forms]} if self.forms else {}),
                 # Only attention with sinks runs its long texts otherwise (chunked_sink_attention).
                 **({"long_attention": self.chunked} if self.chunked != CHUNKED else {})}
@@ -1180,6 +1334,13 @@ class StreamingReference:
         outputs, unsafe = None, None
         with torch.no_grad():
             self._load_outer()
+            if not self.chained():
+                log("reference: the forward does not call each decoder layer once in order; each text runs through "
+                    "it, its layers loaded as it calls them")
+                outputs = self._called_texts(texts, chunk, long, log, check)
+                head, cap = self._head(valid_vocab)
+                return [self._text_rows(ids, cut, hidden, head, cap, top_k, t in long, tail=False)
+                        for t, (ids, (cut, hidden)) in enumerate(zip(texts, outputs))]
             try:
                 prompts, jobs, paged = [], [], {}
                 sharing = _shared_chunks(chunks, long) if self.share_prefixes else [(None, 0)] * len(texts)
@@ -1242,15 +1403,16 @@ class StreamingReference:
         self.head_inputs = self._activations(base) if self.declared else None
         return head, getattr(self.config, "final_logit_softcapping", None)
 
-    def _text_rows(self, ids, pieces, outputs, head, cap, top_k, long):
+    def _text_rows(self, ids, pieces, outputs, head, cap, top_k, long, tail=True):
         """score_texts' rows of one text from its pieces' (consecutive chunks of ids) last layer outputs, through the
-        model's tail and head, SCORE_ROWS positions at a time."""
+        model's tail (tail; else outputs are the forward's final hidden states) and head, SCORE_ROWS positions at a
+        time."""
         torch = self.torch
         targets, tops, values = [], [], []
         start = 0
         for piece, out in zip(pieces, outputs):
             self._implementation(self.chunked if long else "eager")
-            hidden = self._tail(piece, out.to(self.device))[0]
+            hidden = (self._tail(piece, out.to(self.device)) if tail else out.to(self.device))[0]
             following = torch.tensor(ids[start + 1:start + len(piece) + 1], device=self.device)
             for row in range(0, len(following), SCORE_ROWS):
                 rows = hidden[row:row + SCORE_ROWS][:len(following) - row]

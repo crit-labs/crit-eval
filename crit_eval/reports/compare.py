@@ -61,7 +61,9 @@ def compare(paths):
             rows.append(("**Sampled decode score** (geomean tok/s)",
                          [_fmt((r.get("sampled_speed") or {}).get("decode_score"), ".1f") for r in results]))
             rows.append(("Sampling", [_sampling(r.get("sampled_speed") or {}) for r in results]))
-        rows.append(("**Decode score** (greedy, geomean tok/s)", [_fmt(r.get("speed", {}).get("decode_score"), ".1f") for r in results]))
+        # A greedy decode is a comparison (the same text on each engine), never a speed: decode speed is the sampled row.
+        rows.append(("Greedy decode (comparison only, not a speed; geomean tok/s)",
+                     [_fmt(r.get("speed", {}).get("decode_score"), ".1f") for r in results]))
         cells = []
         for r in results:
             p = (r.get("headroom") or {}).get("prefill") or {}

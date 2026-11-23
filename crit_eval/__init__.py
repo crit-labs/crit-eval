@@ -18,7 +18,7 @@ if _registry is not None:
 # The package holds its suite, protocol, probes and examples; a checkout of crit-eval is its parent.
 EVAL_DIR = Path(__file__).resolve().parent
 SUITE_DIR = EVAL_DIR / "suite"
-__version__ = "0.7.3"
+__version__ = "0.8.1"
 CONTRACT = "eval-v1"
 PROTOCOL_ID = re.compile(r"crit-eval-v(\d+)\.(\d+)\.(\d+)")
 # The ids before crit-eval had its own repository (crit-eval-v4, crit-eval-v4.1, ... crit-eval-v8): major and minor.
@@ -35,6 +35,13 @@ def protocol_version(identifier):
     if match:
         return -1, int(match[1]), int(match[2] or 0)
     raise ValueError(f"not a crit-eval protocol id: {identifier}")
+
+
+def prefill_cases(protocol, unmeasurable=None):
+    """The protocol's prefill cases a run scores prefill over: its speed.prefill_cases but those the prepared data
+    records as not measurable for the model (unmeasurable: {case id: why}, prepare's speed_unmeasurable)."""
+    skip = unmeasurable or {}
+    return [case for case in protocol["speed"].get("prefill_cases", []) if case not in skip]
 
 
 def protocol_series(identifier):

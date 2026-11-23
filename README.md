@@ -38,7 +38,8 @@
 ## Quick start
 
 ```sh
-python -m pip install "crit-core @ git+https://github.com/crit-labs/crit#subdirectory=core/python"
+python -m pip install "crit-core @ git+https://github.com/crit-labs/crit#subdirectory=inference/core/python"
+python -m pip install "crit-models @ git+https://github.com/crit-labs/crit#subdirectory=models/core/python"
 python -m pip install "crit-eval[reference] @ git+https://github.com/crit-labs/crit-eval"
 ```
 
@@ -86,8 +87,8 @@ with `--package DIR`, through Core's own adapter; another engine without a serve
 
 | KPI or record | In the result | What it records |
 | --- | --- | --- |
-| **decode_greedy** | `status.kpis.decode_greedy` | Greedy decode tokens per second over six workloads (chat, code, math, tool calls, a long document, a 14K-token agent session), one repetition per case and more only when it disagrees with its warmup; run-to-run noise from the cases measured more than once |
-| **decode_sampled** | `status.kpis.decode_sampled` | Decode tokens per second at the model's own sampling, the headline decode, and tokens per round for speculative engines; one seed per case (`--adaptive-sampled` repeats a case at further seeds, up to 9, until its standard error is within 3%), and each case's error is reported when it has more than one |
+| **decode_sampled** | `status.kpis.decode_sampled` | Decode tokens per second at the model's own sampling, the decode speed, and tokens per round for speculative engines; one seed per case (`--adaptive-sampled` repeats a case at further seeds, up to 9, until its standard error is within 3%), and each case's error is reported when it has more than one. Without a sampled suite (an engine that cannot sample, a run that skipped it) it is null and decode is unmeasured |
+| decode_greedy | `status.kpis.decode_greedy` | Greedy decode over the same six workloads (chat, code, math, tool calls, a long document, a 14K-token agent session), the text exactness and the repeat checks compare; labelled `comparison_only`: a greedy decode is never a speed and sets no goal |
 | **prefill** | `status.kpis.prefill` | Prompt tokens per second on the two long prompts |
 | **ttft** | `status.kpis.ttft` | Milliseconds to the first token over every workload |
 | **long-context decode and ttft** | `status.kpis.context` | The same scores along a curve of prompts up to the required context (200,000 tokens by default; the required context itself on a certified run) |

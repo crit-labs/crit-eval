@@ -4,7 +4,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .. import CONTRACT, EVAL_DIR, __version__, load_json, machine_settings, portable_path, write_json
+from .. import CONTRACT, EVAL_DIR, __version__, load_json, machine_settings, portable_path, write_json, prefill_cases
 from ..quality import fixed
 from ..limits import headroom
 from . import energy, host, journal
@@ -15,7 +15,8 @@ from .chat import Server
 from .concurrency import run_concurrency
 from .deadline import Hung, RequestDeadline
 from .estimate import estimate, summary as estimate_summary
-from ..limits.context import GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes, placement, weight_split
+from ..limits.context import (GIB, draft_step_bytes, interpolated_curve, link_gbs, pass_bytes, placement,
+                              speed_pass_bytes, weight_split)
 from ..limits.tiers import derive as derive_tiers, telemetry_counts
 from ..limits import devices as device_set
 from .pin import load_continuations
@@ -26,7 +27,8 @@ from .forks import judge_forks
 from .history import compare_followup, compare_history, history_cases, history_outputs, run_followup
 from .jitter import new_seed, record as jitter_record
 from .tracks import closed as closed_track, engine_loads, mode_budgets
-from .long_context import compare_lower, context_requirement, run_context, run_lower_context, run_retrieval
+from .long_context import (compare_lower, context_requirement, run_context, run_lower_context, run_required_again,
+                           run_retrieval)
 from .quality_checks import (merge_honesty, merge_quality, quality_thresholds, reference_origin, run_attribution,
                              run_honesty, run_quality, stored_spread)
 from .speed import (drafts, run_exactness, run_heldout, run_sampled_speed, run_sampling_check, run_speed,
@@ -136,6 +138,10 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         raise SystemExit(f"exactness must be one of {', '.join(EXACTNESS_MODES)}")
     prepared = load_json(Path(data) / PREPARED)
     check_prepared(prepared, protocol, data)
+    # Speed cases the model cannot run (prepare's speed_unmeasurable): prefill is scored over the prefill cases left
+    unmeasurable = prepared.get("speed_unmeasurable") or {}
+    if unmeasurable:
+        protocol = {**protocol, "speed": {**protocol["speed"], "prefill_cases": prefill_cases(protocol, unmeasurable)}}
     check_template(prepared, model, data, chat_template)
     device = device or {}
     if device_set.indices(device):
@@ -196,6 +202,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
         "contract": CONTRACT, "protocol": protocol["protocol"], "profile": profile, "label": label,
+        "speed_unmeasurable": unmeasurable,
         "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
         "crit_eval_version": __version__,
         "model_sha256": prepared["model"]["sha256"], "suite_sha256": prepared["suite_sha256"],
@@ -581,6 +588,10 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 # other parts had warmed it, the lower context's is freshly opened.
                 lower = run_lower_context(module, model, config, prepared, protocol, required, 1, 1, log,
                                           continuations, disturbed, exact_prompts="quality" in parts)
+                if "speed" in lower:   # the requirement again, the same way and under the same device state
+                    lower["required_again"] = run_required_again(module, model, config, prepared, protocol,
+                                                                 required, 1, 1, log, continuations, disturbed,
+                                                                 exact_prompts="quality" in parts)
     elif staged is not None and "context" in parts and "speed" in parts and required:
         lower = {"context": None, "passed": None, "reason": plan["lower_reason"]}
     measured_memory = {k: v for k, v in memory.items() if v and v.get("free_bytes") is not None}
@@ -622,8 +633,16 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 result["exactness"] = run_exactness(module, model, config, prepared, result["speed"], log,
                                                     exactness, context_tokens=required)
     if lower is not None and "speed" in lower:
-        result["context"]["lower"] = {**compare_lower(result["speed"], lower["speed"], lower["context"], settings),
-                                      "engine_max_context": lower["engine_max_context"]}
+        first = compare_lower(result["speed"], lower["speed"], lower["context"], settings)
+        again = lower.get("required_again")
+        if again:   # judged against the requirement measured right after it; the first measurement's comparison kept
+            result["context"]["lower"] = {
+                **compare_lower(again, lower["speed"], lower["context"], settings),
+                "engine_max_context": lower["engine_max_context"],
+                "against": "the required context measured again right after the lower context, the same way",
+                "against_first_measurement": first}
+        else:
+            result["context"]["lower"] = {**first, "engine_max_context": lower["engine_max_context"]}
         for case_id, kinds in result["context"]["lower"]["slower"].items():
             log(f"lower context: {case_id} is slower at {lower['context']:,} tokens ({', '.join(kinds)})")
     elif lower is not None:
@@ -641,8 +660,10 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         element = float(settings["kv_bytes_per_element"])
         try:
             stored = pass_bytes(model, element)
+            # protocol headroom.speed_weights: quality mode speed's pass, every 16-bit matrix in 8 bits.
+            speed_pass = speed_pass_bytes(model, element) if headroom.quality_mode(result) == "speed" else None
         except (OSError, ValueError, KeyError):
-            stored = None
+            stored = speed_pass = None
         if not facts.get("bytes_per_pass"):
             facts["bytes_per_pass"] = stored
             source = "model files" if facts["bytes_per_pass"] else None
@@ -673,7 +694,8 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                                                 decode_speed=decode_speed, decode_name=decode_name,
                                                 host_rates={"link": link_gbs(device),
                                                             "memory": ((device or {}).get("host_memory_gbs") or {}).get("read")},
-                                                model_pass=model_pass, tiers=tiers, telemetry=result.get("telemetry"))
+                                                model_pass=model_pass, tiers=tiers, telemetry=result.get("telemetry"),
+                                                speed_pass=speed_pass)
         # An engine whose weights cannot all be on the device: priced by the placement's tiers when it declares no host
         # bytes, and asked for them only when Eval cannot place the model.
         try:

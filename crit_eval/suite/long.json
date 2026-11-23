@@ -17,22 +17,22 @@
   },
   "retrieval": {
     "system": "Follow the user's request carefully. When asked for identifiers, copy them exactly.",
-    "user": "Read this archive. It contains the secret identifiers of three stations; remember them.\n\n{document}\n\nList the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
-    "curve_user": "Read this archive. It contains the secret identifiers of three stations; remember them.\n\n{document}\n\nList the exact secret identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier. Then summarize the archive in detail, part by part.",
+    "user": "Read this archive. It contains the identifiers of three stations; remember them.\n\n{document}\n\nList the exact identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier.",
+    "curve_user": "Read this archive. It contains the identifiers of three stations; remember them.\n\n{document}\n\nList the exact identifiers of stations ALPHA, BETA and GAMMA, one per line, as STATION: identifier. Then summarize the archive in detail, part by part.",
     "facts": [
       {
         "id": "start",
-        "text": "The secret identifier for station ALPHA is juniper-482719.",
+        "text": "The identifier for station ALPHA is juniper-482719.",
         "answer": "juniper-482719"
       },
       {
         "id": "middle",
-        "text": "The secret identifier for station BETA is cobalt-935126.",
+        "text": "The identifier for station BETA is cobalt-935126.",
         "answer": "cobalt-935126"
       },
       {
         "id": "end",
-        "text": "The secret identifier for station GAMMA is amber-671843.",
+        "text": "The identifier for station GAMMA is amber-671843.",
         "answer": "amber-671843"
       }
     ]

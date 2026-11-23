@@ -4,16 +4,19 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.7.3"
+version = "0.8.1"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
-# crit-core 0.21.0 on: the probe's placement reads ModelConfig.routed_layers().
-# From 0.17.0 on: --package measures a crit engine package through Core's eval-v1 adapter, which it ships.
-# No upper bound: crit pins the crit-eval it ships with, so a new crit-core release needs no crit-eval release.
-dependencies = ["crit-core>=0.21.0"]
+# crit-core and crit-models at the versions crit's checkout declares: this crit-eval needs Core's eval adapter
+# cohort with per-request sampling (the sampled concurrency runs) and a decoder's mechanisms in crit-models (layer
+# kinds, routed layers, the KV a token adds, the fixed state, which the limits read beside Core's generic fields),
+# neither in a released crit-core. At a release both lower bounds are the release's version (crit-models first ships
+# with it). No upper bound: crit pins the crit-eval it ships with, so a new crit-core release needs no crit-eval
+# release.
+dependencies = ["crit-core>=0.23.0", "crit-models>=0.23.0"]
 
 [project.optional-dependencies]
 # The reference scores the quality texts on the checkpoint itself (crit-eval reference).

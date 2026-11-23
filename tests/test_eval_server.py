@@ -63,6 +63,8 @@ def write_data(directory):
     speed = [("chat", CHAT, None), ("tool-call", AGENT, TOOLS)]
     prepared = {"protocol": protocol["protocol"], "suite_sha256": prepare.suite_identity(), "model": {"sha256": "model"},
                 "stop_ids": [], "valid_vocab": 1 << 16,
+                # The sampled suite's, the held-out prompts', the curve's and the concurrency levels' sampling.
+                "sampling": {"temperature": 1.0}, "sampling_source": "protocol_default",
                 "speed": [{"id": i, "kind": i, "prompt_ids": ids(m, t), "messages": prepare.api_messages(m), "tools": t,
                            "output_tokens": 12} for i, m, t in speed],
                 "heldout": [{"id": "de", "language": "German", "kind": "prose", "prompt_ids": ids(HELDOUT),
@@ -280,9 +282,13 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(result["heldout"]["prompts"]["de"]["status"], "measured")
         self.assertTrue(result["history"]["passed"])
         sent = self.server.requests
+        # Greedy requests for the speed suite and the history, sampled ones for the sampled suite and the held-out
+        # prompts (decode speed is sampled decode).
         self.assertEqual({(r["model"], r["temperature"], r["max_tokens"], r["stream"]) for r in sent},
-                         {("fake", 0, 12, True)})
-        # Greedy requests name the penalties neutral, so no served default changes them.
+                         {("fake", 0, 12, True), ("fake", 1.0, 12, True)})
+        held = [r for r in sent if r["messages"][-1]["content"] == HELDOUT[-1]["content"]]
+        self.assertEqual({(r["temperature"], r.get("seed")) for r in held}, {(1.0, 1)})
+        # Every request names the penalties neutral, so no served default changes them.
         self.assertEqual({(r["presence_penalty"], r["frequency_penalty"], r["repetition_penalty"]) for r in sent},
                          {(0.0, 0.0, 1.0)})
         agent = next(r for r in sent if r.get("tools"))
@@ -448,7 +454,12 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(result["context"]["lower"]["reason"], "a served engine cannot be opened at a lower context")
         # The curve's point asks for the facts and a summary of the archive that holds them, and the retrieval
         # verdict comes from that one request.
-        (curve,) = [r for r in self.server.requests if r["messages"][-1]["content"].endswith("then summarize.")]
+        # Then one sampled request on the same prompt times the point's decode.
+        curve, drawn = [r for r in self.server.requests if r["messages"][-1]["content"].endswith("then summarize.")]
+        self.assertEqual((curve["temperature"], drawn["temperature"], drawn["seed"]), (0, 1.0, 1))
+        self.assertEqual(drawn["messages"], curve["messages"])
+        self.assertEqual(point["greedy"]["comparison_only"], "greedy decode: comparison only, never a speed")
+        self.assertIsNotNone(point["sampled_sample"]["decode_tps"])
         self.assertIn("\n\ntides\n\n", curve["messages"][-1]["content"])
         self.assertTrue(curve["messages"][-1]["content"].startswith("Filler text. Filler"))
         self.assertEqual(len(ids(curve["messages"])), 4096 - 256)
@@ -531,7 +542,8 @@ class ChatServerTests(unittest.TestCase):
         self.server.stream_logprobs = True
         result = self.run_eval(("quality", "context"), repetitions=1)
         curve = [r for r in self.server.requests if r.get("messages") and r["messages"][-1]["content"].endswith("then summarize.")]
-        self.assertEqual([(r.get("logprobs"), r.get("top_logprobs")) for r in curve], [(True, 16)])
+        # The greedy request asks for them; the sampled one that times the point's decode does not.
+        self.assertEqual([(r.get("logprobs"), r.get("top_logprobs")) for r in curve], [(True, 16), (None, None)])
         honesty = result["quality"]["honesty"]
         self.assertEqual([r["id"] for r in honesty["replies"]], ["tides", "curve@4096"])
         self.assertEqual((honesty["passed"], result["quality"]["passed"]), (True, True))
@@ -542,7 +554,7 @@ class ChatServerTests(unittest.TestCase):
         self.server.requests.clear()
         self.run_eval(("speed", "context"), repetitions=1)
         curve = [r for r in self.server.requests if r.get("messages") and r["messages"][-1]["content"].endswith("then summarize.")]
-        self.assertEqual([r.get("logprobs") for r in curve], [None])
+        self.assertEqual([r.get("logprobs") for r in curve], [None, None])   # the greedy request and the sampled one
 
     def test_a_long_reply_is_scored_after_the_prompt_the_server_rendered(self):
         # A frame's prompt goes to the server as decoded text, which its template may tokenize to other ids (a merge

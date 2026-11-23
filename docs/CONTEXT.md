@@ -64,7 +64,10 @@ unmeasured.
   floors price the set as one device by the faster split of the weights across it
   ([measurements](MEASUREMENTS.md#several-gpus)).
 - **Capacity gate:** `max_context` is at least the requirement and a request filling it completes.
-- **Long-context curve:** after speed and quality, one greedy request per point fills the context,
+- **Long-context curve:** after speed and quality, one greedy request per point fills the context (it times the
+  point's first token and has retrieval judged on its reply), then one sampled request on the same prompt at the
+  prepared sampling (seed 1, servable from a prompt cache) times the point's decode, since decode speed is sampled
+  decode (from v0.8.0; the greedy decode stays beside it as `greedy`, comparison only). The requests fill the context,
   prompt plus 256 output tokens, at powers of two from 32,768 below the requirement, each filling
   the share of its point the run draws ([prompt-length jitter](MEASUREMENTS.md#prompt-length-jitter),
   80-100%, recorded as the point's `filled_context`), and at the requirement, filled exactly. Each prompt is the retrieval check's archive, suite filler text

@@ -500,6 +500,8 @@ PROTOCOLS = {
     "crit-eval-v0.6.0": "0ccc760244b448454b16b5eeafef260de88b7811f6a2ace55b53c3938695a812",  # release 0.6.0: modes preserve and speed
     "crit-eval-v0.7.0": "e13a0225f4998250a485d428b12b228a8dc9699faab3b9e084668b74fdbb0580",  # release 0.7.0: sampled suite in stage 1
     "crit-eval-v0.7.1": "aa0c304e831dbf7368718b7e97b937bbf32567a132a1921ed7816b825d5ff56d",  # releases 0.7.1 to 0.7.3: honesty by exactness, staged steady state
+    "crit-eval-v0.8.0": "64a97ad352f537567fe1b3bc9c593af3a9fa9e73744247f2d1c2b446e664aa6f",  # decode speed is sampled decode only; speed prices 16-bit matrices in 8 bits
+    "crit-eval-v0.8.1": "fb2500d9278bd1e23cf3ad187cd63b378500f3e077d0f4415de0af442fc7df09",  # release 0.8.1: retrieval judges a reasoning model answer after a reasoning budget
 }
 
 
@@ -1052,8 +1054,52 @@ class ActivationCeilingTests(unittest.TestCase):
         other = headroom.activation_ceilings(self.result(), rates, sources, ["long"], [self.result("stored", False, model="x")])
         self.assertIsNone(other["modes"]["stored"]["state"])
         self.assertIn("prompt_activations from the adapter", other["missing"][0])
-        self.assertIsNone(headroom.activation_ceilings({**self.result(), "ceiling": {"matmul_flops_per_token": {"bf16": 1}}},
+        self.assertIsNone(headroom.activation_ceilings({**self.result(), "ceiling": {"matmul_flops_per_token": {}}},
                                                        rates, sources, ["long"]))
+
+    def test_the_speed_mode_prices_16_bit_matrices_in_fp8(self):
+        # A model with 16-bit matrices beside its quantized ones: each ceiling again with those at the FP8 rate (+w8),
+        # which the speed mode admits and preserve does not; a 16-bit model gets the one stored+w8 ceiling.
+        rates, sources = self.RATES, self.SOURCES
+        mixed = {**self.CEILING, "matmul_flops_per_token": {"nvfp4": 1e9, "fp8": 1e9, "bf16": 1e9}}
+        result = {**self.result(), "ceiling": mixed}
+        found = headroom.activation_ceilings(result, rates, sources, ["long"])
+        self.assertEqual(list(found["modes"]), ["bf16", "fp16_acc", "fp8", "stored", "bf16+w8", "fp16_acc+w8",
+                                                "fp8+w8", "stored+w8"])
+        self.assertTrue(found["dense"])
+        ms = lambda *tflops: 10000 * 1e9 * sum(1 / (t * 1e12) for t in tflops) * 1000  # noqa: E731
+        self.assertAlmostEqual(found["modes"]["stored"]["ceiling_score"], 10000 / ms(400, 800, 100) * 1000)
+        self.assertAlmostEqual(found["modes"]["stored+w8"]["ceiling_score"], 10000 / ms(400, 800, 400) * 1000)
+        self.assertEqual(found["modes"]["stored+w8"]["rates"]["bf16"]["rate"], "fp8")
+        self.assertEqual(found["modes"]["stored"]["rates"].get("bf16"), None)   # the quantized matrices' rows alone
+        room = {**result, "headroom": {"activations": found}}
+        speed = headroom.mode_limits({**room, "requirements": {"quality_mode": "speed"}})
+        self.assertEqual(speed["activations"], "stored (16-bit matrices in FP8, W8A8)")
+        self.assertAlmostEqual(speed["prefill"], found["modes"]["stored+w8"]["ceiling_score"])
+        self.assertEqual(headroom.mode_limits({**room, "requirements": {"quality_mode": "preserve"}})["activations"],
+                         "fp16_acc")   # preserve's as before: 16-bit activations, the 16-bit matrices as stored
+        dense = {**self.result(), "ceiling": {**self.CEILING, "matmul_flops_per_token": {"bf16": 1e9}}}
+        found = headroom.activation_ceilings(dense, rates, sources, ["long"])
+        self.assertEqual((list(found["modes"]), found["formats"], found["missing"]), (["stored+w8"], [], []))
+        self.assertAlmostEqual(found["modes"]["stored+w8"]["ceiling_score"], 10000 / ms(400) * 1000)
+        limits = headroom.mode_limits({**dense, "headroom": {"activations": found},
+                                       "requirements": {"quality_mode": "speed"}})
+        self.assertAlmostEqual(limits["prefill"], 10000 / ms(400) * 1000)
+        self.assertIsNone(headroom.mode_limits({**dense, "headroom": {"activations": found},
+                                                "requirements": {"quality_mode": "preserve"}}))
+
+    def test_a_speed_pass_that_reads_16_bit_weights_has_a_decode_gap(self):
+        cases = {"a": {"round_ms": 10.0, "decode_tps": 100.0, "step_ms": 8.0},
+                 "b": {"round_ms": 20.0, "decode_tps": 50.0, "step_ms": 8.0}}
+        score = (100.0 * 50.0) ** 0.5
+        gap, = headroom.speed_weights_gap(cases, score, 2e9, 1.5e9)
+        # Each round's pass at 1.5 / 2 of its time: 10 - 2 and 20 - 2 ms.
+        self.assertAlmostEqual(gap["case_speedup"]["a"], 10 / 8)
+        self.assertAlmostEqual(gap["case_speedup"]["b"], 20 / 18)
+        self.assertAlmostEqual(gap["projected_gain"], (10 / 8 * 20 / 18) ** 0.5 - 1)
+        self.assertEqual(gap["kpi"], "decode")
+        self.assertEqual(headroom.speed_weights_gap(cases, score, 1.51e9, 1.5e9), [])   # within 1%: in 8 bits
+        self.assertEqual(headroom.speed_weights_gap(cases, score, 2e9, None), [])      # not quality mode speed
 
     def test_quality_evidence_counts_only_in_the_mode_it_was_judged_in(self):
         rates, sources = self.RATES, self.SOURCES
@@ -1326,6 +1372,9 @@ class HeldoutTests(unittest.TestCase):
         prompts = prompts or {"zh": heldout, "de": heldout}
         return {**MEASURED, "model_sha256": "m", "suite_sha256": "s", "label": "x",
                 "speed": {"decode_score": suite, "decode_text": {"source": "pinned", "sha256": "t"}, "cases": {}},
+                # Held-out prompts decode sampled: the suite they are set beside is the sampled one.
+                "sampled_speed": {"status": "measured", "decode_score": suite, "sampling": {"temperature": 1.0},
+                                  "cases": {}},
                 "heldout": {"status": "measured", "decode_score": heldout,
                             "prompts": {pid: {"status": "measured", "language": pid, "decode_tps": tps,
                                               "tokens_per_round": 2.0} for pid, tps in prompts.items()}}}
@@ -1799,7 +1848,7 @@ class SampledSpeedTests(unittest.TestCase):
                 [max(result["speed"]["cases"][c]["decode_tps"], s["decode_tps"]) for c, s in sampled["cases"].items()
                  if s["status"] == "measured"]) / sampled["decode_score"])
 
-    def test_without_a_sampled_suite_the_decode_stays_greedy(self):
+    def test_without_a_sampled_suite_decode_is_unmeasured_and_greedy_is_comparison_only(self):
         with tempfile.TemporaryDirectory() as directory:
             data = Path(directory)
             fixture(data)
@@ -1815,9 +1864,11 @@ class SampledSpeedTests(unittest.TestCase):
             self.assertEqual(room["cases"]["short"]["tokens_by_width"], [1.0, 2.0, 3.0, 4.0, 5.0])
             self.assertEqual((kpis["decode_greedy"]["score"], kpis["decode_greedy"]["suite"]),
                              (result["speed"]["decode_score"], "greedy"))
+            self.assertEqual(kpis["decode_greedy"]["comparison_only"], status.GREEDY_COMPARISON_ONLY)
             self.assertIsNone(kpis["decode_sampled"])
             goal = next(g for g in result["status"]["goals"] if g["kpi"] == "decode")
-            self.assertEqual(goal["score"], result["speed"]["decode_score"])
+            self.assertIsNone(goal["score"])
+            self.assertTrue(any(m.startswith("decode speed: no sampled decode") for m in result["status"]["missing"]))
 
     def test_a_sampler_that_favours_likely_tokens_fails_the_sampling_gate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2444,7 +2495,8 @@ class StatusTests(unittest.TestCase):
                 "gaps": [{"kpi": "prefill", "name": "prefill", "projected_gain": 1.8}],
                 "missing": []}
         result = {**MEASURED, "engine": {"speculative": False}, "headroom": room,
-                  "speed": speed_part({"a": {}}, decode_score=220.0, complete=True)}
+                  "speed": speed_part({"a": {}}, decode_score=180.0, complete=True),
+                  "sampled_speed": speed_part({"a": {}}, status="measured", decode_score=220.0, complete=True)}
         current = status.build(result, protocol)
         changes = {goal["kpi"]: round(goal["change"], 3) for goal in current["goals"]}
         self.assertEqual(changes, {"decode": round(250 / 220 - 1, 3), "prefill": 1.8, "ttft": round(200 / 300 - 1, 3)})
@@ -2498,12 +2550,17 @@ class StatusTests(unittest.TestCase):
         quality = {"status": "scored", "passed": True, "sets": {"conversations": {
             "passed": True, "failures": [], "kld_mean": 1e-5, "kld_p99": 1e-4, "ppl_ratio": 1.0, "top1_agreement": 1.0}}}
         result = {**MEASURED, "engine": {"speculative": False}, "headroom": room, "quality": quality,
-                  "speed": speed_part({"a": {}}, decode_score=90.0, complete=True)}
+                  "speed": speed_part({"a": {}}, decode_score=120.0, complete=True),
+                  "sampled_speed": speed_part({"a": {}}, status="measured", decode_score=90.0, complete=True,
+                                              sampling={"temperature": 1.0}, sampling_source="protocol_default")}
         current = status.build(result, protocol)
         self.assertFalse({"verdict", "meaning", "next"} & set(current))
         self.assertEqual(current["gaps"], [{"kpi": "decode", "name": "a term", "projected_gain": 0.1, "noise": None}])
         text = status.render(current)
-        self.assertIn("decode   90.0 tok/s, 90% of its ceiling 100.0", text)
+        self.assertIn("decode   90.0 tok/s at the protocol's default sampling (temperature 1.0), 90% of its ceiling "
+                      "100.0", text)
+        # The greedy suite's decode is shown as a comparison, never as a speed.
+        self.assertIn("greedy   120.0 tok/s at temperature 0, comparison only, never a speed", text)
         self.assertIn("prefill  800 tok/s, 80% of its compute ceiling 1,000", text)
         self.assertNotIn("next step", text)
         self.assertEqual(current["stop_record_headroom"]["kpis"][0], {"kpi": "decode", "start": None, "reached": 90.0,
@@ -2512,8 +2569,18 @@ class StatusTests(unittest.TestCase):
         room["projection"] = {"basis": "one token per pass", "ceiling_score": 100.0, "fraction_of_ceiling": 0.9}
         plain = status.build(result, protocol)
         self.assertEqual(plain["goals"][0]["limit"], 100.0)
-        self.assertIn("decode   90.0 tok/s, 90% of its ceiling 100.0 (one token per model pass at its bandwidth floor)",
-                      status.render(plain))
+        self.assertIn("90% of its ceiling 100.0 (one token per model pass at its bandwidth floor)", status.render(plain))
+        # Without a sampled suite decode is unmeasured: the greedy score is no speed, sets no goal and no stop record.
+        greedy_only = status.build({key: value for key, value in result.items() if key != "sampled_speed"}, protocol)
+        self.assertIsNone(greedy_only["kpis"]["decode_sampled"])
+        self.assertEqual(greedy_only["kpis"]["decode_greedy"]["comparison_only"], status.GREEDY_COMPARISON_ONLY)
+        self.assertIsNone(greedy_only["goals"][0]["score"])
+        self.assertIsNone(greedy_only["stop_record_headroom"]["kpis"][0]["reached"])
+        self.assertIsNone(greedy_only["kpis"]["end_to_end"]["score"])
+        text = status.render(greedy_only)
+        self.assertIn("decode   unmeasured: no sampled decode (the sampled suite did not run)", text)
+        self.assertIn("greedy   120.0 tok/s at temperature 0, comparison only, never a speed", text)
+        self.assertNotIn("decode   120.0", text)
 
     def test_noise_is_the_spread_of_per_repetition_scores(self):
         def sample(tps, warmup=False):
@@ -2872,6 +2939,11 @@ class ContextTests(unittest.TestCase):
             model = safetensors_model(directory, shapes, {**DENSE, "num_experts": 4, "num_experts_per_tok": 1})
             # Resident weights, then one of four experts; no vision tower or embedding rows.
             self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT + 128 * 64 * 2)
+            # Quality mode speed's pass: every 16-bit matrix read in 8 bits (the fixture's are all BF16 matrices).
+            sixteen = context.weight_split(model, ceiling.model_config(model))["sixteen"]
+            self.assertEqual(context.speed_pass_bytes(model, 1.0), RESIDENT + 128 * 64 * 2
+                             - (sixteen["resident"] - sixteen["draft"] + sixteen["experts"] // 4) // 2)
+            self.assertLess(context.speed_pass_bytes(model, 1.0), context.pass_bytes(model, 1.0))
             (model / "config.json").write_text(json.dumps(DENSE))   # no routing known: experts are not counted
             self.assertEqual(context.pass_bytes(model, 1.0), RESIDENT)
             self.assertIsNone(context.pass_bytes(Path(directory) / "missing", 1.0))
@@ -3700,7 +3772,13 @@ class QualityTests(unittest.TestCase):
                   "quality": {"sets": {"conversations/served": {"kld_mean": 0.01}}}}
         compared = status.changes(now, before)
         self.assertTrue(compared["comparable"])
-        self.assertAlmostEqual(compared["decode_score"], 0.1)
+        # Greedy decodes compare as greedy decodes only: no sampled suite, no decode change (never a speed).
+        self.assertIsNone(compared["decode_score"])
+        self.assertAlmostEqual(compared["greedy_decode_score"], 0.1)
+        # With sampled suites at the same sampling, the decode change is the sampled one.
+        now["sampled_speed"] = speed_part({}, status="measured", decode_score=99.0, sampling={"temperature": 1.0})
+        before["sampled_speed"] = speed_part({}, status="measured", decode_score=90.0, sampling={"temperature": 1.0})
+        self.assertAlmostEqual(status.changes(now, before)["decode_score"], 0.1)
         self.assertEqual(status.changes(now, dict(before, protocol="crit-eval-v5")),
                          {"comparable": False, "reason": "measured with crit-eval-v5"})
         for other in (dict(before, suite_sha256="older suite"), dict(before, model_sha256="other")):
@@ -4589,9 +4667,10 @@ class ReferenceTests(unittest.TestCase):
         first = float(schemes.E2M1[int(packed[0, 0]) & 7] * (-1 if int(packed[0, 0]) & 8 else 1))
         self.assertEqual(float(a[0, 0]), first * float(scale[0, 0].float()) / 4)
 
-    def assert_scores_like_the_model(self, model, folder, ids, first, top_k=4, save=None):
+    def assert_scores_like_the_model(self, model, folder, ids, first, top_k=4, save=None, valid_vocab=None):
         """The layer-streamed reference, eager and chunked, scores like the model's own FP32 forward. save(folder)
-        writes the checkpoint (default: save_pretrained)."""
+        writes the checkpoint (default: save_pretrained); valid_vocab, the head's rows the data scores (a head
+        stored padded past them)."""
         import torch
         from crit_eval.quality import reference
         (save or model.save_pretrained)(folder)
@@ -4600,7 +4679,7 @@ class ReferenceTests(unittest.TestCase):
                                          dim=-1)
         expected = expected[first - 1:len(ids) - 1]
         for long in (False, True):
-            got, tops = scored_text(reference.StreamingReference(folder, "cpu"), ids, top_k, long=long)
+            got, tops = scored_text(reference.StreamingReference(folder, "cpu"), ids, top_k, valid_vocab, long=long)
             want = expected.gather(1, torch.tensor(ids[first:])[:, None])[:, 0]
             self.assertLess(float((got[first - 1:] - want).abs().max()), 1e-4, long)
             self.assertEqual(tops[first - 1:].tolist(), expected.topk(top_k, dim=-1).indices.tolist(), long)
@@ -4626,6 +4705,49 @@ class ReferenceTests(unittest.TestCase):
         ids = torch.randint(0, 128, (2 * attention.QUERY_BLOCK + 40,)).tolist()   # chunked blocks past the window
         with tempfile.TemporaryDirectory() as folder:
             self.assert_scores_like_the_model(model, folder, ids, attention.QUERY_BLOCK - 20)
+
+    @unittest.skipUnless(HAS_REFERENCE and importlib.util.find_spec("transformers.models.inkling2_loop"),
+                         "needs transformers with inkling2_loop")
+    def test_converted_parameters_and_renamed_tensors_score_like_the_model(self):
+        # Saved in the model's original layout (save_pretrained reverses transformers' conversions): learned queries
+        # stored as two tensors that are no matrices, merged by a converter into one parameter at load, and gate
+        # matrices stored under names that are no .weight (controllers.attn.down_weight for a down_proj.weight). Its
+        # forward runs a span of layers three times and mixes block states into later inputs, so the reference drives
+        # the texts through it (the called order), the long one in chunks of 16 resuming the forward's cache; its
+        # eager attention takes a position bias and sinks a row, so long texts run it in blocks of rows.
+        from unittest import mock
+        import torch
+        from crit_eval.quality import attention, reference
+        from transformers.models.inkling2_loop.configuration_inkling2_loop import Inkling2LoopTextConfig
+        from transformers.models.inkling2_loop.modeling_inkling2_loop import Inkling2LoopForCausalLM
+        torch.manual_seed(0)
+        config = Inkling2LoopTextConfig(
+            vocab_size=128, unpadded_vocab_size=120, hidden_size=64, num_hidden_layers=6, num_attention_heads=4,
+            num_key_value_heads=2, head_dim=16, swa_num_attention_heads=4, swa_num_key_value_heads=2, swa_head_dim=16,
+            sliding_window_size=8, d_rel=4, rel_extent=8, log_scaling_n_floor=4, qk_l2_clip_threshold=2.0,
+            rel_l2_clip_threshold=1.0, n_layers_per_attn_res_block=2, moe_intermediate_size=32, n_routed_experts=4,
+            num_experts_per_tok=2, loop_layer_index_start=2, loop_layer_index_end=4, loop_num_passes=3,
+            loop_gate_rank=8, eos_token_id=2, pad_token_id=0,
+            layer_types=["hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid", "hybrid_sliding", "hybrid"])
+        model = Inkling2LoopForCausalLM(config).float().eval()
+        with torch.no_grad():   # the parts the model starts at zero or one, random so each one counts
+            for name, parameter in model.named_parameters():
+                if name.endswith((".query", "static_weight", "e_score_correction_bias")):
+                    parameter.normal_(0.0, 0.5)
+                elif name.endswith(".scale"):
+                    parameter.copy_(1.0 + 0.3 * torch.randn_like(parameter))
+                elif "conv" in name and name.endswith("conv1d.weight"):
+                    parameter.normal_(0.0, 0.3)
+        ids = torch.randint(3, 120, (40,)).tolist()   # past the window, the bias's reach and the log scaling
+        # no free margin: chunks of the least, 16 tokens, so the texts resume their cache across chunks
+        with tempfile.TemporaryDirectory() as folder, mock.patch.object(reference, "CALLED_FREE_SHARE", 1e-12):
+            self.assert_scores_like_the_model(model, folder, ids, 4, valid_vocab=120)   # the head stored padded
+            self.assertFalse(reference.StreamingReference(folder, "cpu").chained())
+        # no room: a layer released at every load, the one whose next call is furthest away; blocks of 16 rows
+        with tempfile.TemporaryDirectory() as folder, \
+                mock.patch.object(reference.StreamingReference, "_called_margin", lambda self: 1 << 63), \
+                mock.patch.object(attention, "SCORE_KEYS", 1):
+            self.assert_scores_like_the_model(model, folder, ids, 4, valid_vocab=120)
 
     @unittest.skipUnless(HAS_REFERENCE and importlib.util.find_spec("transformers.models.qwen4_exp"),
                          "needs transformers with qwen4_exp")
