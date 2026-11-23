@@ -74,16 +74,17 @@ def stalls(samples, round_ms):
             "p99_gap_rounds": p99 / round_ms if round_ms else None}
 
 
-def timed_generate(engine, prompt, output_tokens, prompt_cache=False, logprobs=None):
+def timed_generate(engine, prompt, output_tokens, prompt_cache=False, logprobs=None, thinking_tokens=None):
     """prompt_cache: the request is judged on its text alone, so an engine behind a server may serve it from its
     prompt cache. logprobs: ask a served engine for that many alternatives per reply token; the sample then carries
     the reply in reply()'s shape as "reply" (or "reply_unmapped": why the server's tokens map to no ids)."""
     served = isinstance(engine, ChatEngine)
     options = {**({"prompt_cache": True} if prompt_cache and served else {}),
-               **({"logprobs": logprobs} if logprobs and served else {})}
+               **({"logprobs": logprobs} if logprobs and served else {}),
+               **({"thinking_tokens": thinking_tokens} if thinking_tokens and served else {})}
     # tool_calls: the calls a server parsed from its reply (protocol speed.tool_calls).
     return _timed(lambda on_tokens: engine.generate(list(prompt), output_tokens, on_tokens, **options), prompt,
-                  output_tokens, keep=("tool_calls",) + (("reply", "reply_unmapped") if logprobs else ()))
+                  output_tokens, keep=("tool_calls", "answer_tokens") + (("reply", "reply_unmapped") if logprobs else ()))
 
 
 def timed_plain(engine, prompt, output_tokens):
@@ -91,14 +92,17 @@ def timed_plain(engine, prompt, output_tokens):
     return _timed(lambda on_tokens: engine.generate_plain(list(prompt), output_tokens, on_tokens), prompt, output_tokens)
 
 
-def timed_sampled(engine, prompt, output_tokens, sampling, logprobs=None):
+def timed_sampled(engine, prompt, output_tokens, sampling, logprobs=None, prompt_cache=False):
     """A sampled request (protocol sampled_speed): the engine's generate_sampled with the request's sampling fields
-    (prepare.sampled_request); with logprobs, asking for that many alternatives of every emitted token. Returns
-    (tokens, sample, the reported log-probabilities or None)."""
+    (prepare.sampled_request); with logprobs, asking for that many alternatives of every emitted token. prompt_cache:
+    an engine behind a server may serve the prompt from its prompt cache (a request timed for its decode alone).
+    Returns (tokens, sample, the reported log-probabilities or None)."""
     replied = {}
+    served = isinstance(engine, ChatEngine)
 
     def call(on_tokens):
-        extra = {"logprobs": logprobs} if logprobs else {}
+        extra = {**({"logprobs": logprobs} if logprobs else {}),
+                 **({"prompt_cache": True} if prompt_cache and served else {})}
         replied["result"] = engine.generate_sampled(list(prompt), output_tokens, on_tokens, dict(sampling), **extra)
         return replied["result"]
     tokens, sample = _timed(call, prompt, output_tokens)

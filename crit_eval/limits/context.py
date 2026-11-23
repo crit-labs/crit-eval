@@ -33,6 +33,7 @@ from .tensors import tensor_role
 
 GIB = 1 << 30
 DRAFT_HEAD = re.compile(r"(^|\.)head\.weight$")   # a draft layer's own output head (shared_head.head)
+SIXTEEN = ("BF16", "F16")   # the stored dtypes of 16-bit matrices (safetensors and GGUF names alike)
 
 
 def _kv_fit(free_bytes, kv_bytes_per_token, *, headroom, reserve, held, granularity):
@@ -60,42 +61,56 @@ def weight_split(model, config):
     if not shards:
         return None
     split = {"resident": 0, "experts": 0, "draft": 0, "embedding": 0, "vision": 0}
+    # The same groups' matrices stored in 16 bits (SIXTEEN, two dimensions or more: no norms or biases).
+    sixteen = {"resident": 0, "experts": 0, "draft": 0, "embedding": 0}
     tied = bool(config.tie_word_embeddings)
     heads = 0
     for shard in shards:
         for tensor in shard.tensors:
             role, size = tensor_role(tensor.name, shard.path.name, drafts), tensor.nbytes
+            wide = tensor.dtype in SIXTEEN and len(tensor.shape) >= 2
             if role.kind == "other_modality":
                 split["vision"] += size
-            elif role.kind == "embedding":
-                split["embedding"] += size
-            elif role.kind == "expert":
-                split["experts"] += size
-            else:
-                split["resident"] += size
+                continue
+            group = "embedding" if role.kind == "embedding" else "experts" if role.kind == "expert" else "resident"
+            split[group] += size
+            sixteen[group] += size if wide else 0
+            if group == "resident":
                 heads += role.kind == "head"
                 if role.draft:
                     split["draft"] += size
+                    sixteen["draft"] += size if wide else 0
     if tied and not heads:
         # The output head is the embedding table: every pass reads all of it.
         split["resident"] += split["embedding"]
-        split["embedding"] = 0
-    return split
+        sixteen["resident"] += sixteen["embedding"]
+        split["embedding"] = sixteen["embedding"] = 0
+    return {**split, "sixteen": sixteen}
 
 
-def pass_bytes(model, kv_bytes_per_element):
+def pass_bytes(model, kv_bytes_per_element, sixteen_bits=16):
     """What one decode pass of one token reads from the stored model, for an engine that reports no bytes_per_pass:
     the weights read on every pass but draft layers, the routed experts' share (experts_per_token of the experts,
     taken as equally sized) and the fixed state (linear-attention and Mamba recurrence, sliding-window KV at
-    kv_bytes_per_element). None without weight headers."""
+    kv_bytes_per_element). sixteen_bits: the bits a weight of the matrices stored in 16 bits is read at (8: quality
+    mode speed's starting arithmetic, every such matrix in FP8: speed_pass_bytes). None without weight headers."""
     config = model_config(model)
     split = weight_split(model, config)
     if split is None:
         return None
     moe = config.moe
-    experts = (split["experts"] * min(1.0, moe.experts_per_token / moe.experts)
-               if split["experts"] and moe and moe.experts and moe.experts_per_token else 0)
-    return int(split["resident"] - split["draft"] + experts + config.fixed_state_bytes(kv_bytes_per_element))
+    share = (min(1.0, moe.experts_per_token / moe.experts) if split["experts"] and moe and moe.experts
+             and moe.experts_per_token else 0)
+    saved = (1 - sixteen_bits / 16) * (split["sixteen"]["resident"] - split["sixteen"]["draft"]
+                                       + split["sixteen"]["experts"] * share)
+    return int(split["resident"] - split["draft"] + split["experts"] * share - saved
+               + config.fixed_state_bytes(kv_bytes_per_element))
+
+
+def speed_pass_bytes(model, kv_bytes_per_element):
+    """pass_bytes with every matrix stored in 16 bits read in 8 bits: what a pass reads in quality mode speed's
+    starting arithmetic (protocol headroom.speed_weights). None without weight headers."""
+    return pass_bytes(model, kv_bytes_per_element, sixteen_bits=8)
 
 
 def draft_step_bytes(model):

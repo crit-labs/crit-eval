@@ -6,8 +6,13 @@ from ..limits.context import (curve_points, curve_prompt, lower_context, max_con
                               retrieval_prompt, token_text)
 from .adapters import open_engine
 from .jitter import curve_point
-from .speed import run_speed
-from .timing import Disturbed, _summary, timed_generate
+from .speed import cannot_sample, run_speed
+from .timing import Disturbed, _summary, timed_generate, timed_sampled
+from ..quality.prepare import sampled_request
+
+# A curve point's decode fields: the sampled request's (decode speed is sampled decode); the greedy request's stay
+# beside them as a comparison.
+DECODE_KEYS = ("decode_tps", "tokens_per_round", "round_ms")
 
 
 def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings, requested=None, basis=None):
@@ -24,21 +29,34 @@ def context_requirement(model, device, context_tokens, vram_headroom_bytes, sett
 CONTEXT_TEXT = {"source": "generated", "reason": "each point answers the retrieval request in the engine's own words"}
 
 
-def judged_retrieval(tokens, prepared, prompt, point):
+def thinking_tokens(engine, rule):
+    """The reasoning budget a retrieval request carries (context.retrieval.thinking_tokens) on an engine whose package
+    ends reasoning at one (chat-thinking-budget-v1), else None."""
+    return int(rule.get("thinking_tokens") or 0) or None if getattr(engine, "thinking_budget", False) else None
+
+
+def judged_retrieval(tokens, prepared, prompt, point, sample=None):
     """A reply's retrieval verdict (protocol context.retrieval): every fact's answer in its text up to the first stop
-    token, decoded with the prepared token strings."""
+    token, decoded with the prepared token strings; a reply that reasoned is judged on its answer (the sample's
+    answer_tokens: the reply without its reasoning)."""
     pieces = prepared["retrieval"]
-    text = token_text(tokens, pieces["token_text"], prepared["stop_ids"])
+    answer = (sample or {}).get("answer_tokens")
+    text = token_text(answer if answer is not None else tokens, pieces["token_text"], prepared["stop_ids"])
     found = {fact["id"]: fact["answer"] in text for fact in pieces["facts"]}
     return {"status": "measured", "context": point, "prompt_tokens": len(prompt), "found": found,
-            "passed": all(found.values()), "text": text[:2000], "tokens": tokens}
+            "passed": all(found.values()), "text": text[:2000], "tokens": tokens,
+            **({"judged": "answer"} if answer is not None else {})}
 
 
 def run_context(engine, info, prepared, settings, required, log, reply_logprobs=None):
-    """One greedy request per curve point, each filling the context exactly (prompt plus output equal the point).
-    The prompt is the retrieval check's archive, filler text with the retrieval facts in it, and a request for the
-    facts and then a summary of the archive (curve_prompt): the point times that reply, the engine's own, and judges
-    retrieval on it, so a long prompt is prefilled once for both. A request the engine cannot serve is recorded as
+    """One greedy request per curve point, each filling the context exactly (prompt plus output equal the point),
+    then one sampled request on the same prompt at the prepared sampling (seed 1), which an engine behind a server
+    may serve from its prompt cache. The prompt is the retrieval check's archive, filler text with the retrieval facts
+    in it, and a request for the facts and then a summary of the archive (curve_prompt): the greedy reply, the
+    engine's own, times the point's first token and has retrieval judged on it, so a long prompt is prefilled once
+    for both; the sampled reply times its decode (decode speed is sampled decode: DECODE_KEYS), and the greedy
+    decode stays beside it as `greedy`, a comparison only. An engine that cannot sample has the point's decode
+    unmeasured (`sampled_missing`). A request the engine cannot serve is recorded as
     failed. With reply_logprobs, the first point's request asks a served engine for that many alternatives per reply
     token, so its reply serves the honesty check's long reply (protocol quality.honesty long_reply). With settings'
     jitter ({"seed", "fraction"}, protocol jitter) a point below the requirement fills its drawn share of the point
@@ -51,6 +69,7 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
     points, asked = {}, {}
     curve = curve_points(required, settings)
     long_reply = {"point": curve[0] if curve else None, "reason": "the curve's first point was not measured"}
+    unsampled = cannot_sample(engine, prepared)
     for point in curve:
         if point > info["max_context"]:
             points[str(point)] = {"status": "skipped", "context": point,
@@ -63,7 +82,7 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"no room for the curve's prompt before {n} output tokens"}
             continue
-        samples = []
+        samples, judged = [], None
         try:
             for _ in range(int(settings.get("repetitions", 1))):
                 if point == curve[0] and reply_logprobs:
@@ -76,14 +95,27 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
                         long_reply = {"point": point, "reason": f"the reply with log-probabilities failed: {error}"}
                         tokens, sample = timed_generate(engine, prompt, n)
                     else:
+                        budget = thinking_tokens(engine, rule)
+                        if budget:   # the request with log-probabilities takes no reasoning budget: one that does
+                            judged = timed_generate(engine, prompt, n, prompt_cache=True, thinking_tokens=budget)
                         reply, unmapped = sample.pop("reply", None), sample.pop("reply_unmapped", None)
                         # scored after the prompt the server rendered (ChatEngine.served_ids), not the frame's ids
                         long_reply = ({"point": point, "prompt_ids": reply.pop("prompt_ids", None) or list(prompt),
                                        "reply": reply} if reply else
                                       {"point": point, "reason": unmapped or "the engine returned no log-probabilities"})
                 else:
-                    tokens, sample = timed_generate(engine, prompt, n)
+                    tokens, sample = timed_generate(engine, prompt, n, thinking_tokens=thinking_tokens(engine, rule))
                 samples.append(sample)
+            sampled, missing = None, unsampled
+            if unsampled is None:
+                try:
+                    _, sampled, _ = timed_sampled(engine, prompt, n, sampled_request(prepared["sampling"], 1),
+                                                  prompt_cache=True)
+                except Hung:
+                    raise
+                except Exception as error:   # the greedy request stands: its first token and retrieval
+                    missing = f"the sampled request failed: {type(error).__name__}: {error}"[:2000]
+                    log(f"context {point:,}: {missing}")
         except Hung:
             raise
         except Exception as error:  # an engine that cannot hold the context fails here, however it fails
@@ -93,11 +125,21 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
             log(f"context {point:,}: failed ({error})")
             continue
         summary = _summary(samples)
+        greedy = {key: summary[key] for key in DECODE_KEYS}
+        summary.update({key: (sampled or {}).get(key) for key in DECODE_KEYS})
         points[str(point)] = {"status": "measured", "context": point, "filled_context": filled,
-                              "prompt_tokens": len(prompt), "output_tokens": n, **summary, "samples": samples}
-        asked[point] = {**judged_retrieval(tokens, prepared, prompt, point), "ttft_ms": summary["ttft_ms"]}
+                              "prompt_tokens": len(prompt), "output_tokens": n, **summary,
+                              "greedy": {**greedy, "comparison_only": "greedy decode: comparison only, never a speed"},
+                              **({"sampled_sample": sampled} if sampled else {"sampled_missing": missing}),
+                              "samples": samples}
+        retrieval = (judged_retrieval(judged[0], prepared, prompt, point, judged[1]) if judged else
+                     judged_retrieval(tokens, prepared, prompt, point, samples[-1]))
+        asked[point] = {**retrieval, "ttft_ms": summary["ttft_ms"],
+                        **({"judged_request": "its own, with the reasoning budget"} if judged else {})}
         log(f"context {point:,}" + (f" (filled {filled:,})" if filled != point else "")
-            + f": decode {summary['decode_tps'] or 0:.1f} tok/s, first token after {summary['ttft_ms']:,.0f} ms, "
+            + (f": sampled decode {summary['decode_tps']:.1f} tok/s" if summary["decode_tps"] else
+               ": sampled decode unmeasured")
+            + f", first token after {summary['ttft_ms']:,.0f} ms, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}; retrieval "
             + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in asked[point]["found"].items()))
     return points, dict(CONTEXT_TEXT), asked, long_reply
@@ -112,14 +154,15 @@ def retrieval_point(engine, info, prepared, rule, prompt, point, log):
         log(f"retrieval {point:,}: not served (max_context {info['max_context']:,})")
         return {"status": "failed", "context": point,
                 "error": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
+    budget = thinking_tokens(engine, rule)   # its output_tokens follow the reasoning budget
     try:
-        tokens, sample = timed_generate(engine, prompt, n, prompt_cache=True)
+        tokens, sample = timed_generate(engine, prompt, n + (budget or 0), prompt_cache=True, thinking_tokens=budget)
     except Hung:
         raise
     except Exception as error:  # an engine that cannot hold the context fails here, however it fails
         log(f"retrieval {point:,}: failed ({type(error).__name__}: {error})")
         return {"status": "failed", "context": point, "error": f"{type(error).__name__}: {error}"[:2000]}
-    found = judged_retrieval(tokens, prepared, prompt, point)
+    found = judged_retrieval(tokens, prepared, prompt, point, sample)
     log(f"retrieval {point:,}: " + ", ".join(f"{k} {'found' if v else 'MISSING'}" for k, v in found["found"].items()))
     return {**found, "ttft_ms": sample["ttft_ms"], "cached_tokens": (sample.get("served") or {}).get("cached_tokens")}
 
@@ -209,6 +252,28 @@ def compare_lower(at_max, at_lower, lower, settings):
             "ttft_score_ms": at_lower.get("ttft_score_ms"), "ttft_score_ms_at_required": at_max.get("ttft_score_ms"),
             "decode_text": at_lower.get("decode_text"),
             "passed": bool(cases) and not slower and not unmatched}
+
+
+def run_required_again(module, model, config, prepared, protocol, required, warmups, repetitions, log,
+                       continuations=None, disturbed_spread=None, exact_prompts=False):
+    """The speed cases on an engine opened at the required context again, right after the lower context's, the same
+    way (warm-ups, samples): the comparison a staged Eval's lower-context gate makes, under the device state the
+    lower context ran in (after the long-context curve). None where it cannot run (the first measurement stands)."""
+    log(f"lower context: opening the engine at the required {required:,} tokens again, to compare under the same "
+        "conditions")
+    try:
+        engine, info = open_engine(module, model, config, speculative=True, context_tokens=required,
+                                   exact_prompts=exact_prompts)
+        try:
+            return run_speed(engine, info, prepared, protocol, warmups, repetitions,
+                             lambda message: log("required again: " + message), continuations, disturbed_spread)
+        finally:
+            engine.close()
+    except (Disturbed, Hung):
+        raise
+    except Exception as error:   # noqa: BLE001 - the comparison with the first measurement stands, and says why
+        log(f"required again: failed ({type(error).__name__}: {error})")
+        return None
 
 
 def run_lower_context(module, model, config, prepared, protocol, required, warmups, repetitions, log,

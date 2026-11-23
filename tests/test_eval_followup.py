@@ -36,6 +36,8 @@ def priced(followup, mode="speed"):
     return {**MEASURED, "requirements": {"exactness": "reported", "quality_mode": mode},
             "engine": {"speculative": False, "kv_bytes_per_token": KV}, "ceiling": CEILING, "followup": followup,
             "speed": speed_part({"a": {"decode_tps": 100.0, "prompt_tokens": 100}}, decode_score=100.0, complete=True),
+            "sampled_speed": speed_part({"a": {"decode_tps": 90.0, "prompt_tokens": 100}}, status="measured",
+                                        decode_score=90.0, complete=True),
             "headroom": {"rates": {"tflops": RATES, "sources": {}}, "bandwidth_gbs": BANDWIDTH, "gaps": [], "missing": []}}
 
 

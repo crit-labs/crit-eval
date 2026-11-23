@@ -219,18 +219,10 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
     1). Every case reports its standard error (None measured at one seed) and the repetitions target_se would take."""
     rule = protocol["sampled_speed"]
     settings = prepared.get("sampling")
-    if not hasattr(engine, "generate_sampled"):
-        log("sampled speed: unsupported (the engine has no generate_sampled)")
-        return {"status": "unsupported", "reason": "the engine cannot sample (no generate_sampled)"}
-    if settings is None:
-        return {"status": "unsupported", "reason": "the prepared data names no sampling (prepare it again)"}
-    # An engine that names the sampling fields it applies (sampling_fields) leaves out the others, which only
-    # neutral values may be.
-    fields = getattr(engine, "sampling_fields", None)
-    missing = unapplied(sampled_request(settings, 0), fields) if fields is not None else []
-    if missing:
-        log(f"sampled speed: unsupported (the engine does not apply {', '.join(missing)})")
-        return {"status": "unsupported", "reason": f"the engine does not apply the sampling's {', '.join(missing)}"}
+    reason = cannot_sample(engine, prepared)
+    if reason:
+        log(f"sampled speed: unsupported ({reason})")
+        return {"status": "unsupported", "reason": reason}
     listed = list(rule["seeds"]["repetitions"])
     repetitions = len(listed) if repetitions is None else repetitions
 
@@ -374,14 +366,33 @@ def run_sampling_check(engine, info, prepared, protocol, log, checked=None):
             "replies": " and ".join(sorted(sources)), "cases": cases}
 
 
+def cannot_sample(engine, prepared):
+    """Why `engine` cannot decode Eval's sampled requests at the prepared sampling (protocol sampled_speed), or None:
+    no generate_sampled, data prepared without a sampling, or a sampling field the engine does not apply (an engine
+    that names the fields it applies, sampling_fields, leaves out the others, which only neutral values may be)."""
+    if not hasattr(engine, "generate_sampled"):
+        return "the engine cannot sample (no generate_sampled)"
+    settings = prepared.get("sampling")
+    if settings is None:
+        return "the prepared data names no sampling (prepare it again)"
+    fields = getattr(engine, "sampling_fields", None)
+    missing = unapplied(sampled_request(settings, 0), fields) if fields is not None else []
+    return f"the engine does not apply the sampling's {', '.join(missing)}" if missing else None
+
+
 def run_heldout(engine, info, prepared, protocol, log, jitter=None):
-    """The held-out prompts (protocol "heldout"): each decodes its own greedy output on the engine built for the
-    required context, cut to the run's drawn length (`jitter` {"seed", "fraction"}, protocol jitter; None: whole).
-    Data prepared before the held-out set has none; it is reported as missing."""
+    """The held-out prompts (protocol "heldout"): each decodes a sampled reply at the prepared sampling (decode speed
+    is sampled decode), repetition r at seed r + 1, on the engine built for the required context, cut to the run's
+    drawn length (`jitter` {"seed", "fraction"}, protocol jitter; None: whole). Data prepared before the held-out set
+    has none; it is reported as missing, and an engine that cannot sample has them unsupported."""
     settings = protocol["heldout"]
     if "heldout" not in prepared:
         log("held-out: not in the prepared data (prepare it again with crit eval prepare into a new data directory)")
         return {"status": "missing", "reason": "the prepared data has no held-out prompts; prepare it again"}
+    reason = cannot_sample(engine, prepared)
+    if reason:
+        log(f"held-out: unsupported ({reason}); decode speed is sampled decode")
+        return {"status": "unsupported", "reason": reason}
     prompts = {}
     for prompt in prepared["heldout"]:
         ids, drawn = heldout_prompt(prepared, prompt, jitter)
@@ -390,8 +401,8 @@ def run_heldout(engine, info, prepared, protocol, log, jitter=None):
             prompts[prompt["id"]] = {"status": "skipped", "reason": f"needs {len(ids) + n} tokens of context"}
             continue
         samples = []
-        for _ in range(int(settings["repetitions"])):
-            _, sample = timed_generate(engine, ids, n)
+        for r in range(int(settings["repetitions"])):
+            _, sample, _ = timed_sampled(engine, ids, n, sampled_request(prepared["sampling"], r + 1))
             samples.append(sample)
         summary = _summary(samples)
         prompts[prompt["id"]] = {"status": "measured", "language": prompt["language"], "kind": prompt["kind"],
@@ -402,7 +413,7 @@ def run_heldout(engine, info, prepared, protocol, log, jitter=None):
         log(f"held-out {prompt['id']} ({prompt['language']}): decode {rate(summary['decode_tps'], 1)}, "
             f"tokens/round {summary['tokens_per_round'] or 0:.2f}")
     measured = [p for p in prompts.values() if p["status"] == "measured"]
-    return {"status": "measured", "prompts": prompts,
+    return {"status": "measured", "sampling": prepared["sampling"], "prompts": prompts,
             "decode_score": metrics.geometric_mean([p["decode_tps"] for p in measured]),
             "tokens_per_round": metrics.geometric_mean([p["tokens_per_round"] for p in measured if p.get("tokens_per_round")]),
             "complete": len(measured) == len(prompts)}

@@ -20,7 +20,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
 from crit_core.model import GgufError, inspect_gguf_model  # noqa: E402
-from crit_core.model.config import parse_model_config  # noqa: E402
+from crit_models.config import architecture as parse_model_config  # noqa: E402 - the config with its mechanisms
 from crit_core.model.gguf import TensorInfo  # noqa: E402
 from crit_core.model.gguf_files import derive_config  # noqa: E402
 from gguf_writer import ARRAY, BOOL, INT32, gguf_bytes  # noqa: E402

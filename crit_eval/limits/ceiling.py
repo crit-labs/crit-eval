@@ -18,7 +18,8 @@ the same rate), its MXFP4 and NVFP4 at the nvfp4 rate and its F32/F16/BF16 at bf
 (gathered), vision towers, norms, convolutions and the output head (one row of logits per
 prompt) are left out. Engines may compute in other formats; the floor uses the stored ones, and
 prefill_floor_ms prices the quantized matrices with other prompt activations on request (ACTIVATIONS:
-BF16, FP16 accumulation, FP8), as crit_eval.limits.headroom.activation_ceilings reports them.
+BF16, FP16 accumulation, FP8), and the 16-bit ones re-encoded to FP8 (W8A8 at the FP8 rate, REENCODED), as
+crit_eval.limits.headroom.activation_ceilings reports them.
 
 Time to first token cannot beat either floor: the prompt's arithmetic, or reading the weights
 once (language-model tensors and the output head, not embeddings, vision or draft layers)
@@ -28,6 +29,7 @@ import math
 import os
 
 from crit_core.model import open_model, parse_model_config
+from crit_models.config import architecture
 from crit_core.model.gguf import TYPE_BY_NAME, TensorInfo as GgufTensor
 
 from .schemes import PRIMARY, quantization_of, refuse_unread, stored
@@ -41,11 +43,12 @@ def _source(model):
 
 
 def model_config(model):
-    """The model's config.json read with Core's rules (crit_core.model.ModelSource.config): the folder's own, or
-    the one a GGUF's metadata derives; an empty config when the model has none. Rules read the text section
-    (`text_config` over the root)."""
+    """The model's config.json read with Core's rules (crit_core.model.ModelSource.config: the folder's own, or the
+    one a GGUF's metadata derives; an empty config when the model has none) and its mechanisms with crit Models'
+    (crit_models.config.architecture: layer kinds, experts, latent attention, recurrent state, the KV a token adds).
+    Rules read the text section (`text_config` over the root)."""
     source = _source(model)
-    return source.config() if source else parse_model_config({})
+    return architecture(source.config() if source else parse_model_config({}))
 
 
 def weight_files(model, drafts=False):
@@ -206,17 +209,25 @@ def best_rates(device):
 # The activation formats a quantized matrix's prompt GEMM can take, and the rates (crit_eval.limits.probe keys) each runs at
 # for each stored weight format, the best available one counting: BF16 activations on BF16 tensor cores with FP32
 # accumulation, FP16 activations accumulating in FP16, FP8 activations (FP4 weights times FP8 through kind::f8f6f4, or
-# widened to FP8), and the stored format itself (W8A8, W4A4). Weights stored in BF16 stay at the BF16 rate.
+# widened to FP8), and the stored format itself (W8A8, W4A4). Weights stored in BF16 stay at the BF16 rate unless
+# re-encoded: their matrices (DENSE) take FP8 only as REENCODED, weights and activations in E4M3 (W8A8).
 ACTIVATIONS = {"bf16": {"fp8": ("bf16",), "nvfp4": ("bf16",)},
                "fp16_acc": {"fp8": ("fp16_acc",), "nvfp4": ("fp16_acc",)},
-               "fp8": {"fp8": ("fp8",), "nvfp4": ("fp4_fp8", "fp8")},
+               "fp8": {"fp8": ("fp8",), "nvfp4": ("fp4_fp8", "fp8"), "bf16": ("fp8",)},
                "stored": {"fp8": ("fp8",), "nvfp4": ("nvfp4",)}}
 QUANTIZED = ("fp8", "nvfp4")
+DENSE = "bf16"   # the matmul_flops_per_token key of the matrices stored in 16 bits
+REENCODED = {DENSE: {"fp8": 1.0}}   # those matrices re-encoded to FP8 rows (W8A8), as activation shares
 
 
 def quantized_formats(ceiling):
     """The quantized stored formats whose matrices the model's prompt GEMMs multiply (fp8, nvfp4)."""
     return [f for f in QUANTIZED if ((ceiling or {}).get("matmul_flops_per_token") or {}).get(f)]
+
+
+def has_dense(ceiling):
+    """Whether the model's prompt GEMMs multiply matrices stored in 16 bits (DENSE), which REENCODED prices in FP8."""
+    return bool(((ceiling or {}).get("matmul_flops_per_token") or {}).get(DENSE))
 
 
 def activation_shares(activations, formats):

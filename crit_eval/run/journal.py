@@ -31,6 +31,9 @@ SUFFIX = ".journal.jsonl"
 # served engine's capacity and cohort (the concurrency part, crit_eval.run.concurrency) are each one line.
 METHODS = ("generate", "generate_plain", "generate_sampled", "replay", "score", "reply", "capacity", "cohort", "loads",
            "device_free_bytes", "telemetry")
+# Engine attributes Eval reads besides its requests, kept with the engine's open line so a replayed engine answers
+# them without loading: the sampling fields it applies (sampled requests ask them before every sampled part).
+ATTRIBUTES = ("sampling_fields",)
 # Info keys an engine opened for its live requests must answer as the journaled one did.
 SAME_INFO = ("name", "max_context", "speculative", "served")   # a served engine's configuration names its port
 
@@ -244,14 +247,17 @@ class Journal:
             self._write({**self._pop(), "engine": index, "replayed": True})
             wrapped = JournaledEngine(self, index, opener, context, context_sha, dict(row["info"]), row["methods"])
             wrapped.kind = _class(row.get("class"))
+            wrapped.attributes = dict(row.get("attributes") or {})
             return wrapped, dict(row["info"])
         started = time.perf_counter()
         engine, info = opener(context)
         seconds = time.perf_counter() - started
         methods = [name for name in METHODS if callable(getattr(engine, name, None))]
         self.counts["live_opens"] += 1
+        attributes = {name: _attribute(getattr(engine, name)) for name in ATTRIBUTES if hasattr(engine, name)}
         self._record({"event": "open", "engine": index, "context_sha256": context_sha, "info": _plain(info),
-                      "methods": methods, "class": _class_name(type(engine)), "load_seconds": round(seconds, 3)})
+                      "methods": methods, "attributes": attributes, "class": _class_name(type(engine)),
+                      "load_seconds": round(seconds, 3)})
         wrapped = JournaledEngine(self, index, opener, context, context_sha, info, methods)
         wrapped.real, wrapped.kind = engine, type(engine)
         return wrapped, info
@@ -346,6 +352,7 @@ class JournaledEngine:
         self.info_value, self.methods = info, list(methods)
         self.key = f"{index}:{context_sha}"   # the engine a call line belongs to, across rounds
         self.real = None
+        self.attributes = {}  # ATTRIBUTES as the journal's open line recorded them
         self.kind = None      # the engine's class: isinstance sees it through __class__ (a served ChatEngine)
         self.served = []      # the journal's requests this engine answered before it loaded
 
@@ -386,6 +393,9 @@ class JournaledEngine:
             return lambda *args, **kwargs: self.journal.call(self, name, args, kwargs)
         if name == "deadline" and self.real is None:
             return self._deadline()
+        if name in self.attributes and self.real is None:
+            value = self.attributes[name]
+            return set(value) if isinstance(value, list) else value
         return getattr(self.load(), name)
 
     def _deadline(self):
@@ -401,10 +411,16 @@ class JournaledEngine:
         return seen
 
     def __setattr__(self, name, value):
-        if name in ("journal", "index", "opener", "context", "info_value", "methods", "key", "real", "kind", "served"):
+        if name in ("journal", "index", "opener", "context", "info_value", "methods", "key", "real", "kind", "served",
+                    "attributes"):
             object.__setattr__(self, name, value)
         else:
             setattr(self.load(), name, value)
+
+
+def _attribute(value):
+    """An ATTRIBUTES value as the journal keeps it: a set as its sorted list."""
+    return sorted(value) if isinstance(value, (set, frozenset)) else _plain(value)
 
 
 def _observe(engine, rows):

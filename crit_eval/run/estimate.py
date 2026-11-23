@@ -202,7 +202,9 @@ def requests(prepared, protocol, parts, required, settings=None, info=None, warm
         n, curve = int(settings["output_tokens"]), []
         for point in curve_points(required, settings):
             if point <= held and _holds(pieces, point - n, pieces["curve_tail_ids"]):
-                curve += [(point - n, n)] * int(settings.get("repetitions", 1))
+                # The greedy requests, then the sampled one that times the point's decode (priced as a full
+                # prefill, which a server's prompt cache shortens).
+                curve += [(point - n, n)] * (int(settings.get("repetitions", 1)) + 1)
         add("context", curve)
         if curve and "quality" in names and out.get("quality"):
             # The honesty check's long reply is the curve's first reply, scored once more (quality_checks.run_honesty).

@@ -187,13 +187,30 @@ def check_prepared(prepared, protocol, data):
 
 # `model` below is a crit_core.text.ModelText. Templates render in non-thinking mode where they support it.
 
+def paired(messages):
+    """The messages with each tool call given an id and each tool result its call's id (api_messages' pairing), the
+    arguments as they are: what a server renders from the messages it is sent."""
+    out, ids, pending = [], count(), []
+    for message in messages:
+        message = dict(message)
+        if message.get("tool_calls"):
+            message["tool_calls"] = [{"id": call.get("id") or f"call_{next(ids)}", "type": "function",
+                                      **{k: v for k, v in call.items() if k not in ("id", "type")}}
+                                     for call in message["tool_calls"]]
+            pending += [call["id"] for call in message["tool_calls"]]
+        elif message.get("role") == "tool" and not message.get("tool_call_id") and pending:
+            message["tool_call_id"] = pending.pop(0)
+        out.append(message)
+    return out
+
+
 def prompt_ids(model, messages, tools=None):
-    """A generation prompt's token ids (ModelText.encode_chat)."""
-    return model.encode_chat(messages, tools=tools, add_generation_prompt=True, enable_thinking=False)
+    """A generation prompt's token ids (ModelText.encode_chat), its messages paired as a server is sent them."""
+    return model.encode_chat(paired(messages), tools=tools, add_generation_prompt=True, enable_thinking=False)
 
 
 def chat_text(model, messages, generation_prompt, tools=None):
-    return model.render(messages, tools=tools, add_generation_prompt=generation_prompt, enable_thinking=False)
+    return model.render(paired(messages), tools=tools, add_generation_prompt=generation_prompt, enable_thinking=False)
 
 
 def token_ids(model, text):
@@ -244,6 +261,11 @@ def with_document(messages, document):
             for m in messages]
 
 
+class FrameOverflow(ValueError):
+    """A speed case's fixed conversation renders past its prompt budget under the model's chat template: no room for
+    its document. The case is not measurable for that model (prepare records it in speed_unmeasurable)."""
+
+
 def speed_prompt(model, case):
     """A speed case's prompt as (token ids, messages, tools): the messages and tools hold the text the ids render
     from, a long-context document cut to fit."""
@@ -257,7 +279,10 @@ def speed_prompt(model, case):
     document = (SUITE_DIR / case["document"]).read_text(encoding="utf-8")
     need = case["prompt_tokens"] - len(head_ids) - len(tail_ids)
     document_ids = piece_ids(model, document)
-    if need <= 0 or len(document_ids) < need:
+    if need <= 0:
+        raise FrameOverflow(f"{case['id']}: its conversation renders to {len(head_ids) + len(tail_ids):,} tokens under "
+                            f"this model's chat template, past the case's {case['prompt_tokens']:,}-token prompt")
+    if len(document_ids) < need:
         raise ValueError(f"{case['id']}: document has {len(document_ids)} tokens, needs {need}")
     return (head_ids + document_ids[:need] + tail_ids, with_document(messages, model.tokenizer.decode(document_ids[:need])),
             tools)
@@ -510,6 +535,12 @@ def prepare(model, data, speed_tokens=None, sampling=None, chat_template=None):
     quality = json.loads((SUITE_DIR / "quality.json").read_text(encoding="utf-8"))
     long = json.loads((SUITE_DIR / LONG).read_text(encoding="utf-8"))
     filler = filler_ids(text, long)
+    speed_entries, unmeasurable = [], {}
+    for c in speed["cases"]:
+        try:
+            speed_entries.append(speed_entry(text, c, speed_tokens or protocol["speed"]["output_tokens"]))
+        except FrameOverflow as why:
+            unmeasurable[c["id"]] = str(why)
     prepared = {
         "protocol": protocol["protocol"],
         "suite_sha256": suite_identity(),
@@ -519,7 +550,9 @@ def prepare(model, data, speed_tokens=None, sampling=None, chat_template=None):
         "stop_ids": legacy_eos_ids(files),
         # Token ids that exist; head rows beyond this are padding and excluded from scoring.
         "valid_vocab": text.tokenizer.vocab_size,
-        "speed": [speed_entry(text, c, speed_tokens or protocol["speed"]["output_tokens"]) for c in speed["cases"]],
+        "speed": speed_entries,
+        # The speed cases this model cannot run (FrameOverflow: {case id: why}); prefill is scored over the rest.
+        "speed_unmeasurable": unmeasurable,
         # The sampling the sampled speed suite and the sampling check run at (protocol sampled_speed.sampling), and
         # where it came from: the model's generation_config.json, the protocol default, or the user's override.
         "sampling": sampling_override(sampling) if sampling is not None else sampled_settings(text.generation),
