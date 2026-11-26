@@ -218,10 +218,13 @@ def _quality_gate(result):
             for name in raised)
     allowed = [name for name, s in quality["sets"].items() if s.get("allowance_raised")]
     if allowed:
-        detail += "; judged with the checkpoint's own quantization drift as allowance: " + ", ".join(
+        detail += "; judged with the checkpoint's own declared format as allowance: " + ", ".join(
             f"{name} (" + ", ".join(f"{k[:-4]} <= {quality['sets'][name]['limits'][k]:.3g}"
                                     for k in quality["sets"][name]["allowance_raised"]) + ")"
             for name in allowed)
+    if (quality.get("allowance") or {}).get("status") == "missing":
+        # protocol quality.allowance: a speed run of a checkpoint whose declared format the data has no allowance for.
+        detail += "; " + quality["allowance"]["reason"]
     if development:
         # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).
         return {"name": "quality", "state": "unmeasured",
@@ -252,6 +255,14 @@ def _prompt_cache_gate(result):
     differ = {turn: row["first_difference"] for turn, row in again["turns"].items() if not row["identical"]}
     tied = {turn for turn in differ if forks_allowed(result) and near_ties([again["turns"][turn].get("fork")])}
     cached = [str(row.get("cached_tokens")) for row in followup["turns"]]
+    served = [row.get("cached_tokens") for row in followup["turns"]] + \
+        [row.get("cached_tokens") for row in again["turns"].values()]
+    if (result.get("engine") or {}).get("prompt_cache") and not differ and served and \
+            all(count == 0 for count in served):
+        # A declared cache that served no token in either pass never ran the cached path this gate judges.
+        return {"name": "prompt_cache", "state": "unmeasured",
+                "detail": f"the engine declares a prompt cache, but no follow-up turn was served from it in either "
+                          f"pass (0 cached prompt tokens on all {len(served)} turns): its cached path never ran"}
     return {"name": "prompt_cache", "state": "fail" if set(differ) - tied else "pass",
             "detail": (f"{len(again['turns']) - len(differ)}/{len(again['turns'])} follow-up turns answer again as "
                        f"first (cached prompt tokens {', '.join(cached)})"
@@ -1049,6 +1060,8 @@ def build(result, protocol, baseline=None):
     spreads = room.get("noise") or {}
     prefill_kpi = {"score": prefill.get("score"), "ceiling": prefill.get("ceiling_score"),
                    "fraction_of_ceiling": prefill.get("fraction_of_ceiling"), "noise": spreads.get("prefill"),
+                   # What an unpriced ceiling lacks (a device file's GEMM rates, the model's FLOPs)
+                   "missing": list(prefill.get("missing") or []) if prefill.get("ceiling_score") is None else [],
                    # The rate each format's floor takes and what achieved it (cuBLASLt GEMM or raw MMA).
                    "rates": room.get("rates"),
                    # Ceilings with the quantized matrices' prompt activations at each format, the engine's own, what
@@ -1589,6 +1602,8 @@ def _rest_lines(status, p, t, e):
         if rates.get("tflops"):
             prefill += " (at " + ", ".join(f"{name} {value:,.0f} TFLOPS {rates['sources'].get(name, '')}".rstrip()
                                            for name, value in rates["tflops"].items() if name in STORED_FORMATS) + ")"
+    elif p.get("score") and p.get("missing"):
+        prefill += f", its compute ceiling unpriced: no {', '.join(p['missing'])}"
     for cid, row in p["cases"].items():
         if row.get("ttft_ms"):
             prefill += f"; {cid} {row['ttft_ms']:,.0f} ms to first token"
@@ -1631,12 +1646,19 @@ def _rest_lines(status, p, t, e):
             line += (f"; device memory free {c['free_memory_bytes'] / 1e9:.2f} of {c['memory_total_bytes'] / 1e9:.1f} GB "
                      f"({(c.get('free_memory_at') or '').replace('_', ' ')})")
         cd, ct = c.get("decode") or {}, c.get("ttft") or {}
+        points = sorted((c.get("points") or {}).values(), key=lambda row: row.get("context") or 0)
         if cd.get("score"):
-            line += f"; sampled decode {cd['score']:.1f} tok/s over {len(c['points'])} points"
+            # Scores of the curve: geometric means over its points, each point's own value beside them (a mean of a
+            # short and the longest point is neither)
+            line += (f"; sampled decode {cd['score']:.1f} tok/s geometric mean over {len(c['points'])} points ("
+                     + ", ".join(f"{row['context']:,} {row['decode_tps']:.1f}" for row in points
+                                 if row.get("decode_tps")) + ")")
             if cd.get("ceiling_score"):
                 line += f", {_pct(cd['fraction_of_ceiling'])} of its ceiling {cd['ceiling_score']:.1f}"
         if ct.get("score_ms"):
-            line += f"; first token {ct['score_ms']:,.0f} ms"
+            line += (f"; first token {ct['score_ms']:,.0f} ms geometric mean over {len(c['points'])} points ("
+                     + ", ".join(f"{row['context']:,} {row['ttft_ms']:,.0f} ms" for row in points
+                                 if row.get("ttft_ms")) + ")")
             if ct.get("floor_ms"):
                 line += f", {_pct(ct['fraction_of_floor'])} of its {ct['floor_ms']:,.0f} ms floor"
         line += "".join(f"; {int(key):,} not measured: {why}" for key, why in (c.get("not_measured") or {}).items())

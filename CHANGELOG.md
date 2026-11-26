@@ -9,6 +9,80 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-11-26
+
+### Overview
+
+crit-eval 0.8.2 releases protocol crit-eval-v0.8.2, which stays in the 0.8 series: results compare with v0.8.1's.
+Speed mode now judges a checkpoint's own declared activation format by what it measurably costs: the reference
+measures that allowance by default, and each quality set is judged against the larger of speed's limits and twice
+the allowance, so an NVFP4 checkpoint with quantized activations is no longer failed for the drift its own format
+brings. A speed case whose repetitions spread past the disturbed limit is measured once more before the round
+stops. The concurrency gate compares a served tool-call case with its own reply at the part's output length, the
+`prompt_cache` gate no longer passes an engine whose cache served no token, and each quality set lists its positions
+of the largest KLD. The status names its context scores as geometric means, and the pre-check names a case still
+warming after the engine is reopened. crit 0.24.0 ships with crit-eval 0.8.2, which needs crit-core and crit-models
+0.24.0 or later.
+
+### Added
+
+- Each quality set and path lists its 8 positions of the largest KLD (`worst_positions`, protocol
+  `quality.worst_positions`, reported, not judged): the text and row, the KLD, the reference's top-1 probability and
+  both sides' log-probability of the text's token, so a p99 decided by a few positions shows whether the reference
+  was near-certain there. Scores and judging are unchanged.
+
+### Changed
+
+- The `prompt_cache` gate reads unmeasured, no longer pass, when the engine declares a prompt cache
+  (`prompt_cache` true) and every follow-up turn reports 0 cached tokens in both passes: the cached path the gate
+  judges never ran. Under v0.8.1 such a result passed (the Gemma 4 build's engine, whose kept prompts were evicted
+  on arrival, did). Results whose cache served a token, engines that declare no cache, and failing results are
+  unchanged.
+- Speed mode judges a checkpoint's own declared activation format against what it costs (protocol
+  `quality.allowance`, crit-eval-v0.8.2): where the data holds the checkpoint's allowance (`allowance.json`, `crit
+  eval reference --allowance`), each set and path is judged against the larger of speed's limits and 2
+  (`allowance.factor`) times the allowance's KLD mean and p99, and 1 plus twice its perplexity ratio's distance from
+  1. The limits a run's own `--quality-budget` sets are not raised, and the reference's spread still raises a limit
+  further. Results record the limits the allowance raised and its values per set (`allowance`,
+  `allowance_raised`) and the run's `quality.allowance` (applied, or missing with the reason), and status names
+  them. A speed run of a checkpoint that declares quantized activations but whose data holds no allowance is judged
+  against speed's limits alone and says so. Preserve is unchanged. Results under v0.8.1 and earlier were judged
+  against the bare caps (mean KLD 0.4, p99 4.0, PPL ratio 1.4) whatever the format cost: on Gemma 4 31B NVFP4 the
+  format alone costs a prompt p99 of 3.2-6.4 and mean KLD 0.25-0.50, so the limits become p99 about 6.4 on
+  conversations and 10.6-12.7 on the long sets, and mean 0.5-1.0; its served paths stay at speed's limits.
+  Checkpoints that declare no quantized activations (weight-only, 16-bit, GGUF) are unchanged.
+- `crit eval reference` (and every caller of `score_data`, such as crit's `crit run eval`) measures the allowance by
+  default when the checkpoint declares quantized activations, so speed runs of such a checkpoint are judged by it
+  without anyone asking for it; `--no-allowance` skips the second scoring pass (about 4 min for Gemma 4 31B on an
+  RTX 5090). A checkpoint that declares none stores an empty allowance without a second pass. Data scored before
+  holds none until `crit eval reference` runs again, which keeps the stored scores and adds the allowance.
+
+- A speed case whose measured decode speeds spread past `disturbed_spread` (25%) is measured once more, its warmups
+  included, and stops the round only when it is disturbed a second time (protocol `speed.disturbed`, and the sampled
+  suite's `round_ms` rule); the case records the first measurement's spread as `measured_again`. An engine reopened
+  in the same host can settle and move again while its file-backed pages come back: a build's certified round stopped
+  twice in the lower-context round on agent-long (68%, then 26%). A case that is not disturbed is measured as before,
+  so scores stay in the 0.8 series.
+
+### Fixed
+
+- The pre-check's lower-context item names a case still warming after the engine was reopened in the same host (its
+  decode rising on every sample, by 5% or more from the first to the last) in its detail and its `warming` facts,
+  whatever the verdict, where it reported the reopened engine's warm-up as the lower context's cost.
+- The status's context line names its decode and first-token scores geometric means over the curve's points and
+  gives each point's value beside them; it printed "first token N ms" alone, which a summary quoted as the longest
+  point's (105 s for a 200k point of 478 s). A prefill whose compute ceiling is unpriced says what it lacks (a device
+  file's GEMM rates), where it printed nothing.
+- The concurrency gate compares a served engine's replies to a speed case whose prompt defines tools (tool-call,
+  agent) with that case's reply run alone at the part's `output_tokens` (a one-client cohort, `serial_source` "speed
+  part and one-client runs"), no longer with the speed part's reply. A server shapes a reply's text by how it ends:
+  crit serve streams a tool call it finished as delta tool_calls (name and arguments) and one the output limit cut as
+  text with the format's markers, so the speed part's 256-token reply, its call finished, and a level's 128-token
+  reply, its call cut, differed at token 1 on an engine that decoded the same tokens (the Gemma 4 build's
+  candidate-0023 failed the gate on every level that way, the 1-client level too). In-process engines, whose replies
+  are their token ids, and cases without tools still compare with the speed part (protocol
+  `concurrency.consistency`).
+
 ## [0.8.1] - 2026-11-23
 
 ### Overview

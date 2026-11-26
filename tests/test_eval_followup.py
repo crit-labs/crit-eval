@@ -62,14 +62,14 @@ class Engine(chat.ChatEngine):
 class FollowupTests(unittest.TestCase):
     protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
 
-    def measure(self, engine, max_context=1000, **info):
+    def measure(self, engine, max_context=1000, declared=None, **info):
         prepared, info = {"followup": TURNS}, {"max_context": max_context, **info}
         first = history.run_followup(engine, info, prepared, self.protocol, lambda m: None)
         if first["status"] == "measured":
             first["again"] = history.compare_followup(
                 first, history.run_followup(engine, info, prepared, self.protocol, lambda m: None))
         gate = next(g for g in status._gates({"requirements": {"exactness": "reported", "quality_mode": "preserve"}, "context": {"tokens": None,
-                    "reason": "-", "missing": []}, "followup": first}) if g["name"] == "prompt_cache")
+                    "reason": "-", "missing": []}, "followup": first, "engine": declared or {}}) if g["name"] == "prompt_cache")
         return first, gate
 
     def test_without_a_cache_every_turn_prefills_and_the_gate_passes(self):
@@ -99,6 +99,22 @@ class FollowupTests(unittest.TestCase):
         first, gate = self.measure(Engine(exact=True, drifts=True))
         self.assertEqual([t["cached_tokens"] for t in first["turns"]], [0, 0, 0])
         self.assertEqual(gate["state"], "fail")
+
+    def test_a_declared_cache_that_serves_no_turn_in_either_pass_leaves_the_gate_unmeasured(self):
+        # The cached path never ran: a pass would say it answers as the fresh one without having seen it.
+        first, gate = self.measure(Engine(), declared={"prompt_cache": True})
+        self.assertEqual(gate["state"], "unmeasured")
+        self.assertIn("no follow-up turn was served from it in either pass", gate["detail"])
+        # One cached turn, in either pass, measures it; an engine that declares nothing is judged as before.
+        self.assertEqual(self.measure(Engine(exact=True), declared={"prompt_cache": True})[1]["state"], "pass")
+        self.assertEqual(self.measure(Engine())[1]["state"], "pass")
+        # A cache that serves nothing yet answers otherwise the second time still fails.
+        drifting = Engine(drifts=True)
+        drifting.generate = lambda prompt, n, on_tokens, prompt_cache=False, seen=[]: (
+            seen.append(1), on_tokens([len(seen)] * n),
+            {"tokens": [len(seen)] * n, "served": {"prompt_tokens": len(prompt), "output_tokens": n,
+                                                   "cached_tokens": 0, "finish_reason": "length"}})[-1]
+        self.assertEqual(self.measure(drifting, declared={"prompt_cache": True})[1]["state"], "fail")
 
     def test_an_engine_that_declares_no_prompt_cache_is_not_sent_the_turns_and_passes(self):
         engine = Engine()

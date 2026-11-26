@@ -30,7 +30,7 @@ from .tracks import closed as closed_track, engine_loads, mode_budgets
 from .long_context import (compare_lower, context_requirement, run_context, run_lower_context, run_required_again,
                            run_retrieval)
 from .quality_checks import (merge_honesty, merge_quality, quality_thresholds, reference_origin, run_attribution,
-                             run_honesty, run_quality, stored_spread)
+                             run_honesty, run_quality, stored_allowance, stored_spread)
 from .speed import (drafts, run_exactness, run_heldout, run_sampled_speed, run_sampling_check, run_speed,
                     run_wider_draft, speed_summary)
 from .stages import (choose, creep, exactness_cases, memory_fit, observations, price, quality_rows, quality_sets,
@@ -198,6 +198,9 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                           **fixed.identity(fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"])}
     reference_scores = fixed.load(data, reference_identity) if "quality" in parts else None
     reference_spread = stored_spread(data, prepared, protocol, reference_identity) if "quality" in parts else None
+    # protocol quality.allowance: in speed, the checkpoint's own declared format raises a set's limits.
+    reference_allowance = (stored_allowance(data, protocol, reference_identity, model, quality_budget, mode=quality_mode)
+                           if "quality" in parts else None)
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
@@ -275,7 +278,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                 return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions,
                                 log, continuations, required, settings, exactness, disturbed, bandwidth_gbs,
                                 device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
-                                reference_spread, attribute_drift, adaptive_sampled, staged)
+                                reference_spread, attribute_drift, adaptive_sampled, staged, reference_allowance)
             except (Disturbed, Hung) as error:
                 # What the run measured until then stays in the result, marked aborted.
                 log(f"aborted: {error}")
@@ -378,7 +381,7 @@ def _stopped(result, times, out, written, reason, detail):
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
              out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None,
-             attribute_drift=False, adaptive_sampled=False, staged=None):
+             attribute_drift=False, adaptive_sampled=False, staged=None, reference_allowance=None):
     times = times or PartTimes()
     lower = None
     # A staged run measures the lower context in its stage 3, after its engine closed.
@@ -449,7 +452,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         if staged is not None:
             plan = _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required,
                            settings, exactness, disturbed, reference_scores, reference_spread,
-                           memory, times, baseline, staged, concurrency, counters)
+                           memory, times, baseline, staged, concurrency, counters, reference_allowance)
         else:
             fresh = None
             if "history" in parts:
@@ -509,7 +512,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 with times.part("quality"):
                     result["quality"] = run_quality(engine, info, prepared, protocol, log, reference_scores,
                                                     result["requirements"]["quality_budget"], reference_spread,
-                                                    mode=headroom.quality_mode(result))
+                                                    mode=headroom.quality_mode(result), allowance=reference_allowance)
                 stopped = result["quality"].get("stopped_early")
                 if stopped:
                     # protocol quality.fail_fast: nothing after quality can pass a run this far over the budget.
@@ -613,7 +616,8 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 result["quality"]["attribution"] = run_attribution(
                     module, model, config, prepared, protocol, log, reference_scores,
                     result["requirements"]["quality_budget"], reference_spread, result["quality"],
-                    info.get("exact_variants"), required, mode=headroom.quality_mode(result))
+                    info.get("exact_variants"), required, mode=headroom.quality_mode(result),
+                    allowance=reference_allowance)
     wider = info.get("wider_draft")
     if (wider and "speed" in result and info.get("speculative") and not info.get("served")
             and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
@@ -750,7 +754,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
 
 def _staged(result, engine, info, module, prepared, protocol, parts, log, continuations, required, settings, exactness,
             disturbed, reference_scores, reference_spread, memory, times, baseline, staged,
-            concurrency, counters):
+            concurrency, counters, reference_allowance=None):
     """The parts of a staged run on its engine (protocol stages): stage 1, then the highest stage that fits the
     budget at the rates the engine measured (with the certification's request at the requirement when certified),
     the request history again, and the concurrency part, each level while it fits (concurrency(fits)). counters: the
@@ -882,7 +886,8 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             with times.part("quality"):
                 result["quality"] = run_quality(engine, info, with_quality(prepared, first), protocol, log,
                                                 reference_scores, result["requirements"]["quality_budget"],
-                                                reference_spread, mode=headroom.quality_mode(result))
+                                                reference_spread, mode=headroom.quality_mode(result),
+                                                allowance=reference_allowance)
             if result["quality"].get("status") == "scored":
                 result["quality"]["skipped"].update({**over, **{name: "a stage 2 set" for name in later}})
         else:
@@ -947,7 +952,7 @@ def _staged(result, engine, info, module, prepared, protocol, parts, log, contin
             with times.part("quality"):
                 more = run_quality(engine, info, with_quality(prepared, later), protocol, log, reference_scores,
                                    result["requirements"]["quality_budget"], reference_spread,
-                                   mode=headroom.quality_mode(result))
+                                   mode=headroom.quality_mode(result), allowance=reference_allowance)
             result["quality"] = merge_quality(result["quality"], more)
             stopped = result["quality"].get("stopped_early")
         curve_seconds = (cost(2, "context") or 0.0) + (cost("certify", "context") or 0.0) if found else None

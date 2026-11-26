@@ -480,13 +480,20 @@ engine's activation quantization (the format the checkpoint declares included) a
 drift in either one.
 
 The budget is the cap that the speed mode's per-set allowance had from crit-eval-v0.3.0 to v0.4.x: four
-times the checkpoint's own drift, never past these limits. `crit eval reference --allowance` measures that
-drift on request when the checkpoint declares quantized input activations on any matrix or the output head (NVFP4
+times the checkpoint's own drift, never past these limits. `crit eval reference` measures that
+drift by default (`--no-allowance` skips it) when the checkpoint declares quantized input activations on any matrix or the output head (NVFP4
 in groups of 16 with the stored global scale, FP8 per token or per tensor;
 `crit_eval.limits.schemes.activations`). It scores the texts a second time with those activations
 quantized as declared and keeps how far that lands from the exact scores, per set and path
 (`allowance.json` beside the scores; reference packages carry it). That shows what the format itself
-costs. Runs no longer read it. Fused experts (every expert's matrices stacked, gate and up joined
+costs. From crit-eval-v0.8.2 a speed run reads it again: each set and path is judged against the larger of
+speed's limits and twice its allowance (`quality.allowance.factor`: KLD mean and p99, and the perplexity
+ratio's distance from 1), so an engine of the checkpoint's own arithmetic is not shut out by a cap set on
+another checkpoint's format. On Gemma 4 31B NVFP4 the format alone costs a prompt p99 of 5.3-6.4 and mean KLD
+0.39-0.50 on the long sets, over speed's caps; its limits there become p99 10.6-12.7 and mean 0.78-1.0. The
+limits a run's own `--quality-budget` sets are not raised, preserve never reads it, and a speed run of a
+checkpoint that declares quantized activations without an allowance in its data is judged against the caps
+alone and says so (`quality.allowance`). Fused experts (every expert's matrices stacked, gate and up joined
 along the output rows) quantize each expert matrix's input with that matrix's own declared scale. A
 model whose declared matrices the modeling code multiplies any other way than through `nn.Linear` or
 such fused experts gets no measured drift (`unsupported`).

@@ -215,6 +215,40 @@ class ActivationTests(unittest.TestCase):
             self.assertIsNone(fixed.load_allowance(data, {"reference": 4}))   # another reference's
             self.assertTrue((Path(data) / fixed.STORE / fixed.ALLOWANCE).is_file())
 
+    def test_speed_reads_the_allowance_and_preserve_does_not(self):
+        # protocol quality.allowance: a speed run judges by the stored allowance, the limits its own budget sets left
+        # out; preserve never reads it; a checkpoint that declares quantized activations without one is said missing.
+        from crit_eval import load_json, EVAL_DIR
+        from crit_eval.run import quality_checks
+        protocol = load_json(EVAL_DIR / "protocol.json")
+        identity = {"reference": 3}
+        sets = {"long-1/prompt": {"kld_mean": 0.5, "kld_p99": 6.4, "ppl_ratio": 1.3}}
+        with tempfile.TemporaryDirectory() as data:
+            with patch("crit_eval.limits.schemes.declares_activations", return_value=True) as declares:
+                missing = quality_checks.stored_allowance(data, protocol, identity, "model", mode="speed")
+                self.assertIn("declares quantized activations but the data holds no allowance", missing["missing"])
+                declares.return_value = False
+                self.assertIsNone(quality_checks.stored_allowance(data, protocol, identity, "model", mode="speed"))
+                self.assertIsNone(quality_checks.stored_allowance(data, protocol, identity, "model", mode="preserve"))
+                fixed.write_allowance(data, {**identity, "allowance": "declared_activations"},
+                                      {"activations": ["nvfp4"], "sets": sets})
+                self.assertEqual(quality_checks.stored_allowance(data, protocol, identity, "model", mode="speed"),
+                                 {"factor": 2.0, "sets": sets, "keys": list(quality_checks.QUALITY_KEYS)})
+                self.assertEqual(quality_checks.stored_allowance(data, protocol, identity, "model",
+                                                                 {"kld_p99_max": 5.0}, mode="speed")["keys"],
+                                 ["ppl_ratio_max", "kld_mean_max"])
+                self.assertIsNone(quality_checks.stored_allowance(data, protocol, identity, "model", mode="preserve"))
+                self.assertIsNone(quality_checks.stored_allowance(data, protocol, {"reference": 4}, None,
+                                                                  mode="speed"))   # another reference's
+                fixed.write_allowance(data, {**identity, "allowance": "declared_activations"},
+                                      {"unsupported": "int4 activations", "sets": {}})
+                self.assertIn("int4 activations",
+                              quality_checks.stored_allowance(data, protocol, identity, mode="speed")["missing"])
+                fixed.write_allowance(data, {**identity, "allowance": "declared_activations"},
+                                      {"activations": [], "sets": {}})
+                declares.return_value = True
+                self.assertIsNone(quality_checks.stored_allowance(data, protocol, identity, "model", mode="speed"))
+
 
 @unittest.skipUnless(HAS_REFERENCE, "needs torch, transformers, safetensors and tokenizers")
 class DeclaredActivationsReferenceTests(unittest.TestCase):
@@ -301,6 +335,15 @@ class DeclaredActivationsReferenceTests(unittest.TestCase):
             self.assertEqual(reference.store_allowance(plain, refused, texts, 4, None, {**identity, "model_sha256": "p"},
                                                        layout, [], log=lambda m: None), "none")
             self.assertEqual(fixed.load_allowance(refused, {"model_sha256": "p"}), {"activations": [], "sets": {}})
+
+    def test_a_run_reads_from_headers_whether_a_checkpoint_declares_quantized_activations(self):
+        # What a speed run asks when the data holds no allowance (quality_checks.stored_allowance): no torch.
+        from crit_eval.limits.schemes import declares_activations
+        with tempfile.TemporaryDirectory() as temp:
+            folder, _, _ = nvfp4_checkpoint(Path(temp))
+            self.assertTrue(declares_activations(folder))
+            self.assertFalse(declares_activations(Path(temp) / "original"))
+            self.assertFalse(declares_activations(Path(temp) / "nowhere"))
 
     def test_fused_experts_quantize_each_matrix_input_with_its_own_scale(self):
         # Experts the modeling code multiplies through fused parameters (gate and up joined, every expert stacked):

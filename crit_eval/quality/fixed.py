@@ -40,8 +40,8 @@ def mode_of(requirements):
 
 
 # How far the checkpoint run with its activations quantized as it declares lands from the stored scores, per set and
-# path (crit_eval.quality.reference.store_allowance): what the format itself costs, beside the scores. Reported only
-# (protocol quality.allowance): no run reads it.
+# path (crit_eval.quality.reference.store_allowance): what the format itself costs, beside the scores. A speed
+# run's limits are raised to its factor times it (protocol quality.allowance, crit_eval.run.quality_checks.stored_allowance).
 ALLOWANCE = "allowance.json"
 # The reference's own spread (protocol quality.spread): how a second run of the long texts under an engine-sized
 # perturbation (TF32 matmuls) disagrees with the stored scores, per set and path, with the identity it was computed

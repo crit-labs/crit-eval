@@ -9,7 +9,7 @@ from ..quality.prepare import sampled_request, unapplied
 from .adapters import open_engine
 from . import energy
 from .tool_calls import case_tool_calls
-from .timing import (_summary, check_disturbed, decode_text, engine_memory, disagree, provisional, rate, replies, reply_sha256,
+from .timing import (Disturbed, _summary, check_disturbed, decode_text, engine_memory, disagree, provisional, rate, replies, reply_sha256,
                      settling, stalls, steady_state, timed_generate, timed_plain, timed_replay, timed_sampled)
 
 
@@ -46,59 +46,72 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             cases[case["id"]] = {"status": "skipped", "reason": refused, "over_budget": True}
             log(f"speed {case['id']}: skipped ({refused})")
             continue
-        before = (warmed or {}).get(case["id"]) or {}
-        samples = [{**s, "warmup": True} for s in before.get("samples", [])]
-        carried = len(samples)   # an earlier call's warmups: other cases ran between them and this call's requests
-        outputs = [before["tokens"]] if before.get("tokens") is not None else []
-        own = len(outputs)   # outputs before this call's: the warmup's, compared but not the case's tokens
-        load = HostLoad().start()
-        memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
-        continuation = pinned.get(case["id"])
-        if pinned and (continuation is None or len(continuation) != n):
-            raise SystemExit(f"{CONTINUATIONS} has no {n}-token continuation for speed case {case['id']}")
-        # A single repetition is compared with its warmup: when they disagree it gets a second, and a third when
-        # those two disagree in turn (protocol speed.extra_repetition).
-        extra = 2 if repetitions == 1 and (warmups or samples) else 1
-        # A request whose decode is still moving away from the one before it (a cache adapting to the case) stands as
-        # one more warmup, up to the protocol's bound (protocol speed.steady_state).
-        warm, added = warmups, 0
-        # The case's first request (protocol speed.fresh_decode): with a pinned continuation the first free generation,
-        # which runs before the replays; a staged run's is its first stage's.
-        first = before.get("first_request")
-        if continuation is not None:
-            for _ in range(2):
-                tokens, sample = timed_generate(engine, prompt, n)
-                outputs.append(tokens)
-                first = first or first_request(sample)
-        i = 0
-        while i < warm + repetitions + extra:
-            if i >= warm + repetitions and not disagree(samples, outputs, tolerance):
+        retried = None   # what stopped a first measurement of the case (protocol speed.disturbed)
+        for retry in (False, True):
+            try:
+                # Measured again, the case warms up anew: an earlier call's warmup no longer stands for it.
+                before = {} if retry else (warmed or {}).get(case["id"]) or {}
+                samples = [{**s, "warmup": True} for s in before.get("samples", [])]
+                carried = len(samples)   # an earlier call's warmups: other cases ran between them and this call's requests
+                outputs = [before["tokens"]] if before.get("tokens") is not None else []
+                own = len(outputs)   # outputs before this call's: the warmup's, compared but not the case's tokens
+                load = HostLoad().start()
+                memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
+                continuation = pinned.get(case["id"])
+                if pinned and (continuation is None or len(continuation) != n):
+                    raise SystemExit(f"{CONTINUATIONS} has no {n}-token continuation for speed case {case['id']}")
+                # A single repetition is compared with its warmup: when they disagree it gets a second, and a third when
+                # those two disagree in turn (protocol speed.extra_repetition).
+                extra = 2 if repetitions == 1 and (warmups or samples) else 1
+                # A request whose decode is still moving away from the one before it (a cache adapting to the case) stands as
+                # one more warmup, up to the protocol's bound (protocol speed.steady_state).
+                warm, added = warmups, 0
+                # The case's first request (protocol speed.fresh_decode): with a pinned continuation the first free generation,
+                # which runs before the replays; a staged run's is its first stage's.
+                first = before.get("first_request")
+                if continuation is not None:
+                    for _ in range(2):
+                        tokens, sample = timed_generate(engine, prompt, n)
+                        outputs.append(tokens)
+                        first = first or first_request(sample)
+                i = 0
+                while i < warm + repetitions + extra:
+                    if i >= warm + repetitions and not disagree(samples, outputs, tolerance):
+                        break
+                    if continuation is not None:
+                        _, sample = energy.metered(timed_replay, engine, prompt, continuation)
+                    else:
+                        tokens, sample = energy.metered(timed_generate, engine, prompt, n)
+                        # Which reply this request decoded: repetitions of different replies are not a disturbance
+                        # (protocol speed.output_varies).
+                        sample["reply_sha256"] = reply_sha256(tokens)
+                    sample["warmup"] = i < warm
+                    # A first measured repetition compared only with an earlier call's warmup was provisional: when the
+                    # request after it moves away from it, it was still warming up (protocol speed.steady_state).
+                    if not sample["warmup"] and provisional(samples, sample, steady, carried):
+                        samples[-1]["warmup"], warm, added = True, warm + 1, added + 1
+                    if not sample["warmup"] and settling(samples, sample, steady):
+                        sample["warmup"], warm, added = True, warm + 1, added + 1
+                    samples.append(sample)
+                    if continuation is None:
+                        outputs.append(tokens)   # the warmup's too: the repeatable gate compares every output
+                    i += 1
+                if continuation is None:
+                    own += warm
+                first = first or first_request(samples[0] if samples else {})
+                other = load.cores()
+                # The GPU's energy over the measured requests (crit_eval.run.energy; reported, not judged).
+                drawn = energy.case(samples, len(prompt))
+                check_disturbed(case["id"], samples, disturbed_spread, other, memory=(memory, engine_memory(engine)))
                 break
-            if continuation is not None:
-                _, sample = energy.metered(timed_replay, engine, prompt, continuation)
-            else:
-                tokens, sample = energy.metered(timed_generate, engine, prompt, n)
-                # Which reply this request decoded: repetitions of different replies are not a disturbance
-                # (protocol speed.output_varies).
-                sample["reply_sha256"] = reply_sha256(tokens)
-            sample["warmup"] = i < warm
-            # A first measured repetition compared only with an earlier call's warmup was provisional: when the
-            # request after it moves away from it, it was still warming up (protocol speed.steady_state).
-            if not sample["warmup"] and provisional(samples, sample, steady, carried):
-                samples[-1]["warmup"], warm, added = True, warm + 1, added + 1
-            if not sample["warmup"] and settling(samples, sample, steady):
-                sample["warmup"], warm, added = True, warm + 1, added + 1
-            samples.append(sample)
-            if continuation is None:
-                outputs.append(tokens)   # the warmup's too: the repeatable gate compares every output
-            i += 1
-        if continuation is None:
-            own += warm
-        first = first or first_request(samples[0] if samples else {})
-        other = load.cores()
-        # The GPU's energy over the measured requests (crit_eval.run.energy; reported, not judged).
-        drawn = energy.case(samples, len(prompt))
-        check_disturbed(case["id"], samples, disturbed_spread, other, memory=(memory, engine_memory(engine)))
+            except Disturbed as error:
+                if retry:
+                    raise
+                # A first disturbance is measured once more, warmups included: an engine reopened in the same
+                # host can settle, then move again while its file-backed pages come back (protocol
+                # speed.disturbed). A second one stops the round.
+                retried = str(error)
+                log(f"speed {case['id']}: {error}; measuring the case once more")
         summary = _summary([s for s in samples if not s["warmup"]])
         tokens = outputs[own] if continuation is None else outputs[-2]
         crossed = [i for i, t in enumerate(tokens) if t in stop_ids]
@@ -114,6 +127,9 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             "output_varies": output_varies(samples),
             "stop_crossed": bool(crossed), "first_stop_index": crossed[0] if crossed else None,
             "tokens": tokens, "samples": samples,
+            # The disturbance that stopped the case's first measurement, which this one replaced (protocol
+            # speed.disturbed).
+            **({"measured_again": retried} if retried else {}),
             # The prompt's first request, before any warmup or replay (protocol speed.fresh_decode).
             "first_request": first,
             # The warmups the case took to reach steady speed and how far its speed moved meanwhile.
@@ -244,55 +260,68 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
         if len(prompt) + n > info["max_context"]:
             cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
             continue
-        samples = []
-        load = HostLoad().start()
-        memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
-        # A first measured repetition whose time per target pass still moves away from the request before it stands
-        # as one more warmup, and its seed is asked again (protocol sampled_speed.steady_state).
-        warm, added, i = warmups, 0, 0
-        while i < warm + repetitions:
-            request = sampled_request(settings, rule["seeds"]["warmup"] if i < warmups else seed_at(i - warm))
-            if i == 0 and i < warmups and checked is not None:
-                reported = None
-                try:   # the warmup's reply, its timing unused, is the sampling check's
-                    _, sample, reported = timed_sampled(engine, prompt, n, request,
-                                                        int(protocol["sampling_check"]["top_logprobs"]))
-                except RuntimeError as error:
-                    log(f"sampled speed {case['id']}: the warmup with log-probabilities failed ({error}); "
-                        "warming up without them")
-                    _, sample, _ = timed_sampled(engine, prompt, n, request)
-                if reported:
-                    checked[case["id"]] = {"logprobs": reported, "seed": request.get("seed")}
-            else:
-                _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, request)
-            sample["warmup"] = i < warm
-            if (not sample["warmup"] and full_length(sample) and settling(samples, sample, steady, key="round_ms")
-                    and full_length(samples[-1])):
-                sample["warmup"], warm, added = True, warm + 1, added + 1
-            samples.append(sample)
-            i += 1
-        speeds = lambda: [s["decode_tps"] for s in samples if not s["warmup"] and s.get("decode_tps")]  # noqa: E731
-        extra = 0
-        while adaptive and repetitions + extra < cap and (len(speeds()) < 2
-                                                          or (metrics.case_error(speeds())[0] or 0.0) > target):
-            # The next seed after those measured (2, 3, ...): one more text, until the case's error reaches the target.
-            seed = seed_at(repetitions + extra)
-            _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, sampled_request(settings, seed))
-            sample.update(warmup=False, seed=seed)
-            samples.append(sample)
-            extra += 1
-        error, deviation = metrics.case_error(speeds())
-        other = load.cores()
-        drawn = energy.case(samples, len(prompt))
-        # Only replies decoded to their full length show the device: one a server ended early, at an end token or a
-        # tool call, has its time per pass from a few tokens and from how the server streamed the call.
-        full = [s for s in samples if not s["warmup"] and full_length(s)]
-        if len(full) >= 2:
-            check_disturbed(case["id"], full, disturbed_spread, other, key="round_ms",
-                            memory=(memory, engine_memory(engine)))
+        retried = None   # what stopped a first measurement of the case (protocol speed.disturbed)
+        for retry in (False, True):
+            try:
+                samples = []
+                load = HostLoad().start()
+                memory = engine_memory(engine)   # Core's memory before the case, whose changes a disturbance names
+                # A first measured repetition whose time per target pass still moves away from the request before it stands
+                # as one more warmup, and its seed is asked again (protocol sampled_speed.steady_state).
+                warm, added, i = warmups, 0, 0
+                while i < warm + repetitions:
+                    request = sampled_request(settings, rule["seeds"]["warmup"] if i < warmups else seed_at(i - warm))
+                    if i == 0 and i < warmups and checked is not None and not retry:
+                        reported = None
+                        try:   # the warmup's reply, its timing unused, is the sampling check's
+                            _, sample, reported = timed_sampled(engine, prompt, n, request,
+                                                                int(protocol["sampling_check"]["top_logprobs"]))
+                        except RuntimeError as error:
+                            log(f"sampled speed {case['id']}: the warmup with log-probabilities failed ({error}); "
+                                "warming up without them")
+                            _, sample, _ = timed_sampled(engine, prompt, n, request)
+                        if reported:
+                            checked[case["id"]] = {"logprobs": reported, "seed": request.get("seed")}
+                    else:
+                        _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, request)
+                    sample["warmup"] = i < warm
+                    if (not sample["warmup"] and full_length(sample) and settling(samples, sample, steady, key="round_ms")
+                            and full_length(samples[-1])):
+                        sample["warmup"], warm, added = True, warm + 1, added + 1
+                    samples.append(sample)
+                    i += 1
+                speeds = lambda: [s["decode_tps"] for s in samples if not s["warmup"] and s.get("decode_tps")]  # noqa: E731
+                extra = 0
+                while adaptive and repetitions + extra < cap and (len(speeds()) < 2
+                                                                  or (metrics.case_error(speeds())[0] or 0.0) > target):
+                    # The next seed after those measured (2, 3, ...): one more text, until the case's error reaches the target.
+                    seed = seed_at(repetitions + extra)
+                    _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, sampled_request(settings, seed))
+                    sample.update(warmup=False, seed=seed)
+                    samples.append(sample)
+                    extra += 1
+                error, deviation = metrics.case_error(speeds())
+                other = load.cores()
+                drawn = energy.case(samples, len(prompt))
+                # Only replies decoded to their full length show the device: one a server ended early, at an end token or a
+                # tool call, has its time per pass from a few tokens and from how the server streamed the call.
+                full = [s for s in samples if not s["warmup"] and full_length(s)]
+                if len(full) >= 2:
+                    check_disturbed(case["id"], full, disturbed_spread, other, key="round_ms",
+                                    memory=(memory, engine_memory(engine)))
+                break
+            except Disturbed as error:
+                if retry:
+                    raise
+                # A first disturbance is measured once more, warmups included: an engine reopened in the same
+                # host can settle, then move again while its file-backed pages come back (protocol
+                # speed.disturbed). A second one stops the round.
+                retried = str(error)
+                log(f"sampled speed {case['id']}: {error}; measuring the case once more")
         summary = _summary([s for s in samples if not s["warmup"]])
         cases[case["id"]] = {"status": "measured", "kind": case["kind"], "prompt_tokens": len(prompt), "output_tokens": n,
                              **summary, "samples": samples,
+                             **({"measured_again": retried} if retried else {}),
                              "steady_state": steady_state(samples, steady, added, key="round_ms"),
                              "host_other_cpu_cores": None if other is None else round(other, 2),
                              # The case's relative standard error over its measured texts, the repetitions it took,

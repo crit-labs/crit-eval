@@ -220,6 +220,21 @@ class ConcurrencyTests(unittest.TestCase):
         self.server.unstable = True
         self.assertEqual(self.gate(self.measure(result={}))["state"], "fail")
 
+    def test_a_served_case_with_tools_is_compared_with_its_own_reply_run_alone(self):
+        # A server streams a finished call as delta tool_calls and one the output limit cut as text with its markers,
+        # so the speed part's tool-call reply, decoded to another length, is no serial reply for a level's: the case
+        # runs alone at the level's length, and the gate compares like with like.
+        self.server.step = 0.004
+        other_shape = prepare.token_ids(Text(), REPLY[:12].upper())   # the speed reply's text, shaped otherwise
+        found = self.measure(result={"speed": {"cases": {
+            "chat": {"status": "measured", "tokens": prepare.token_ids(Text(), REPLY[:12])},
+            "tool-call": {"status": "measured", "tokens": other_shape}}}})
+        self.assertEqual(found["serial_source"], "speed part and one-client runs")
+        for level in found["levels"].values():
+            cases = {c["case"] for c in level["consistency"]["differences"].values()}
+            self.assertEqual(level["consistency"]["fraction"], 1.0, cases)
+        self.assertEqual(self.gate(found)["state"], "pass")
+
     def test_the_gate_does_not_pass_on_no_reply_compared(self):
         level = lambda tps, peak: {"qualified": True, "aggregate_tps": tps, "errors": [], "streaming_peak": peak,  # noqa: E731
                                    "ran_together": concurrency.together(peak, peak),
