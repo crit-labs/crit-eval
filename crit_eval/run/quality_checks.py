@@ -74,26 +74,56 @@ def stored_spread(data, prepared, protocol, reference_identity, store=fixed.STOR
                                     "spread_texts": texts}, store)
 
 
-def set_limits(thresholds, spread, factor):
-    """A set's drift limits (quality_thresholds) raised to `factor` times the reference's own spread on it
-    (protocol quality.spread): kld_mean_max and kld_p99_max to factor times the spread's, ppl_ratio_max to 1 plus
-    factor times the spread ratio's distance from 1. Returns (limits, the keys raised)."""
+def set_limits(thresholds, spread, factor, keys=QUALITY_KEYS):
+    """A set's drift limits (quality_thresholds) raised to `factor` times a measured drift on it, the reference's own
+    spread (protocol quality.spread) or the checkpoint's allowance (quality.allowance): kld_mean_max and kld_p99_max
+    to factor times its kld_mean and kld_p99, ppl_ratio_max to 1 plus factor times its ratio's distance from 1, each
+    where larger and only the limits `keys` names. Returns (limits, the keys raised)."""
     if not spread:
         return dict(thresholds), []
     limits, raised = dict(thresholds), []
     for key, name in (("kld_mean_max", "kld_mean"), ("kld_p99_max", "kld_p99")):
-        if key in limits and spread.get(name) is not None:
+        if key in limits and key in keys and spread.get(name) is not None:
             value = factor * spread[name]
             if value > limits[key]:
                 limits[key], raised = value, raised + [key]
-    if "ppl_ratio_max" in limits and spread.get("ppl_ratio") is not None:
+    if "ppl_ratio_max" in limits and "ppl_ratio_max" in keys and spread.get("ppl_ratio") is not None:
         from_spread = 1.0 + factor * abs(spread["ppl_ratio"] - 1.0)
         if from_spread > limits["ppl_ratio_max"]:
             limits["ppl_ratio_max"], raised = from_spread, raised + ["ppl_ratio_max"]
     return limits, raised
 
 
-def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode, honesty=True):
+def stored_allowance(data, protocol, reference_identity, model=None, budget=None, *, mode):
+    """protocol quality.allowance, for a run in quality mode `mode`: in a mode the rule names (speed), the
+    checkpoint's allowance stored under `data` (fixed.load_allowance: what its own declared activation format costs
+    per set and path) as {"factor", "sets", "keys": the limits it may raise}, the limits a run's own budget
+    (`budget`, --quality-budget) sets left out, since the run's limits win. {"missing": why, "sets": {}} when the
+    checkpoint declares quantized activations (the allowance's own record, else the checkpoint `model`'s config and
+    tensor names: crit_eval.limits.schemes.declares_activations) but the data holds no allowance for them: such a run
+    is judged against the mode's limits alone, and says so. None otherwise: another mode, or a checkpoint that
+    declares none."""
+    rule = protocol["quality"].get("allowance") or {}
+    if mode not in (rule.get("modes") or ()):
+        return None
+    found = fixed.load_allowance(data, {**reference_identity, "allowance": "declared_activations"})
+    if found and found.get("sets"):
+        return {"factor": float(rule["factor"]), "sets": found["sets"],
+                "keys": [key for key in QUALITY_KEYS if key not in (budget or {})]}
+    if found and found.get("unsupported"):
+        return {"missing": f"the checkpoint declares activations crit does not emulate ({found['unsupported']}), so "
+                           "the data holds no allowance: judged against the mode's limits alone", "sets": {}}
+    if found is not None:
+        return None   # measured: the checkpoint declares none
+    from ..limits.schemes import declares_activations
+    if model is None or not declares_activations(model):
+        return None
+    return {"missing": "the checkpoint declares quantized activations but the data holds no allowance for them "
+                       "(crit eval reference measures it): judged against the mode's limits alone", "sets": {}}
+
+
+def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode, honesty=True,
+                allowance=None):
     """protocol quality: every quality text scored by the engine through its serving paths (an engine's score(prompt,
     continuation, top_k): an engine behind crit serve, crit_eval.run.chat) and judged against the reference's stored
     scores of the same text (reference: crit_eval.quality.fixed.load, None when the data has none). Each set is judged on
@@ -103,7 +133,9 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     Then the honesty check (run_honesty). A set whose texts do not fit the engine's max_context is skipped. Sets
     are scored in the prepared order and judged as each completes; a set far over the budget (clearly_failed) stops
     the scoring, and the result says so (stopped_early). spread: the reference's own spread per set and path
-    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). mode: the quality mode,
+    (fixed.load_spread), which raises a set's limits where it exceeds the budget (set_limits). allowance: what the
+    checkpoint's own declared activation format costs (stored_allowance), which raises a set's limits to its factor
+    times that, before the spread; a missing one is recorded as such (the result's allowance). mode: the quality mode,
     for the honesty check's bound. honesty False: the sets alone, no honesty check (the gate pre-check runs its own)."""
     rule = protocol["quality"]
     # A served engine scores through the paths it serves with; an in-process adapter's score() is development evidence:
@@ -119,11 +151,16 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
     if out["evidence"] == "development":
         log("quality: development evidence (the adapter's own score(), not the served paths): reported, not a gate "
             "result")
+    if allowance:
+        out["allowance"] = ({"status": "missing", "reason": allowance["missing"]} if allowance.get("missing") else
+                            {"status": "applied", "factor": allowance["factor"], "keys": allowance["keys"]})
+        if allowance.get("missing"):
+            log(f"quality: {allowance['missing']}")
     if reference is None:
         log("quality: not measured (no reference scores for this data)")
         return {**out, "status": "unsupported",
                 "reason": "the data holds no reference scores: run crit eval reference --model --data first"}
-    started, skipped, parts, labels, timings = time.time(), {}, {}, {}, []
+    started, skipped, parts, labels, timings, places = time.time(), {}, {}, {}, [], {}
     sets, buckets, judged, stopped = {}, {}, 0.0, None
     order = list(dict.fromkeys(text["set"] for text in prepared["quality"]))
     for set_name in order:
@@ -153,27 +190,41 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
                 found += engine_rows[pick]
                 ids.append(text["id"])
                 labels.setdefault(f"{set_name}/{part}", []).extend(bucket(i) for i in range(len(rows))[pick])
+                places.setdefault(f"{set_name}/{part}", []).extend((text["id"], i) for i in range(len(rows))[pick])
         judging = time.perf_counter()
         for name in (f"{set_name}/prompt", f"{set_name}/served"):
             reference_rows, found, ids = parts.get(name, ([], [], []))
             if not found:
                 continue   # a prompt of a single token has no prompt positions
             row = metrics.text_quality(reference_rows, found)
-            limits, raised = set_limits(thresholds, (spread or {}).get(name), float(rule["spread"]["factor"])
+            own = ((allowance or {}).get("sets") or {}).get(name)
+            limits, allowed = set_limits(thresholds, own, (allowance or {}).get("factor", 0.0),
+                                         (allowance or {}).get("keys", ()))
+            limits, raised = set_limits(limits, (spread or {}).get(name), float(rule["spread"]["factor"])
                                         if rule.get("spread") else 0.0)
             if name.endswith("/prompt"):
                 # protocol quality.prompt_perplexity: reported, not judged on the prompt positions.
                 limits.pop("ppl_ratio_max", None)
                 raised = [key for key in raised if key != "ppl_ratio_max"]
+                allowed = [key for key in allowed if key != "ppl_ratio_max"]
             failures = metrics.judge(row, limits)
             # The share's dependence on the positions the set holds (protocol quality.position_spread): reported.
             noise = rule.get("position_spread") or {}
             spread_found = metrics.budget_spread(reference_rows, found, limits, int(noise.get("block", 64)),
                                                  int(noise.get("draws", 200)), int(noise.get("seed", 0))) if noise else None
+            worst = rule.get("worst_positions") or {}
             sets[name] = {**row, "texts": ids, "passed": not failures, "failures": failures,
                           "budget_used": metrics.budget_used(row, limits), "limits": limits,
                           **({"budget_spread": spread_found} if spread_found else {}),
-                          **({"reference_spread": spread[name], "raised": raised} if raised else {})}
+                          # The positions that decide the p99, with the reference's confidence there: reported.
+                          **({"worst_positions": metrics.worst_positions(reference_rows, found, places[name],
+                                                                          int(worst.get("count", 8)))}
+                             if worst else {}),
+                          **({"reference_spread": spread[name], "raised": raised} if raised else {}),
+                          **({"allowance": own, "allowance_raised": allowed} if allowed else {})}
+            if allowed:
+                log(f"quality {name}: judged with the checkpoint's own declared format as allowance, "
+                    + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in allowed))
             if raised:
                 log(f"quality {name}: judged against the reference's own spread, "
                     + ", ".join(f"{key[:-4]} <= {limits[key]:.3g}" for key in raised))
@@ -206,12 +257,13 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
 
 
 def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
-                    context_tokens=None, *, mode):
+                    context_tokens=None, *, mode, allowance=None):
     """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
     exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
     {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
     uses and the share of the full engine's that the variant's exactness takes away. Shares need not add up: the
-    terms interact. mode: the run's quality mode, judged as the run judges it (run_quality)."""
+    terms interact. mode and allowance: the run's quality mode and allowance, judged as the run judges it
+    (run_quality)."""
     rule = protocol["quality"].get("attribution") or {}
     if quality.get("status") != "scored":
         return {"status": "unmeasured", "reason": "quality was not scored"}
@@ -226,7 +278,7 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
         engine, info = open_engine(module, model, {**config, **overrides}, speculative=True, context_tokens=context_tokens)
         try:
             scored = run_quality(engine, info, prepared, protocol, lambda line: log(f"attribution {name}: {line}"),
-                                 reference, thresholds, spread, mode=mode)
+                                 reference, thresholds, spread, mode=mode, allowance=allowance)
         finally:
             engine.close()
         sets = {set_name: s["budget_used"] for set_name, s in (scored.get("sets") or {}).items()}

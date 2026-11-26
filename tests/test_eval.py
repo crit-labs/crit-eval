@@ -502,6 +502,7 @@ PROTOCOLS = {
     "crit-eval-v0.7.1": "aa0c304e831dbf7368718b7e97b937bbf32567a132a1921ed7816b825d5ff56d",  # releases 0.7.1 to 0.7.3: honesty by exactness, staged steady state
     "crit-eval-v0.8.0": "64a97ad352f537567fe1b3bc9c593af3a9fa9e73744247f2d1c2b446e664aa6f",  # decode speed is sampled decode only; speed prices 16-bit matrices in 8 bits
     "crit-eval-v0.8.1": "fb2500d9278bd1e23cf3ad187cd63b378500f3e077d0f4415de0af442fc7df09",  # release 0.8.1: retrieval judges a reasoning model answer after a reasoning budget
+    "crit-eval-v0.8.2": "5ccb432eea193b9e5474aa47b762f3946621b38b945680118bc23fa3fab806b8",  # release 0.8.2: speed judges a checkpoint's quantized activations by their measured allowance
 }
 
 
@@ -1475,8 +1476,10 @@ class RepetitionTests(unittest.TestCase):
         counted them; returns (requests made, the measured case)."""
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
-        queue = [self.sample(s, 50.0) for s in speeds]
-        tokens = list(outputs or [[7] * 4] * len(speeds))
+        # Served twice over: a case disturbed once is measured once more (protocol speed.disturbed), and a test of a
+        # disturbed device sees the same requests the second time.
+        queue = [self.sample(s, 50.0) for s in speeds] * 2
+        tokens = list(outputs or [[7] * 4] * len(speeds)) * 2
         calls = []
 
         def timed(engine, prompt, n):
@@ -1586,6 +1589,26 @@ class RepetitionTests(unittest.TestCase):
         self.assertIsNone(report_status._above_ceiling({**decode, "fraction_of_ceiling": 0.9}))
         self.assertIsNone(report_status._above_ceiling({**decode, "ceiling_basis": None}))
 
+    def test_a_case_disturbed_once_is_measured_once_more_and_twice_stops_the_round(self):
+        # A reopened engine that settled, then moved again while its pages came back: 100 and 101 agree, 150 spreads
+        # past the limit. The case is measured once more, warmups included, and records what stopped the first try.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        self.assertIn("is measured once more", protocol["speed"]["disturbed"])
+        prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
+        queue = [self.sample(s, 50.0) for s in (100.0, 101.0, 150.0, 102.0, 101.0, 100.0, 101.0)]
+        lines = []
+
+        def timed(engine, prompt, n):
+            return [7] * 4, dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
+                                 round_ms=None, output_tokens=256)
+        with patch.object(speed, "timed_generate", timed):
+            case = speed.run_speed(None, {"max_context": 64}, prepared, protocol, 1, 2, lines.append,
+                                   disturbed_spread=0.25)["cases"]["a"]
+        self.assertIn("decode varied", case["measured_again"])
+        self.assertTrue(any("measuring the case once more" in line for line in lines), lines)
+        self.assertEqual([s["decode_tps"] for s in case["samples"]], [101.0, 100.0, 101.0])
+        self.assertNotIn("measured_again", self.run_case([100.0, 101.0], 1, disturbed_spread=0.25)[1])
+
     def test_repetitions_of_different_replies_are_not_a_disturbance(self):
         # A greedy reply that alternates between two texts, one of them slow (72-75 against 113-126 tok/s). Repetitions of the same reply agree, so the round goes on; the case records how its replies spread.
         one, two = [1] * 4, [2] * 4
@@ -1625,7 +1648,7 @@ class RepetitionTests(unittest.TestCase):
         tokens in 3 s), with a 25% disturbed limit; returns the measured case."""
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
-        queue = [self.sample(decode, ttft) for decode, ttft in requests]
+        queue = [self.sample(decode, ttft) for decode, ttft in requests] * 2   # a disturbed case is measured again
 
         def timed(engine, prompt, n):
             return [7] * 4, dict(queue.pop(0), request_ms=3000.0, prefill_tps=None, tokens_per_round=None,
@@ -2744,6 +2767,25 @@ class ContextTests(unittest.TestCase):
         self.settings = runner.load_json(runner.EVAL_DIR / "protocol.json")["context"]
         self.overhead = context.GIB + int(self.settings["reserve_gib"] * context.GIB)  # headroom and reserve
 
+    def test_the_context_line_names_its_scores_geometric_means_and_each_points_value(self):
+        # The curve's decode and first-token scores are geometric means over its points; a summary that quoted one as
+        # the longest point's value overstated it (32k and 200k: 105 s against 478 s at 200k). Each point is named.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        points = {"32768": {"context": 32768, "decode_tps": 110.9, "ttft_ms": 23141.0},
+                  "200000": {"context": 200000, "decode_tps": 48.8, "ttft_ms": 478234.0}}
+        room = {"prefill": {"score": 1530.7, "ceiling_score": None, "fraction_of_ceiling": None, "cases": {},
+                            "missing": ["device GEMM rates (--device)"]},
+                "gaps": [], "missing": [], "noise": {},
+                "context": {"decode": {"score": 73.6}, "ttft": {"score_ms": 105196.0}, "points": points}}
+        result = {**MEASURED, "engine": {"speculative": False}, "headroom": room,
+                  "context": {"tokens": 200000, "source": "given", "decode_text": {"source": "generated"}},
+                  "speed": speed_part({"a": {}}, decode_score=90.0, ttft_score_ms=10.0, complete=True)}
+        text = status.render(status.build(result, protocol))
+        self.assertIn("sampled decode 73.6 tok/s geometric mean over 2 points (32,768 110.9, 200,000 48.8)", text)
+        self.assertIn("first token 105,196 ms geometric mean over 2 points (32,768 23,141 ms, 200,000 478,234 ms)", text)
+        # A prefill without a device's rates says why its ceiling is unpriced, where it printed nothing.
+        self.assertIn("prefill  1,531 tok/s, its compute ceiling unpriced: no device GEMM rates (--device)", text)
+
     def test_max_context_is_the_smaller_of_the_model_and_device_limits(self):
         with tempfile.TemporaryDirectory() as directory:
             model = safetensors_model(directory, SHAPES, DENSE)
@@ -3457,13 +3499,14 @@ class QualityTests(unittest.TestCase):
             return {"tokens": tokens, "logprobs": [r["logprob"] for r in rows], "top": [r["top"] for r in rows]}
 
     def measure(self, engine, thresholds=None, max_context=10_000, honesty_sets=("conversations", "long-600"),
-                spread=None):
+                spread=None, allowance=None):
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         protocol["quality"]["honesty"] = dict(protocol["quality"]["honesty"], sets=list(honesty_sets))
         thresholds = thresholds or protocol["quality"]["thresholds"]
         texts = self.texts()
         quality = quality_checks.run_quality(engine, {"max_context": max_context, "served": True}, {"quality": texts}, protocol,
-                                     lambda message: None, self.reference(texts), thresholds, spread, mode="preserve")
+                                     lambda message: None, self.reference(texts), thresholds, spread, mode="preserve",
+                                     allowance=allowance)
         result = {**MEASURED, "engine": {"speculative": False}, "quality": quality, "model_sha256": "m", "suite_sha256": "s",
                   "protocol": protocol["protocol"], "speed": speed_part({"a": {}})}
         return result, status.build(result, protocol)
@@ -3519,6 +3562,27 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(current["kpis"]["kl_divergence"]["budget_used_spread"], spread["budget_used"])
         self.assertIn(f"(long-600/prompt, {spread['budget_used']['p05']:.0%}-{spread['budget_used']['p95']:.0%} over "
                       "resamples of its positions (5th-95th percentile))", status.render(current))
+
+    def test_a_set_lists_the_positions_of_its_largest_kld_with_the_references_confidence(self):
+        # A p99 decided by a few positions: which they are and how sure the reference was there (an engine that flips
+        # a near-certain position, against one that moves a spread one), reported, not judged.
+        sure = {"logprob": math.log(0.98), "top_ids": [7, 8], "top_logprobs": [math.log(0.98), math.log(0.01)]}
+        spread = {"logprob": math.log(0.4), "top_ids": [7, 8], "top_logprobs": [math.log(0.4), math.log(0.35)]}
+        same = {"logprob": math.log(0.98), "top": [[7, math.log(0.98)], [8, math.log(0.01)]]}
+        flipped = {"logprob": math.log(0.01), "top": [[8, math.log(0.98)], [7, math.log(0.01)]]}
+        moved = {"logprob": math.log(0.3), "top": [[7, math.log(0.3)], [8, math.log(0.45)]]}
+        reference = [sure, sure, spread, sure]
+        found = metrics.worst_positions(reference, [same, flipped, moved, same],
+                                        [("a", 0), ("a", 1), ("b", 0), ("b", 1)], count=2)
+        self.assertEqual([(row["text"], row["offset"]) for row in found], [("a", 1), ("b", 0)])
+        self.assertAlmostEqual(found[0]["reference_top1_probability"], 0.98)
+        self.assertAlmostEqual(found[0]["engine_logprob"], math.log(0.01))
+        self.assertGreater(found[0]["kld"], found[1]["kld"])
+        # Every set and path of a run carries them, offsets in their texts.
+        result, _ = self.measure(self.Engine(self, drift_from=500, shift=0.3, prompt_only=True))
+        worst = result["quality"]["sets"]["long-600/prompt"]["worst_positions"]
+        self.assertEqual(len(worst), 8)
+        self.assertTrue(all(row["offset"] >= 499 for row in worst), worst)   # the row scoring token 500 on
 
     def test_an_in_process_adapters_scores_are_development_evidence_not_a_gate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -3638,9 +3702,63 @@ class QualityTests(unittest.TestCase):
         self.assertEqual(self.gate(current)["state"], "pass")
         self.assertIn("judged against the reference's own spread: long-600/prompt", self.gate(current)["detail"])
 
+    def test_speed_raises_a_sets_limits_to_twice_its_own_formats_cost(self):
+        # protocol quality.allowance: in speed, a set whose checkpoint's own declared activation format costs more
+        # than the mode's limits is judged against factor (2) times that cost; the result and status say so.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        self.assertEqual((protocol["quality"]["allowance"]["factor"], protocol["quality"]["allowance"]["modes"]),
+                         (2, ["speed"]))
+        budget = quality_checks.quality_thresholds(protocol, mode="speed")
+        failing = self.measure(self.Engine(self, drift_from=520, shift=2.5), thresholds=budget)[0]["quality"]
+        self.assertFalse(failing["sets"]["long-600/served"]["passed"])
+        own = {"kld_mean": 5.0, "kld_p99": 20.0, "ppl_ratio": 4.0}
+        allowance = {"factor": 2.0, "sets": {"long-600/served": own, "long-600/prompt": own},
+                     "keys": list(quality_checks.QUALITY_KEYS)}
+        result, current = self.measure(self.Engine(self, drift_from=520, shift=2.5), thresholds=budget,
+                                       allowance=allowance)
+        quality = result["quality"]
+        served = quality["sets"]["long-600/served"]
+        self.assertTrue(served["passed"] and quality["sets"]["long-600/prompt"]["passed"])
+        self.assertEqual(served["limits"], {"ppl_ratio_max": 7.0, "kld_mean_max": 10.0, "kld_p99_max": 40.0})
+        self.assertEqual((served["allowance"], served["allowance_raised"]),
+                         (own, ["kld_mean_max", "kld_p99_max", "ppl_ratio_max"]))
+        self.assertEqual(quality["sets"]["long-600/prompt"]["allowance_raised"], ["kld_mean_max", "kld_p99_max"])
+        self.assertNotIn("allowance_raised", quality["sets"]["conversations/served"])   # none stored for it
+        self.assertEqual(quality["sets"]["conversations/served"]["limits"], budget)
+        self.assertEqual(quality["allowance"], {"status": "applied", "factor": 2.0,
+                                                "keys": ["ppl_ratio_max", "kld_mean_max", "kld_p99_max"]})
+        self.assertEqual(self.gate(current)["state"], "pass")
+        self.assertIn("judged with the checkpoint's own declared format as allowance: long-600/prompt (kld_mean <= 10",
+                      self.gate(current)["detail"])
+        # A run's own budget wins: the limits it sets are not raised.
+        mine = {**budget, "kld_p99_max": 0.5}
+        kept = self.measure(self.Engine(self, drift_from=520, shift=2.5), thresholds=mine,
+                            allowance={**allowance, "keys": ["ppl_ratio_max", "kld_mean_max"]})[0]["quality"]
+        self.assertEqual(kept["sets"]["long-600/served"]["limits"]["kld_p99_max"], 0.5)
+        self.assertEqual(kept["sets"]["long-600/served"]["allowance_raised"], ["kld_mean_max", "ppl_ratio_max"])
+        self.assertFalse(kept["sets"]["long-600/served"]["passed"])
+
+    def test_a_missing_allowance_is_said_and_the_mode_judges_alone(self):
+        # A checkpoint that declares quantized activations whose data holds no allowance: the mode's limits as they
+        # are, and the result, log and status say why.
+        protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
+        budget = quality_checks.quality_thresholds(protocol, mode="speed")
+        missing = {"missing": "no allowance for them", "sets": {}}
+        result, current = self.measure(self.Engine(self, drift_from=520, shift=2.5), thresholds=budget,
+                                       allowance=missing)
+        quality = result["quality"]
+        self.assertEqual(quality["allowance"], {"status": "missing", "reason": "no allowance for them"})
+        self.assertFalse(quality["sets"]["long-600/served"]["passed"])
+        self.assertTrue(all(s["limits"] == budget or s["limits"] == {k: v for k, v in budget.items()
+                                                                       if k != "ppl_ratio_max"}
+                            for s in quality["sets"].values()))
+        self.assertTrue(all("allowance_raised" not in s for s in quality["sets"].values()))
+        self.assertIn("; no allowance for them", self.gate(current)["detail"])
+        self.assertNotIn("allowance", self.measure(self.Engine(self))[0]["quality"])   # none: nothing said
+
     def test_speed_judges_every_set_by_its_own_budget(self):
-        # protocol quality.mode_thresholds: a drift preserve's budget fails passes speed's, whatever the
-        # checkpoint's own quantization drift (the allowance is reported by the reference, not judged).
+        # protocol quality.mode_thresholds: a drift preserve's budget fails passes speed's; without an allowance the
+        # mode's limits stand as they are.
         protocol = runner.load_json(runner.EVAL_DIR / "protocol.json")
         failing = self.measure(self.Engine(self, drift_from=520, shift=0.6))[0]["quality"]["sets"]["long-600/served"]
         self.assertFalse(failing["passed"])

@@ -4,8 +4,8 @@ every crit-eval of that checkpoint, so a run needs only the engine (`crit eval p
 A package source is a folder or an HTTPS base URL (a Hugging Face dataset's `resolve/main/`, say) holding
 packages.json and one folder per package, named by the first 16 hex digits of the model's and the suite's sha256:
 prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with the reference's own spread
-(spread.json) and the allowance (allowance.json, what the checkpoint's declared activation format costs, reported
-only) when the data holds them. packages.json
+(spread.json) and the allowance (allowance.json, what the checkpoint's declared activation format costs, which
+speed's limits read) when the data holds them. packages.json
 lists each package with the
 identities it was made under (model_sha256, suite_sha256, protocol, reference version) and the sha256 of every file,
 which fetch checks before it writes anything into the data. The scores do not depend on the device that computed

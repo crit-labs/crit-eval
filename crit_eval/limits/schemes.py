@@ -44,7 +44,8 @@ in DECODERS.
 activations(checkpoint, base) says how the checkpoint's own inference quantizes the activations a quantized matrix
 multiplies (its declared input activations: compressed-tensors input_activations with base.input_global_scale or
 base.input_scale, ModelOpt base.input_scale), and quantize_activations applies it in FP32 in the reference's
-allowance pass (crit_eval.quality.reference, reported only; both quality modes judge against exact activations).
+allowance pass (crit_eval.quality.reference; both quality modes judge against exact activations, and speed's
+limits are raised to twice what that pass costs).
 """
 import json
 import math
@@ -95,6 +96,23 @@ def activations(checkpoint, base):
         scale = float(checkpoint.raw(base + ".input_scale").float().reshape(-1)[0])
         return ("nvfp4", 1.0 / scale) if kind == "nvfp4" else ("fp8_tensor", scale)
     return None
+
+
+def declares_activations(model):
+    """Whether checkpoint folder `model` declares quantized input activations for a matrix, from its config and
+    tensor headers alone (no torch): a compressed-tensors config group with input_activations, else (ModelOpt and
+    others) a stored base.input_scale or base.input_global_scale. What a speed run asks of a checkpoint whose data
+    holds no allowance (protocol quality.allowance); False where the model cannot be read."""
+    try:
+        from crit_core.model import inspect_model, open_model
+        quantization = quantization_of(open_model(model).config())
+        if _method(quantization) == "compressed-tensors":
+            return any(isinstance(group, dict) and group.get("weights") and group.get("input_activations")
+                       for group in (quantization.get("config_groups") or {}).values())
+        return any(tensor.name.endswith((".input_scale", ".input_global_scale"))
+                   for shard in inspect_model(model, header_only=True).shards for tensor in shard.tensors)
+    except Exception:   # a model it cannot read: the run says nothing of an allowance
+        return False
 
 
 def _round_e2m1(magnitude):

@@ -223,6 +223,18 @@ def text_quality(reference_rows, engine_rows):
     }
 
 
+def worst_positions(reference_rows, engine_rows, places, count=8):
+    """protocol quality.worst_positions: the `count` positions of the largest KLD, largest first, each {"text",
+    "offset" (places[i]: the text, and the row's index in it, the row that scores the text's token offset + 1), "kld", "reference_top1_probability",
+    "reference_logprob", "engine_logprob"} (the two last: the text's token)."""
+    kls = [partial_kl(r["top_ids"], r["top_logprobs"], dict(e["top"])) for r, e in zip(reference_rows, engine_rows)]
+    order = sorted(range(len(kls)), key=lambda i: (-kls[i], i))[:max(0, int(count))]
+    return [{"text": places[i][0], "offset": places[i][1], "kld": kls[i],
+             "reference_top1_probability": math.exp(reference_rows[i]["top_logprobs"][0]),
+             "reference_logprob": reference_rows[i]["logprob"], "engine_logprob": engine_rows[i]["logprob"]}
+            for i in order]
+
+
 def budget_spread(reference_rows, engine_rows, thresholds, block=64, draws=200, seed=0):
     """How much a set's share of the drift budget depends on which positions it holds: the budget used
     (budget_used of text_quality's ppl_ratio, kld_mean and kld_p99) over `draws` block-bootstrap resamples of its

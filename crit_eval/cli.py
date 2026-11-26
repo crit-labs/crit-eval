@@ -248,10 +248,11 @@ def main(argv=None):
                                                   "transformers, GPU; stop any engine first)")
     reference.add_argument("--model", required=True, help="The checkpoint the data was prepared from")
     reference.add_argument("--data", required=True, help="Prepared suite directory")
-    reference.add_argument("--allowance", action="store_true",
-                           help="Also score the texts with the activations quantized as the checkpoint declares and "
-                                "store how far that lands from the scores (allowance.json): what the format itself "
-                                "costs, reported, not judged; a second scoring pass")
+    reference.add_argument("--allowance", action=argparse.BooleanOptionalAction, default=True,
+                           help="When the checkpoint declares quantized activations, also score the texts with them "
+                                "quantized as declared and store how far that lands from the scores (allowance.json): "
+                                "what the format itself costs, which speed mode's limits are raised to twice of; a "
+                                "second scoring pass, on by default (--no-allowance skips it)")
 
     fetch = subs.add_parser("fetch", help="Fetch the checkpoint's reference package (prepared data and reference "
                                           "scores) into the data, so a run needs only the engine")
@@ -405,7 +406,7 @@ def _command(args):
               + (f"; the reference's own spread {how['spread']}" if how.get("spread") else "")
               + {"none": "; the checkpoint declares no quantized activations: no allowance to measure",
                  "unsupported": "; the allowance not measured (see above)"}.get(
-                  how.get("allowance"), f"; the allowance (what the declared activation format costs, reported only) "
+                  how.get("allowance"), f"; the allowance (what the declared activation format costs, judged by in speed) "
                                         f"{how['allowance']}" if how.get("allowance") else ""))
         return 0
     if args.command == "fetch":

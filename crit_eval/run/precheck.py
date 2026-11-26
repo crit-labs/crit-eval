@@ -31,6 +31,9 @@ from .timing import timed_generate
 # which they cannot tell a slower engine from a noisy one (the item is then unverified, not failed).
 LOWER_SAMPLES = 3
 LOWER_SPREAD_MAX = 0.25
+# A case whose decode rises on every sample after the reopen, by this much from the first to the last, is still
+# warming: the engine opened again in the same host (as the certified round reopens it) has not settled.
+WARMING_RISE = 0.05
 
 
 def _item(name, state, detail, **facts):
@@ -73,14 +76,14 @@ def long_reply_item(engine, info, prepared, protocol, settings, required, mode, 
     return item, point
 
 
-def quality_item(engine, info, prepared, protocol, data, mode, budget, log):
+def quality_item(engine, info, prepared, protocol, data, mode, budget, log, model=None):
     """The quality gate's drift judgment: every quality text the engine holds scored and judged against the
     reference's stored scores by the run's budget (run_quality, its honesty check left to the honesty items). A staged
     round scores the long sets only from stage 2 on, so an engine whose approximations drift at depth (fewer routed
     experts, a narrower KV) otherwise fails quality most of an hour into a round."""
     from ..quality import fixed
     from ..quality.reference import REFERENCE_VERSION
-    from .quality_checks import quality_thresholds, run_quality, stored_spread
+    from .quality_checks import quality_thresholds, run_quality, stored_allowance, stored_spread
     if not callable(getattr(engine, "score", None)):
         return _item("precheck_quality", "unverified", "the engine scores no text")
     identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
@@ -90,7 +93,8 @@ def quality_item(engine, info, prepared, protocol, data, mode, budget, log):
         return _item("precheck_quality", "unverified", "the data holds no reference scores (crit eval reference)")
     thresholds = quality_thresholds(protocol, budget, mode=mode)
     found = run_quality(engine, info, prepared, protocol, lambda line: log("precheck " + line), reference, thresholds,
-                        stored_spread(data, prepared, protocol, identity), mode=mode, honesty=False)
+                        stored_spread(data, prepared, protocol, identity), mode=mode, honesty=False,
+                        allowance=stored_allowance(data, protocol, identity, model, budget, mode=mode))
     if found.get("status") != "scored":
         return _item("precheck_quality", "unverified", found.get("reason") or "no quality text was scored")
     sets = found["sets"]
@@ -150,6 +154,18 @@ def speed_samples(engine, cases, samples=LOWER_SAMPLES):
     return {"cases": found}
 
 
+def warming(at_lower):
+    """{case: rise} for the cases whose decode samples at the lower context rise on every sample, the last WARMING_RISE
+    or more above the first: an engine reopened in the same host that is still settling. Its speeds there are not yet
+    its own, and a certified round, which reopens it the same way, can stop on its repetitions' spread."""
+    out = {}
+    for case_id, row in (at_lower.get("cases") or {}).items():
+        decode = [s.get("decode_tps") for s in row.get("samples") or []]
+        if len(decode) >= 2 and all(decode) and all(b > a for a, b in zip(decode, decode[1:]))                 and decode[-1] / decode[0] - 1 >= WARMING_RISE:
+            out[case_id] = decode[-1] / decode[0] - 1
+    return out
+
+
 def lower_item(at_required, at_lower, lower, settings):
     """The certified gate's comparison (long_context.compare_lower) of the speed cases at the lower context
     against the required one: failed where a case is slower than its tolerance, unless the case's spread passes
@@ -167,15 +183,21 @@ def lower_item(at_required, at_lower, lower, settings):
                     f"{fmt.format(row[key + '_at_required'])} -> {fmt.format(row[key])} {unit} "
                     f"(tolerance {tolerance:.0%})")
             (noisy if tolerance > LOWER_SPREAD_MAX else slower).append(text)
+    rising = warming(at_lower)
+    note = ("; still warming after the reopen in the same host (decode rose on every sample: "
+            + ", ".join(f"{c} +{r:.0%}" for c, r in sorted(rising.items()))
+            + "): the lower context's own cost is not told apart from the reopened engine's warm-up, and a certified "
+            "round, which reopens the engine the same way, can stop on its repetitions' spread") if rising else ""
+    facts = {"context": lower, **({"warming": {c: round(r, 3) for c, r in rising.items()}} if rising else {})}
     if slower:
         return _item("precheck_lower_context", "failed", f"at {lower:,} tokens, over {LOWER_SAMPLES} samples a "
-                     "case: " + "; ".join(slower), context=lower)
+                     "case: " + "; ".join(slower) + note, **facts)
     if noisy or found["unmeasured"]:
         return _item("precheck_lower_context", "unverified", f"at {lower:,} tokens the samples spread too wide to "
-                     "judge: " + "; ".join(noisy + [f"{c} unmeasured" for c in found["unmeasured"]]), context=lower)
+                     "judge: " + "; ".join(noisy + [f"{c} unmeasured" for c in found["unmeasured"]]) + note, **facts)
     widest = max([max(r["decode_tolerance"], r["ttft_tolerance"]) for r in found["cases"].values()] or [0.0])
     return _item("precheck_lower_context", "passed", f"at {lower:,} tokens no case slower than its tolerance "
-                 f"({LOWER_SAMPLES} samples a case, the widest {widest:.0%})", context=lower)
+                 f"({LOWER_SAMPLES} samples a case, the widest {widest:.0%})" + note, **facts)
 
 
 def memory_item(memory, headroom_bytes):
@@ -221,7 +243,8 @@ def run_precheck(adapter, model, data, context_tokens, quality_mode=DEFAULT_QUAL
         # engine first served it, not with what a long score leaves behind.
         at_required = speed_samples(engine, cases) if lower and not url else None
         if drift:
-            items.append(quality_item(engine, info, prepared, protocol, Path(data), quality_mode, quality_budget, log))
+            items.append(quality_item(engine, info, prepared, protocol, Path(data), quality_mode, quality_budget, log,
+                                      model))
     finally:
         engine.close()
     if at_required is not None:

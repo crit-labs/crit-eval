@@ -268,18 +268,26 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
     serial = {cid: case.get("tokens") for cid, case in ((result.get("speed") or {}).get("cases") or {}).items()
               if case.get("status") == "measured" and case.get("tokens")}
     serial_source = "speed part"
-    missing = [p for p in prompts if p["case"] is not None and serial.get(p["case"]) is None]
+    # A served engine's reply is its streamed text, which its server shapes by how the reply ends: a tool call it
+    # finished comes as delta tool_calls (name and arguments), one the output limit cut as text with the format's
+    # markers (crit serve's ToolReply). A case with tools, its speed reply the case's output_tokens long and a level's
+    # concurrency.output_tokens, would compare text of two shapes, so its serial reply is run alone at the level's.
+    shaped = ({c["id"] for c in prepared["speed"] if c.get("tools")} if info.get("served") else set())
+    missing = [p for p in prompts if p["case"] is not None and (serial.get(p["case"]) is None or p["case"] in shaped)]
     if missing:
-        # Without the speed part's replies (crit eval run --only concurrency) each speed case of the pool is run once
-        # alone, a cohort of one client, so every level still has serial replies to compare with.
+        # Without the speed part's replies (crit eval run --only concurrency), or for a served case with tools, each
+        # such speed case of the pool is run once alone, a cohort of one client, so every level has a serial reply of
+        # its own length to compare with.
         for p in missing:
+            serial.pop(p["case"], None)   # a served case with tools: never the speed part's reply of another length
             alone = engine.cohort([[p["prompt_ids"]]], output)
             rows = alone.get("requests") or []
             if rows and not rows[0].get("errors") and rows[0].get("tokens"):
                 serial[p["case"]] = rows[0]["tokens"]
         serial_source = "speed part and one-client runs" if len(missing) < len(
             [p for p in prompts if p["case"] is not None]) else "one-client runs"
-        log(f"concurrency: {len(missing)} serial replies run alone first (no speed part to compare with)")
+        log(f"concurrency: {len(missing)} serial replies run alone first (no speed part reply, or a served case "
+            "with tools)")
     strings = (prepared.get("retrieval") or {}).get("token_text")
     mean_context = sum(len(p["prompt_ids"]) for p in prompts) / len(prompts) + output / 2
     terms, bandwidth_gbs, tflops, host = ceiling_inputs() if ceiling_inputs else (None, None, None, None)

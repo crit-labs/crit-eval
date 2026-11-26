@@ -423,7 +423,8 @@ stays under the protocol id of the coming release, and nothing in a change picks
 which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the changes since ran under
 `crit-eval-v0.7.0`, which crit-eval 0.7.0 kept; the changes since ran under `crit-eval-v0.7.1`, which crit-eval
 0.7.1, 0.7.2 and 0.7.3 kept; the changes since ran under `crit-eval-v0.8.0` and then `crit-eval-v0.8.1`, and
-crit-eval 0.8.1 kept `crit-eval-v0.8.1` (no release kept `crit-eval-v0.8.0`). A change that can move a
+crit-eval 0.8.1 kept `crit-eval-v0.8.1` (no release kept `crit-eval-v0.8.0`); the changes since ran under
+`crit-eval-v0.8.2`, which crit-eval 0.8.2 kept. A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results
@@ -469,7 +470,10 @@ with each score:
 - Physical RAM/VRAM use, cancellation and lifecycle need separate engine measurements.
 
 A round stops early when a speed case's measured decode speeds spread by more than the protocol's
-`disturbed_spread` (25%; quiet engines stay near 10% at most): something else was using the device.
+`disturbed_spread` (25%; quiet engines stay near 10% at most) twice: something else was using the device. The
+first time, the case is measured once more, warmups included, and records the first try's disturbance as
+`measured_again` (an engine opened again in the same host can settle and then move again while its file-backed pages
+come back).
 The spread is taken over the repetitions measured once the case reached steady state: requests whose speed still
 moves away from the one before them stand as further warmups, until four have decoded 1,024 tokens, at most 16;
 in a staged run a first repetition that agreed only with stage 1's request is provisional

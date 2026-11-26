@@ -54,6 +54,19 @@ class LowerContextTests(unittest.TestCase):
         low = {"cases": {"long": case([50] * 3, [900, 901, 902], [701, 700, 702])}}
         self.assertEqual(precheck.lower_item(high, low, 65536, SETTINGS)["state"], "passed")
 
+    def test_a_case_still_rising_after_the_reopen_is_named_as_warming(self):
+        # An engine opened again in the same host whose decode climbs on every sample has not settled: the item says
+        # so, whatever its verdict, as the certified round can stop on that case's spread.
+        high = {"cases": {"chat": case([130, 131, 130], [500, 501, 500]), "agent": case([117, 118, 117], [900] * 3)}}
+        low = {"cases": {"chat": case([128, 131, 133], [530, 531, 529]), "agent": case([84, 101, 143], [900] * 3)}}
+        item = precheck.lower_item(high, low, 49152, SETTINGS)
+        self.assertEqual(item["warming"], {"agent": round(143 / 84 - 1, 3)}, item)
+        self.assertIn("still warming after the reopen", item["detail"])
+        self.assertIn("agent +70%", item["detail"])
+        settled = precheck.lower_item(high, {"cases": {"chat": case([130, 131, 130], [500, 501, 500]),
+                                                       "agent": case([117, 118, 117], [900] * 3)}}, 49152, SETTINGS)
+        self.assertNotIn("warming", settled)
+
     def test_speed_samples_warm_each_case_and_time_it_lower_samples_times(self):
         calls = []
 

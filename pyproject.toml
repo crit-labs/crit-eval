@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crit-eval"
-version = "0.8.1"
+version = "0.8.2"
 description = "crit-eval: one speed, quality and exactness suite that every inference engine runs the same way"
 readme = "README.md"
 license = "Apache-2.0"
@@ -16,7 +16,7 @@ requires-python = ">=3.11"
 # neither in a released crit-core. At a release both lower bounds are the release's version (crit-models first ships
 # with it). No upper bound: crit pins the crit-eval it ships with, so a new crit-core release needs no crit-eval
 # release.
-dependencies = ["crit-core>=0.23.0", "crit-models>=0.23.0"]
+dependencies = ["crit-core>=0.24.0", "crit-models>=0.24.0"]
 
 [project.optional-dependencies]
 # The reference scores the quality texts on the checkpoint itself (crit-eval reference).

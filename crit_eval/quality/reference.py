@@ -49,13 +49,13 @@ Requires torch, transformers and safetensors, gguf for a GGUF and numpy for ONNX
 run once per prepared data.
 
 Both quality modes (protocol quality.modes) judge against these scores: the checkpoint's stored weights, exact
-activations, whatever format the checkpoint stores. The allowance (protocol quality.allowance, on request): when the
+activations, whatever format the checkpoint stores. The allowance (protocol quality.allowance, by default): when the
 checkpoint declares quantized input activations, the same run scores the texts once more with the activations
 quantized as the checkpoint's own inference does: every matrix (and the output head) whose stored scheme declares
 input activations (crit_eval.limits.schemes.activations: NVFP4 in groups of 16 with the stored global scale, FP8 per
 token or per tensor) multiplies its inputs quantized and dequantized in FP32, the weights as in the exact pass. The KV
 cache and every other operation stay exact. Only how far that run lands from the stored scores is kept, per set and
-path (store_allowance, fixed.ALLOWANCE): what the declared format itself costs, reported and never judged. That pass
+path (store_allowance, fixed.ALLOWANCE): what the declared format itself costs, which speed judges by. That pass
 is the one place the reference quantizes activations (StreamingReference declared_activations). Fused experts (MergeModulelist, then Concatenate
 along the output rows) quantize each expert matrix's input with that matrix's own declared scale (_FusedInputs). A
 matrix with declared activations that the modeling code multiplies any other way is refused rather than left exact.
@@ -331,7 +331,7 @@ class StreamingReference:
         import os
         # The reference's own arithmetic, not a run's quality mode: exact activations score what both quality modes
         # judge against; declared_activations quantizes them as the checkpoint declares, the allowance's pass alone
-        # (store_allowance), reported and never judged.
+        # (store_allowance), whose distance from the exact scores raises speed's limits, never scores judged against.
         self.declared = declared_activations
         # declared_activations: {checkpoint base: crit_eval.limits.schemes.activations} as found, and the output head's
         self.inputs, self.head_inputs = {}, None
@@ -1581,8 +1581,8 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
                     check=lambda: None, device="cuda"):
     """protocol quality.allowance: how far the checkpoint run with its activations quantized as it declares
     (`declared`: StreamingReference.declared_activations) lands from the stored scores, per set and path
-    (_compare_sets), stored beside them (fixed.write_allowance): what the declared format itself costs, reported and
-    never judged (both quality modes judge against the exact scores). A checkpoint that declares none stores an empty
+    (_compare_sets), stored beside them (fixed.write_allowance): what the declared format itself costs, which raises
+    speed's limits (both quality modes judge against the exact scores). A checkpoint that declares none stores an empty
     allowance. Returns "stored", "none", "measured" or "unsupported" (a declared form crit does not emulate, recorded
     so the allowance says why it is missing)."""
     from . import fixed
@@ -1619,12 +1619,13 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
     return how
 
 
-def score_data(model, data, log=print, check=lambda: None, allowance=False):
+def score_data(model, data, log=print, check=lambda: None, allowance=True):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
     store the scores under the data (crit_eval.quality.fixed), with the reference's own spread, unless they are stored
-    already under the same identity: both quality modes judge against them. allowance: also measure, for a checkpoint that declares quantized
-    activations, how far the checkpoint run with them quantized lands from the scores (store_allowance), a second
-    scoring pass whose result is reported, not judged (protocol quality.allowance). check() runs between layers and
+    already under the same identity: both quality modes judge against them. allowance (the default): also measure,
+    for a checkpoint that declares quantized activations, how far the checkpoint run with them quantized lands from
+    the scores (store_allowance), a second scoring pass that speed judges by (protocol quality.allowance); a
+    checkpoint that declares none stores an empty one without a second pass. False skips it. check() runs between layers and
     texts: it raises to stop. Returns how they were obtained."""
     from . import fixed
     protocol = load_json(EVAL_DIR / "protocol.json")

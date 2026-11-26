@@ -774,13 +774,28 @@ class ChatServerTests(unittest.TestCase):
                              lambda model, chat_template=None: {"sha256": "model" if model == "source" else "x"}):
             with self.assertRaisesRegex(SystemExit, "not the checkpoint"):
                 reference.score_data("other", self.data, log=lambda m: None)
-            how = reference.score_data("source", self.data, log=lambda m: None)
+            how = reference.score_data("source", self.data, log=lambda m: None, allowance=False)
             self.assertEqual((how["method"], how["positions"]), ("scored", sum(len(i) - 1 for i, _ in texts.values())))
-            self.assertEqual((how["spread"], how.get("allowance")), ("scored", None))   # the allowance only on request
-            asked = reference.score_data("source", self.data, log=lambda m: None, allowance=True)
+            self.assertEqual((how["spread"], how.get("allowance")), ("scored", None))   # skipped when asked to
+            # By default (protocol quality.allowance): a checkpoint that declares quantized activations gets its
+            # second pass, one that declares none an empty allowance without it.
+            with patch.object(Reference, "declared_activations", lambda self: ["nvfp4"]), \
+                    patch.object(reference, "store_allowance", lambda *a, **k: "measured"):
+                declared = reference.score_data("source", self.data, log=lambda m: None)
+            self.assertEqual(declared["allowance"], "measured")
+            asked = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((asked["method"], asked["allowance"]), ("stored", "none"))
-            again = reference.score_data("source", self.data, log=lambda m: None, allowance=True)
+            again = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((again["method"], again["spread"], again["allowance"]), ("stored", "stored", "stored"))
+        from contextlib import nullcontext
+        from crit_eval import cli
+        seen = []
+        with patch.object(cli, "_command", lambda args: seen.append(args.allowance) or 0), \
+                patch("crit_core.machine.engine_lock", lambda holder: nullcontext()):
+            cli.main(["reference", "--model", "m", "--data", "d"])
+            cli.main(["reference", "--model", "m", "--data", "d", "--no-allowance"])
+            cli.main(["reference", "--model", "m", "--data", "d", "--allowance"])
+        self.assertEqual(seen, [True, False, True])
         prepared = json.loads((self.data / "prepared.json").read_text())
         stored = fixed.load(self.data, {"model_sha256": "model", **fixed.identity(texts, 16, prepared["valid_vocab"])})
         self.assertEqual(set(stored), {"tides", "tides@3000", "tides@5000"})
