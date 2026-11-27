@@ -77,7 +77,9 @@ def write_data(directory):
                               "curve_tail_ids": frame(CURVE)["tail_ids"], "curve_messages": prepare.api_messages(CURVE),
                               "facts": [{"id": "start", "answer": "tides", "ids": prepare.token_ids(Text(), "\n\ntides\n\n")}],
                               "token_text": [chr(i) if chr(i).isascii() else None for i in range(256)]},
-                "followup": [{"turn": t, "prompt_ids": ids(m), "messages": m} for t, m in enumerate(FOLLOWUP, 1)]}
+                "followup": [{"turn": t, "prompt_ids": ids(m), "messages": m,
+                              "output_tokens": protocol["followup"]["output_tokens"]}
+                             for t, m in enumerate(FOLLOWUP, 1)]}
     (directory / "prepared.json").write_text(json.dumps(prepared))
 
 
@@ -620,6 +622,27 @@ class ChatServerTests(unittest.TestCase):
         self.assertEqual(tight["state"], "failed", tight)
         self.assertNotIn("precheck_quality", self.precheck(drift=False))
 
+    def test_the_precheck_shows_the_16_bit_baseline_beside_the_drift_and_judges_by_the_budget_alone(self):
+        # protocol quality.baseline, reported, never judged: the item names what a plain 16-bit engine of this model
+        # uses of the same limits on its worst set, or why the data holds no baseline.
+        from unittest.mock import patch
+        from crit_eval.run import quality_checks
+        self.server.stream_logprobs = self.server.real_usage = True
+        self.store(shift=0.01)
+        item = self.precheck()["precheck_quality"]
+        self.assertEqual(item["baseline"]["status"], "missing")
+        self.assertIn("no 16-bit baseline (the data holds no 16-bit baseline", item["detail"])
+        sets = {name: {"kld_mean": 0.001, "kld_p99": 0.02, "ppl_ratio": 1.0, "top1_agreement": 1.0}
+                for name in ("conversations/prompt", "conversations/served", "long-3000/prompt", "long-3000/served")}
+        stored = {"baseline": {"dtype": "bfloat16", "block": 64, "sets": sets}, "canaries": None}
+        with patch.object(quality_checks, "stored_qualification", return_value=stored):
+            shown = self.precheck()["precheck_quality"]
+        self.assertEqual(shown["state"], item["state"])   # the verdict is the budget's alone
+        self.assertEqual((shown["baseline"]["set"], shown["baseline"]["dtype"]), (shown["worst_set"], "bfloat16"))
+        self.assertGreater(shown["baseline"]["budget_used"], 0)
+        self.assertIn(f"the 16-bit baseline uses {shown['baseline']['budget_used']:.0%} of it on {shown['worst_set']}",
+                      shown["detail"])
+
     def test_quality_scores_the_fixed_texts_through_the_servers_score_call(self):
         self.store()
         result = self.run_eval(("quality",))
@@ -648,6 +671,26 @@ class ChatServerTests(unittest.TestCase):
         gate = next(g for g in result["status"]["gates"] if g["name"] == "quality")
         self.assertEqual(gate["state"], "pass")
         self.assertIn("served replies scored alike", gate["detail"])
+        # protocol quality.baseline: data scored before it holds no 16-bit baseline, and the run says so; a stored
+        # one is listed beside each set it measured, its verdict unchanged.
+        self.assertEqual(quality["baseline"]["status"], "missing")
+        self.assertIn("no 16-bit baseline: the data holds no 16-bit baseline", gate["detail"])
+        prepared = json.loads((self.data / "prepared.json").read_text())
+        identity = {"model_sha256": prepared["model"]["sha256"], "reference": reference.REFERENCE_VERSION,
+                    **fixed.identity(fixed.texts(prepared), 16, prepared["valid_vocab"])}
+        noise = json.loads((ROOT / "crit_eval/protocol.json").read_text())["quality"]["position_spread"]
+        row = {"targets": 9, "kld_mean": 0.3, "kld_p99": 5.0, "ppl_ratio": 1.0, "top1_agreement": 1.0, "bootstrap": None}
+        fixed.write_beside(self.data, fixed.BASELINE, {**identity, "baseline": "bfloat16",
+                                                       "bootstrap": {k: noise[k] for k in ("block", "draws", "seed")}},
+                           {"dtype": "bfloat16", "sets": {"long-3000/prompt": row}})
+        again = self.run_eval(("quality",))
+        self.assertEqual(again["quality"]["baseline"], {"status": "measured", "dtype": "bfloat16",
+                                                        "unreachable": ["long-3000/prompt"], "near": []})
+        self.assertEqual(again["quality"]["sets"]["long-3000/prompt"]["baseline"]["reach"], "unreachable")
+        self.assertTrue(again["quality"]["passed"])
+        gate = next(g for g in again["status"]["gates"] if g["name"] == "quality")
+        self.assertEqual(gate["state"], "pass")
+        self.assertIn("a bfloat16 engine of this model: long-3000/prompt unreachable at 16 bits", gate["detail"])
 
     def test_quality_reads_packed_scores_and_falls_back_to_json_rows(self):
         self.store()
@@ -787,15 +830,23 @@ class ChatServerTests(unittest.TestCase):
             self.assertEqual((asked["method"], asked["allowance"]), ("stored", "none"))
             again = reference.score_data("source", self.data, log=lambda m: None)
             self.assertEqual((again["method"], again["spread"], again["allowance"]), ("stored", "stored", "stored"))
+            # The 16-bit baseline by default (protocol quality.baseline): a config this fake cannot read declares no
+            # 16-bit dtype, an empty baseline without a pass; the canaries only on request.
+            self.assertEqual((how["baseline"], again["baseline"], "canaries" in again), ("none", "stored", False))
+            self.assertNotIn("baseline", reference.score_data("source", self.data, log=lambda m: None, baseline=False))
+            with patch.object(reference, "store_canaries", lambda *a, **k: "measured"):
+                self.assertEqual(reference.score_data("source", self.data, log=lambda m: None, canaries=True)["canaries"],
+                                 "measured")
         from contextlib import nullcontext
         from crit_eval import cli
         seen = []
-        with patch.object(cli, "_command", lambda args: seen.append(args.allowance) or 0), \
+        with patch.object(cli, "_command", lambda args: seen.append((args.allowance, args.baseline, args.canaries)) or 0), \
                 patch("crit_core.machine.engine_lock", lambda holder: nullcontext()):
             cli.main(["reference", "--model", "m", "--data", "d"])
             cli.main(["reference", "--model", "m", "--data", "d", "--no-allowance"])
             cli.main(["reference", "--model", "m", "--data", "d", "--allowance"])
-        self.assertEqual(seen, [True, False, True])
+            cli.main(["reference", "--model", "m", "--data", "d", "--no-baseline", "--canaries"])
+        self.assertEqual(seen, [(True, True, False), (False, True, False), (True, True, False), (True, False, True)])
         prepared = json.loads((self.data / "prepared.json").read_text())
         stored = fixed.load(self.data, {"model_sha256": "model", **fixed.identity(texts, 16, prepared["valid_vocab"])})
         self.assertEqual(set(stored), {"tides", "tides@3000", "tides@5000"})

@@ -4,10 +4,11 @@ unverified where so few samples spread too wide to judge."""
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from crit_eval.run import precheck  # noqa: E402
+from crit_eval.run import precheck, requests  # noqa: E402
 
 SETTINGS = {"tolerance": 0.05}
 
@@ -70,15 +71,11 @@ class LowerContextTests(unittest.TestCase):
     def test_speed_samples_warm_each_case_and_time_it_lower_samples_times(self):
         calls = []
 
-        def timed(engine, prompt, output_tokens):
+        def timed(engine, prompt, output_tokens, **options):
             calls.append(len(prompt))
             return None, {"decode_tps": 10.0 + len(calls), "ttft_ms": 5.0}
-        original = precheck.timed_generate
-        precheck.timed_generate = timed
-        try:
+        with patch.object(requests, "timed_generate", timed):   # every case request goes through requests.send
             found = precheck.speed_samples(None, [{"id": "a", "prompt_ids": [1, 2], "output_tokens": 4}])
-        finally:
-            precheck.timed_generate = original
         self.assertEqual(len(calls), 1 + precheck.LOWER_SAMPLES)
         self.assertEqual(len(found["cases"]["a"]["samples"]), precheck.LOWER_SAMPLES)
         self.assertEqual(found["cases"]["a"]["decode_tps"], 13.0)   # the median of 12, 13, 14

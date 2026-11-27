@@ -1,10 +1,10 @@
 """Run one engine through the suite: `crit eval run --adapter FILE --model DIR --data DIR --out FILE`."""
 import datetime
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from .. import CONTRACT, EVAL_DIR, __version__, load_json, machine_settings, portable_path, write_json, prefill_cases
+from .. import (CONTRACT, EVAL_DIR, RAM_HEADROOM_GIB, VRAM_HEADROOM_GIB, __version__, load_json, machine_settings,
+                portable_path, write_json, prefill_cases)
 from ..quality import fixed
 from ..limits import headroom
 from . import energy, host, journal
@@ -29,8 +29,9 @@ from .jitter import new_seed, record as jitter_record
 from .tracks import closed as closed_track, engine_loads, mode_budgets
 from .long_context import (compare_lower, context_requirement, run_context, run_lower_context, run_required_again,
                            run_retrieval)
-from .quality_checks import (merge_honesty, merge_quality, quality_thresholds, reference_origin, run_attribution,
-                             run_honesty, run_quality, stored_allowance, stored_spread)
+from .quality_checks import (merge_honesty, merge_quality, qualification_lines, qualify, quality_spec,
+                             quality_thresholds, reference_origin, run_attribution, run_honesty, run_quality,
+                             stored_allowance, stored_qualification, stored_spread)
 from .speed import (drafts, run_exactness, run_heldout, run_sampled_speed, run_sampling_check, run_speed,
                     run_wider_draft, speed_summary)
 from .stages import (choose, creep, exactness_cases, memory_fit, observations, price, quality_rows, quality_sets,
@@ -40,6 +41,10 @@ from .timing import Disturbed, decode_text
 
 EXACTNESS_MODES = ("reported", "required")
 
+
+# The device memory a run leaves free when its caller gives none: crit Core's (crit_eval.VRAM_HEADROOM_GIB), as
+# crit eval run's own default is.
+VRAM_HEADROOM_BYTES = round(VRAM_HEADROOM_GIB * GIB)
 
 PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
 
@@ -73,6 +78,24 @@ class PartTimes:
         return ", ".join(f"{name} {seconds:.0f} s" for name, seconds in self.parts.items())
 
 
+def package_spec(config, model, log=print):
+    """crit's EngineSpec of the engine a --package run opens (the adapter configuration's "package": Core's eval-v1
+    adapter's), resolved from the checkpoint's headers and the package's configuration before any weight is read, so
+    a context Eval computes is sized by the engine's own prices (limits.context.max_context's spec: its KV elements a
+    token, the held bytes of its 16-bit target matrices; `basis.sized_by`). None for any other adapter, and where crit
+    Core cannot resolve the package (the context is then sized by the checkpoint's config, as without a spec)."""
+    package = config.get("package") if isinstance(config, dict) else None
+    if not package:
+        return None
+    try:
+        from crit_core.spec import engine_spec
+        return engine_spec(package, model)
+    except Exception as error:   # noqa: BLE001 - sizing falls back to the config's static model and says why
+        log(f"context: the package's EngineSpec did not resolve ({type(error).__name__}: {error}); the context is "
+            "sized by the checkpoint's config")
+        return None
+
+
 def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
         repetitions=None, label=None, log=print, bandwidth_gbs=None, device=None, baseline=None,
         quality_budget=None, exactness=None, context_tokens=None, vram_headroom_bytes=None, context_reserve_bytes=None,
@@ -90,9 +113,10 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     decode by these limits against the reference scores `crit eval reference` stored under the data.
     exactness: "reported" (default) or "required" (any difference from plain greedy fails the gate).
     context_tokens: the context every engine is built for (a run's kv_tokens); without it, crit-eval's max context
-    for the model on the device, with vram_headroom_bytes (default 1 GiB) left free, capped at requested_context
-    (the user's wanted context); context_basis: the run's record of how its kv_tokens came about. The `context` part
-    measures the long-context curve and the retrieval check up to it and the speed cases again at a lower context.
+    for the model on the device, with vram_headroom_bytes (default crit Core's, VRAM_HEADROOM_BYTES) left free,
+    capped at requested_context (the user's wanted context); context_basis: the run's record of how its kv_tokens came
+    about. The `context` part measures the long-context curve and the retrieval check up to it and the speed cases
+    again at a lower context.
     The `heldout` part decodes the held-out prompts; with a baseline that measured them, the generality gate judges
     them. The `history` part repeats protocol history's cases right after the engine opens and after every other
     part ran on it.
@@ -184,8 +208,9 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                   "budget_seconds": None if certify else float(budget_seconds or rule["budget_seconds"])}
         settings = staged_settings(settings, rule, certify)
     requirement = context_requirement(model, device, context_tokens,
-                                      GIB if vram_headroom_bytes is None else vram_headroom_bytes, settings,
-                                      requested_context, context_basis)
+                                      VRAM_HEADROOM_BYTES if vram_headroom_bytes is None else vram_headroom_bytes,
+                                      settings, requested_context, context_basis,
+                                      spec=None if context_tokens else package_spec(config, model, log))
     required = requirement["tokens"]
     ceiling = prepared.get("ceiling")
     if ceiling is None:
@@ -201,6 +226,9 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
     # protocol quality.allowance: in speed, the checkpoint's own declared format raises a set's limits.
     reference_allowance = (stored_allowance(data, protocol, reference_identity, model, quality_budget, mode=quality_mode)
                            if "quality" in parts else None)
+    # protocol quality.baseline and quality.canaries: reported beside the sets, never judged.
+    reference_qualification = (stored_qualification(data, protocol, reference_identity) if "quality" in parts
+                               else None)
     opener = None if url or isinstance(adapter, (str, Path)) else adapter
     module = Server(url, prepared, served_model) if url else opener or load_adapter(adapter)
     result = {
@@ -258,7 +286,7 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
               "fraction": list(protocol["jitter"]["fraction"])}
     settings = {**settings, "jitter": jitter,
                 # The device memory left free, which the headroom's placement of the weights keeps too (headroom.tiers).
-                "vram_headroom_bytes": GIB if vram_headroom_bytes is None else int(vram_headroom_bytes)}
+                "vram_headroom_bytes": VRAM_HEADROOM_BYTES if vram_headroom_bytes is None else int(vram_headroom_bytes)}
     result["jitter"] = jitter_record(jitter)
     # What makes two rounds the same measurement: a journal answers only a round with this identity.
     round_identity = {"protocol": protocol["protocol"], "crit_eval_version": __version__,
@@ -278,7 +306,9 @@ def run(adapter, model, data, out, config=None, parts=PARTS, warmups=None,
                 return _measure(result, module, model, config or {}, prepared, protocol, parts, warmups, repetitions,
                                 log, continuations, required, settings, exactness, disturbed, bandwidth_gbs,
                                 device, ceiling, baseline, out, reference_scores, sampled_repetitions, times,
-                                reference_spread, attribute_drift, adaptive_sampled, staged, reference_allowance)
+                                reference_spread, attribute_drift, adaptive_sampled, staged, reference_allowance,
+                                reference_qualification,
+                                quality_spec(thresholds, quality_budget, quality_mode, reference_allowance))
             except (Disturbed, Hung) as error:
                 # What the run measured until then stays in the result, marked aborted.
                 log(f"aborted: {error}")
@@ -347,9 +377,10 @@ def placement_tiers(model, device, settings, required, info, ceiling, loaded_fre
     held = (before - loaded_free if isinstance(loaded_free, int) and isinstance(before, int) and before >= loaded_free
             else None)
     try:
-        where = placement(model, device, settings.get("vram_headroom_bytes", GIB),
-                          float(machine_settings().get("ram_headroom_gib", 2.0)) * GIB, settings, required,
-                          held_bytes=held, kv_bytes_per_token=info.get("kv_bytes_per_token")) \
+        where = placement(model, device, settings.get("vram_headroom_bytes", VRAM_HEADROOM_BYTES),
+                          float(machine_settings().get("ram_headroom_gib", RAM_HEADROOM_GIB)) * GIB, settings, required,
+                          held_bytes=held, kv_bytes_per_token=info.get("kv_bytes_per_token"),
+                          spec=info.get("spec") or info.get("spec_prices")) \
             if device and required else None
     except (OSError, ValueError, KeyError, TypeError):
         where = None
@@ -381,7 +412,8 @@ def _stopped(result, times, out, written, reason, detail):
 def _measure(result, module, model, config, prepared, protocol, parts, warmups, repetitions, log, continuations,
              required, settings, exactness, disturbed, bandwidth_gbs, device, ceiling, baseline,
              out, reference_scores=None, sampled_repetitions=None, times=None, reference_spread=None,
-             attribute_drift=False, adaptive_sampled=False, staged=None, reference_allowance=None):
+             attribute_drift=False, adaptive_sampled=False, staged=None, reference_allowance=None,
+             reference_qualification=None, quality_terms=None):
     times = times or PartTimes()
     lower = None
     # A staged run measures the lower context in its stage 3, after its engine closed.
@@ -403,6 +435,11 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
     # A served engine's load count, again when its run ends: the closed track's one load (protocol tracks).
     result["engine_loads"] = {"first": engine_loads(engine), "last": None}
     result["engine"] = info if not info.get("native_libraries") else         {**info, "native_libraries": [portable_path(p) for p in info["native_libraries"]]}
+    if "quality" in parts:
+        # the quality terms the run judges the engine by, with their sources, beside the engine's own spec values
+        spec = dict(result["engine"].get("spec") or {})
+        spec["values"] = {**(spec.get("values") or {}), **(quality_terms or {})}
+        result["engine"] = {**result["engine"], "spec": spec}
     result["context"]["engine_max_context"] = info["max_context"]
     # protocol context.device_memory: what the device keeps free with this engine built for the required context.
     gpus = device_set.indices(device)   # every GPU of a device set, else the engine's one
@@ -617,7 +654,7 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                     module, model, config, prepared, protocol, log, reference_scores,
                     result["requirements"]["quality_budget"], reference_spread, result["quality"],
                     info.get("exact_variants"), required, mode=headroom.quality_mode(result),
-                    allowance=reference_allowance)
+                    allowance=reference_allowance, qualification=reference_qualification)
     wider = info.get("wider_draft")
     if (wider and "speed" in result and info.get("speculative") and not info.get("served")
             and int(wider.get("width") or 0) > int(info.get("draft_width") or 0)):
@@ -647,6 +684,13 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
                 "against_first_measurement": first}
         else:
             result["context"]["lower"] = {**first, "engine_max_context": lower["engine_max_context"]}
+        # How the lower context's engine closed (the adapter's close report): one that kept its device memory fails
+        # the gate with the report, whatever the speeds say, since the engines after it opened beside the leak.
+        for key in ("close", "error"):
+            if lower.get(key) is not None:
+                result["context"]["lower"][key] = lower[key]
+        if lower.get("error"):
+            result["context"]["lower"]["passed"] = False
         for case_id, kinds in result["context"]["lower"]["slower"].items():
             log(f"lower context: {case_id} is slower at {lower['context']:,} tokens ({', '.join(kinds)})")
     elif lower is not None:
@@ -740,6 +784,12 @@ def _measure(result, module, model, config, prepared, protocol, parts, warmups, 
         own = None
     result["track"] = {"closed": closed_track(result, result.get("engine") or {}, own,
                                               float(protocol["tracks"]["draft_tolerance"]), mode_budgets(protocol))}
+    if result.get("quality"):
+        # protocol quality.baseline and quality.canaries: the 16-bit baseline beside each set, the canaries judged
+        # against its limits; reported, never judged.
+        qualify(result["quality"], reference_qualification)
+        for line in qualification_lines(result["quality"]):
+            log(f"quality: {line}")
     result["timing"] = times.record()
     log(f"timing: {times.summary()}; total {result['timing']['total_seconds']:.0f} s")
     written = journal.active()

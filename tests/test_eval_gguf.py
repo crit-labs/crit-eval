@@ -59,6 +59,7 @@ TENSORS = [("token_embd.weight", "Q6_K", (16, 256)), ("output.weight", "Q6_K", (
 
 def gguf_folder(directory, config=CONFIG, tensors=TENSORS, metadata=METADATA):
     directory = Path(directory)
+    directory.mkdir(parents=True, exist_ok=True)
     (directory / "model-IQ3_S.gguf").write_bytes(gguf_bytes(metadata, tensors))
     if config is not None:
         (directory / "config.json").write_text(json.dumps(config))
@@ -66,6 +67,20 @@ def gguf_folder(directory, config=CONFIG, tensors=TENSORS, metadata=METADATA):
 
 
 class GgufEvalTests(unittest.TestCase):
+    def test_a_gguf_takes_its_baselines_16_bit_dtype_from_its_stored_tensors(self):
+        # A GGUF's derived config names no dtype: the 16-bit float type its tensors hold the most elements in decides
+        # (F16 512x256 + 256x512 against BF16 512x256), and bfloat16 where it stores only quantized and F32 tensors.
+        from crit_eval.quality.reference import sixteen_bit_dtype
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(sixteen_bit_dtype(gguf_folder(Path(directory) / "a", config=None)), "float16")
+        brain = [t for t in TENSORS if t[1] not in ("F16", "BF16")]
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(sixteen_bit_dtype(gguf_folder(Path(directory) / "b", config=None, tensors=brain)),
+                             "bfloat16")
+        wide = [(name, "F32", shape) for name, _, shape in TENSORS]
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertIsNone(sixteen_bit_dtype(gguf_folder(Path(directory) / "c", config=None, tensors=wide)))
+
     def test_ceiling_counts_stored_bytes_by_block_format(self):
         with tempfile.TemporaryDirectory() as directory:
             model = gguf_folder(directory)

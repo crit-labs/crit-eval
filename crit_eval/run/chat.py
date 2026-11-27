@@ -44,7 +44,7 @@ from ..quality.prepare import GREEDY_REQUEST, prepared_template, token_ids, with
 # The engine facts crit serve publishes for crit-eval (crit_core.serving.ENGINE_FACTS), and the capability that lets a
 # request decode plainly. prompt_cache false: the engine keeps no prompt cache (protocol followup).
 FACTS = ("speculative", "plain", "draft_width", "bytes_per_pass", "host_bytes_per_pass", "draft_bytes_per_step",
-         "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache")
+         "draft_ms", "kv_bytes_per_token", "prompt_activations", "prompt_cache", "spec_prices")
 PLAIN_CAPABILITY = "chat-plain-v1"
 # A server that declares it takes crit.prompt_cache false: the request prefills every prompt token, whatever the
 # engine's prompt cache holds. Every request but those that may be served from a cache carries it.
@@ -592,7 +592,9 @@ class ChatEngine:
     def cohort(self, clients, max_new_tokens, sampling=None):
         """One closed-loop level of the concurrency part (protocol concurrency.loop): clients[c] is client c's prompts,
         each sent when the client's previous reply has ended, every client starting at once: greedy, or with
-        sampling (sampling[c][r] the sampling fields of client c's r-th request, prepare.sampled_request) sampled. {"seconds": the
+        sampling (sampling[c][r] the sampling fields of client c's r-th request, prepare.sampled_request) sampled.
+        max_new_tokens: every request's output tokens, or per request (max_new_tokens[c][r], each case's own,
+        crit_eval.run.requests.send_cohort). {"seconds": the
         level's wall interval, "requests": per request its client, index, prompt_tokens, the seconds from the level's
         start when it was sent, its first and last reply text arrived and its reply was read (started, first, last,
         finished), the usage's completion_tokens, finish_reason and cached_tokens, the stream's validation errors
@@ -606,8 +608,10 @@ class ChatEngine:
             start.wait()
             for position, prompt in enumerate(prompts):
                 try:
+                    length = (max_new_tokens[index][position] if isinstance(max_new_tokens, (list, tuple))
+                              else max_new_tokens)
                     rows.append({"client": index, "index": position,
-                                 **self._streamed(list(prompt), max_new_tokens, len(clients), epoch[0],
+                                 **self._streamed(list(prompt), int(length), len(clients), epoch[0],
                                                   sampling[index][position] if sampling else None)})
                 except BaseException as error:   # Hung or a transport failure: the level stops with it
                     failures.append(error)

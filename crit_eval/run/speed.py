@@ -9,8 +9,9 @@ from ..quality.prepare import sampled_request, unapplied
 from .adapters import open_engine
 from . import energy
 from .tool_calls import case_tool_calls
-from .timing import (Disturbed, _summary, check_disturbed, decode_text, engine_memory, disagree, provisional, rate, replies, reply_sha256,
-                     settling, stalls, steady_state, timed_generate, timed_plain, timed_replay, timed_sampled)
+from .requests import case_request, request_sha256, send
+from .timing import (Disturbed, _summary, check_disturbed, decode_text, engine_memory, disagree, provisional, rate, replies,
+                     reply_sha256, settling, stalls, steady_state)
 
 
 def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, continuations=None, disturbed_spread=None,
@@ -36,7 +37,8 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
     pinned = (continuations or {}).get("cases", {}) if text["source"] == "pinned" else {}
     energy.measure_idle()   # the device at rest before the suite's first request (once a round)
     for case in prepared["speed"]:
-        prompt, n = case["prompt_ids"], case["output_tokens"]
+        request = case_request(case, "speed", protocol)   # the case's one request (protocol requests.cases)
+        prompt, n = request["prompt_ids"], request["output_tokens"]
         if len(prompt) + n > info["max_context"]:
             cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
             log(f"speed {case['id']}: skipped (context)")
@@ -71,7 +73,7 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
                 first = before.get("first_request")
                 if continuation is not None:
                     for _ in range(2):
-                        tokens, sample = timed_generate(engine, prompt, n)
+                        tokens, sample, _ = send(engine, request)
                         outputs.append(tokens)
                         first = first or first_request(sample)
                 i = 0
@@ -79,9 +81,10 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
                     if i >= warm + repetitions and not disagree(samples, outputs, tolerance):
                         break
                     if continuation is not None:
-                        _, sample = energy.metered(timed_replay, engine, prompt, continuation)
+                        _, sample, _ = energy.metered(send, engine, case_request(case, "speed", protocol,
+                                                                                 continuation=continuation))
                     else:
-                        tokens, sample = energy.metered(timed_generate, engine, prompt, n)
+                        tokens, sample, _ = energy.metered(send, engine, request)
                         # Which reply this request decoded: repetitions of different replies are not a disturbance
                         # (protocol speed.output_varies).
                         sample["reply_sha256"] = reply_sha256(tokens)
@@ -127,6 +130,9 @@ def run_speed(engine, info, prepared, protocol, warmups, repetitions, log, conti
             "output_varies": output_varies(samples),
             "stop_crossed": bool(crossed), "first_stop_index": crossed[0] if crossed else None,
             "tokens": tokens, "samples": samples,
+            # The request the tokens reply to (the case's own): a later part compares its replies with them only when
+            # it sends the same request (protocol requests.cases).
+            "request_sha256": request_sha256(request),
             # The disturbance that stopped the case's first measurement, which this one replaced (protocol
             # speed.disturbed).
             **({"measured_again": retried} if retried else {}),
@@ -260,6 +266,11 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
         if len(prompt) + n > info["max_context"]:
             cases[case["id"]] = {"status": "skipped", "reason": f"needs {len(prompt) + n} tokens of context"}
             continue
+
+        def sampled(seed, logprobs=None, case=case):
+            """The case's request at the prepared sampling and `seed` (protocol requests.overrides.sampled_speed)."""
+            return case_request(case, "sampled_speed", protocol, sampling=sampled_request(settings, seed),
+                                logprobs=logprobs)
         retried = None   # what stopped a first measurement of the case (protocol speed.disturbed)
         for retry in (False, True):
             try:
@@ -270,20 +281,20 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                 # as one more warmup, and its seed is asked again (protocol sampled_speed.steady_state).
                 warm, added, i = warmups, 0, 0
                 while i < warm + repetitions:
-                    request = sampled_request(settings, rule["seeds"]["warmup"] if i < warmups else seed_at(i - warm))
+                    seed = rule["seeds"]["warmup"] if i < warmups else seed_at(i - warm)
                     if i == 0 and i < warmups and checked is not None and not retry:
                         reported = None
                         try:   # the warmup's reply, its timing unused, is the sampling check's
-                            _, sample, reported = timed_sampled(engine, prompt, n, request,
-                                                                int(protocol["sampling_check"]["top_logprobs"]))
+                            _, sample, reported = send(engine, sampled(
+                                seed, int(protocol["sampling_check"]["top_logprobs"])))
                         except RuntimeError as error:
                             log(f"sampled speed {case['id']}: the warmup with log-probabilities failed ({error}); "
                                 "warming up without them")
-                            _, sample, _ = timed_sampled(engine, prompt, n, request)
+                            _, sample, _ = send(engine, sampled(seed))
                         if reported:
-                            checked[case["id"]] = {"logprobs": reported, "seed": request.get("seed")}
+                            checked[case["id"]] = {"logprobs": reported, "seed": seed}
                     else:
-                        _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, request)
+                        _, sample, _ = energy.metered(send, engine, sampled(seed))
                     sample["warmup"] = i < warm
                     if (not sample["warmup"] and full_length(sample) and settling(samples, sample, steady, key="round_ms")
                             and full_length(samples[-1])):
@@ -296,7 +307,7 @@ def run_sampled_speed(engine, info, prepared, protocol, warmups, repetitions, lo
                                                                   or (metrics.case_error(speeds())[0] or 0.0) > target):
                     # The next seed after those measured (2, 3, ...): one more text, until the case's error reaches the target.
                     seed = seed_at(repetitions + extra)
-                    _, sample, _ = energy.metered(timed_sampled, engine, prompt, n, sampled_request(settings, seed))
+                    _, sample, _ = energy.metered(send, engine, sampled(seed))
                     sample.update(warmup=False, seed=seed)
                     samples.append(sample)
                     extra += 1
@@ -366,12 +377,12 @@ def run_sampling_check(engine, info, prepared, protocol, log, checked=None):
             sources.add("warmup")
         else:
             try:
-                result = engine.generate_sampled(list(prompt), n, lambda tokens: None,
-                                                 sampled_request(settings, rule["seed"]), logprobs=top)
+                _, _, reported = send(engine, case_request(case, "sampling_check", protocol,
+                                                           sampling=sampled_request(settings, rule["seed"]),
+                                                           logprobs=top))
             except RuntimeError as error:
                 log(f"sampling check: unsupported ({error})")
                 return {"status": "unsupported", "reason": f"a sampled reply with log-probabilities failed: {error}"}
-            reported = result.get("logprobs")
             sources.add("own request")
         if not reported:
             log("sampling check: unsupported (the engine reports no log-probabilities for sampled tokens)")
@@ -431,7 +442,9 @@ def run_heldout(engine, info, prepared, protocol, log, jitter=None):
             continue
         samples = []
         for r in range(int(settings["repetitions"])):
-            _, sample, _ = timed_sampled(engine, ids, n, sampled_request(prepared["sampling"], r + 1))
+            # The prompt's own request at its drawn length, sampled at seed r + 1 (protocol requests.overrides.heldout).
+            _, sample, _ = send(engine, case_request(prompt, "heldout", protocol, prompt_ids=ids,
+                                                     sampling=sampled_request(prepared["sampling"], r + 1)))
             samples.append(sample)
         summary = _summary(samples)
         prompts[prompt["id"]] = {"status": "measured", "language": prompt["language"], "kind": prompt["kind"],
@@ -460,7 +473,7 @@ def run_wider_draft(module, model, config, prepared, speed, wider, log, context_
         for case in prepared["speed"]:
             if (speed["cases"].get(case["id"]) or {}).get("status") != "measured":
                 continue
-            _, sample = timed_generate(engine, case["prompt_ids"], case["output_tokens"])
+            _, sample, _ = send(engine, case_request(case, "wider_draft"))
             if sample.get("accepted"):
                 cases[case["id"]] = {"accepted": sample["accepted"], "tokens_per_round": sample["tokens_per_round"]}
     finally:
@@ -477,14 +490,14 @@ def run_exactness(module, model, config, prepared, speed, log, mode="reported", 
     shared = engine is not None
     if not shared:
         engine, info = open_engine(module, model, config, speculative=False, context_tokens=context_tokens)
-    generate = timed_plain if shared else timed_generate
     try:
         cases, samples, steps = {}, [], {}
         for case in prepared["speed"]:
             measured = speed["cases"].get(case["id"], {})
             if measured.get("status") != "measured":
                 continue
-            tokens, sample = generate(engine, case["prompt_ids"], case["output_tokens"])
+            # Plain decoding on the speculative engine itself, else the case's own request on the plain one.
+            tokens, sample, _ = send(engine, case_request(case, "exactness", decode="plain" if shared else "free"))
             samples.append(sample)
             steps[case["id"]] = headroom.step_ms_from([sample])
             diverge = next((i for i, (a, b) in enumerate(zip(tokens, measured["tokens"])) if a != b), None)

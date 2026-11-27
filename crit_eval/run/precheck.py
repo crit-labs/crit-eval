@@ -16,7 +16,7 @@ detail}, state passed, failed or unverified, as crit's serving checks report the
 from pathlib import Path
 
 from .. import EVAL_DIR, load_json
-from ..limits.context import curve_points, curve_prompt, lower_context
+from ..limits.context import curve_points, lower_context
 from ..quality.fixed import DEFAULT_QUALITY_MODE, QUALITY_MODES
 from ..quality.prepare import PREPARED, check_prepared, check_template
 from . import host
@@ -25,7 +25,7 @@ from .chat import Server
 from .forks import ForkJudge
 from .history import compare_history, history_cases, history_outputs
 from .quality_checks import run_honesty
-from .timing import timed_generate
+from .requests import case_request, curve_case, send
 
 # The lower-context comparison's samples of each case at each context (after one warm-up request), and the spread past
 # which they cannot tell a slower engine from a noisy one (the item is then unverified, not failed).
@@ -58,13 +58,16 @@ def long_reply_item(engine, info, prepared, protocol, settings, required, mode, 
     curve = curve_points(required, settings)
     if not curve or curve[0] > info["max_context"]:
         return _item("precheck_long_honesty", "unverified", "no curve point fits the engine's context"), None
-    point, n = curve[0], int(settings["output_tokens"])
-    prompt = curve_prompt(prepared["retrieval"], point - n, settings["retrieval"]["positions"])
-    if prompt is None:
+    point = curve[0]
+    case = curve_case(prepared["retrieval"], settings, point)
+    if case is None:
         return _item("precheck_long_honesty", "unverified", f"no room for the curve's prompt at {point:,}"), None
     if not callable(getattr(engine, "reply", None)):
         return _item("precheck_long_honesty", "unverified", "the engine replies over no chat API"), None
-    tokens, sample = timed_generate(engine, prompt, n, logprobs=protocol["quality"]["top_k"])
+    # The curve point's own request with log-probabilities (protocol requests.overrides.precheck).
+    request = case_request(case, "precheck", protocol, logprobs=protocol["quality"]["top_k"])
+    prompt = request["prompt_ids"]
+    tokens, sample, _ = send(engine, request)
     reply = sample.pop("reply", None)
     if not reply:
         return _item("precheck_long_honesty", "unverified",
@@ -83,7 +86,8 @@ def quality_item(engine, info, prepared, protocol, data, mode, budget, log, mode
     experts, a narrower KV) otherwise fails quality most of an hour into a round."""
     from ..quality import fixed
     from ..quality.reference import REFERENCE_VERSION
-    from .quality_checks import quality_thresholds, run_quality, stored_allowance, stored_spread
+    from .quality_checks import (baseline_budgets, quality_thresholds, run_quality, stored_allowance,
+                                 stored_qualification, stored_spread)
     if not callable(getattr(engine, "score", None)):
         return _item("precheck_quality", "unverified", "the engine scores no text")
     identity = {"model_sha256": prepared["model"]["sha256"], "reference": REFERENCE_VERSION,
@@ -101,15 +105,24 @@ def quality_item(engine, info, prepared, protocol, data, mode, budget, log, mode
     used = {name: s["budget_used"] for name, s in sets.items() if s.get("budget_used") is not None}
     worst = max(used, key=used.get) if used else None
     facts = {"budget_used": used.get(worst), "worst_set": worst} if worst else {}
+    # protocol quality.baseline beside the drift, reported, never judged: what a plain 16-bit engine of this model
+    # already uses of the same limits on the same set
+    baseline = baseline_budgets(sets, stored_qualification(data, protocol, identity))
+    sixteen = (baseline.get("budget_used") or {}).get(worst)
+    facts["baseline"] = ({"budget_used": sixteen, "set": worst, "dtype": baseline.get("dtype")}
+                         if sixteen is not None else {"status": baseline["status"], "reason": baseline.get("reason")})
+    beside = (f"; the 16-bit baseline uses {sixteen:.0%} of it on {worst}" if sixteen is not None else
+              f"; no 16-bit baseline ({baseline.get('reason') or baseline['status']})")
     failed = [f"{name}: " + "; ".join(s["failures"]) for name, s in sets.items() if not s["passed"]]
     skipped = [f"{name} ({why})" for name, why in (found.get("skipped") or {}).items()]
     if failed:
         return _item("precheck_quality", "failed", ("; ".join(failed) + (f" (stopped: {found['stopped_early']})"
-                                                                        if found.get("stopped_early") else ""))[:2000],
+                                                                        if found.get("stopped_early") else "")
+                                                     + beside)[:2000],
                      **facts)
     detail = f"{len(sets)} set paths within the drift budget"
     if worst:
-        detail += f", the worst {worst} using {used[worst]:.0%} of it"
+        detail += f", the worst {worst} using {used[worst]:.0%} of it" + beside
     if skipped:
         detail += "; skipped " + ", ".join(skipped)
     return _item("precheck_quality", "passed", detail, **facts)
@@ -120,7 +133,7 @@ def history_item(engine, prepared, protocol, cases, fresh, served, mode):
     pre-check's other requests. In quality mode speed a difference passes where it parts at a near-tie (protocol forks)."""
     if not cases:
         return _item("precheck_history", "unverified", "no speed case fits the engine's context")
-    verdict = compare_history(fresh, history_outputs(engine, cases), served)
+    verdict = compare_history(fresh, history_outputs(engine, cases, "precheck"), served)
     if verdict["passed"]:
         return _item("precheck_history", "passed", f"{len(cases)} requests answered alike after {', '.join(served)}")
     prompts = {case["id"]: case["prompt_ids"] for case in cases}
@@ -144,8 +157,9 @@ def speed_samples(engine, cases, samples=LOWER_SAMPLES):
     from ..reports import metrics
     found = {}
     for case in cases:
-        timed_generate(engine, case["prompt_ids"], case["output_tokens"])
-        timed = [timed_generate(engine, case["prompt_ids"], case["output_tokens"])[1] for _ in range(samples)]
+        request = case_request(case, "precheck")   # the case's own request, as the speed part sends it
+        send(engine, request)
+        timed = [send(engine, request)[1] for _ in range(samples)]
         decode = [s["decode_tps"] for s in timed if s.get("decode_tps")]
         ttft = [s["ttft_ms"] for s in timed if s.get("ttft_ms")]
         found[case["id"]] = {"status": "measured" if decode and ttft else "unmeasured", "samples": timed,
@@ -232,7 +246,7 @@ def run_precheck(adapter, model, data, context_tokens, quality_mode=DEFAULT_QUAL
     cases = history_cases(prepared, info)
     try:
         items.append(memory_item(host.device_memory(), vram_headroom_bytes))
-        fresh = history_outputs(engine, cases)
+        fresh = history_outputs(engine, cases, "precheck")
         items.append(honesty_item("precheck_honesty",
                                   run_honesty(engine, info, prepared, protocol, log, {}, mode=quality_mode)))
         long_item, point = long_reply_item(engine, info, prepared, protocol, settings, required, quality_mode, log)

@@ -2,12 +2,12 @@
 long prompts, and the check that a lower context is not faster."""
 from ..limits import headroom
 from .deadline import Hung
-from ..limits.context import (curve_points, curve_prompt, lower_context, max_context, retrieval_points,
-                              retrieval_prompt, token_text)
-from .adapters import open_engine
+from ..limits.context import curve_points, lower_context, max_context, retrieval_points, token_text
+from .adapters import close_engine, open_engine
 from .jitter import curve_point
+from .requests import case_request, curve_case, curve_prompt_at, retrieval_case, send
 from .speed import cannot_sample, run_speed
-from .timing import Disturbed, _summary, timed_generate, timed_sampled
+from .timing import Disturbed, _summary
 from ..quality.prepare import sampled_request
 
 # A curve point's decode fields: the sampled request's (decode speed is sampled decode); the greedy request's stay
@@ -15,15 +15,17 @@ from ..quality.prepare import sampled_request
 DECODE_KEYS = ("decode_tps", "tokens_per_round", "round_ms")
 
 
-def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings, requested=None, basis=None):
+def context_requirement(model, device, context_tokens, vram_headroom_bytes, settings, requested=None, basis=None,
+                        spec=None):
     """The context every engine is built and measured for: the given one (a run's kv_tokens, with the run's basis:
-    requested, bound, limits) or crit-eval's max context for the model on the device, capped at the requested context.
-    `tokens` is None when neither is known."""
+    requested, bound, limits) or crit-eval's max context for the model on the device, capped at the requested context
+    (sized by crit's EngineSpec of the engine where given: limits.context.max_context's spec). `tokens` is None when
+    neither is known."""
     if context_tokens:
         return {"tokens": int(context_tokens), "source": "given", "missing": [], "reason": None,
                 **{key: (basis or {})[key] for key in ("requested", "bound", "note", "model_limit", "device_limit")
                    if (basis or {}).get(key) is not None}}
-    return {**max_context(model, device, vram_headroom_bytes, settings, requested), "source": "computed"}
+    return {**max_context(model, device, vram_headroom_bytes, settings, requested, spec=spec), "source": "computed"}
 
 
 CONTEXT_TEXT = {"source": "generated", "reason": "each point answers the retrieval request in the engine's own words"}
@@ -77,7 +79,13 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
             log(f"context {point:,}: skipped (max_context {info['max_context']:,})")
             continue
         filled = curve_point(point, required, jitter)
-        prompt = curve_prompt(pieces, filled - n, rule["positions"])
+        # The point's own request (protocol requests.cases), its prompt filling the drawn share of the point
+        # (protocol requests.overrides.context).
+        case = curve_case(pieces, settings, point)
+        prompt = curve_prompt_at(pieces, settings, filled) if case is not None else None
+
+        def point_request(**overrides):
+            return case_request(case, "context", None, prompt_ids=prompt, **overrides)
         if prompt is None:
             points[str(point)] = {"status": "skipped", "context": point,
                                   "reason": f"no room for the curve's prompt before {n} output tokens"}
@@ -87,30 +95,30 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
             for _ in range(int(settings.get("repetitions", 1))):
                 if point == curve[0] and reply_logprobs:
                     try:
-                        tokens, sample = timed_generate(engine, prompt, n, logprobs=reply_logprobs)
+                        tokens, sample, _ = send(engine, point_request(logprobs=reply_logprobs))
                     except Hung:
                         raise
                     except RuntimeError as error:   # a server that cannot stream log-probabilities: the point stands
                         log(f"context {point:,}: the request with log-probabilities failed ({error}); asking without")
                         long_reply = {"point": point, "reason": f"the reply with log-probabilities failed: {error}"}
-                        tokens, sample = timed_generate(engine, prompt, n)
+                        tokens, sample, _ = send(engine, point_request())
                     else:
                         budget = thinking_tokens(engine, rule)
                         if budget:   # the request with log-probabilities takes no reasoning budget: one that does
-                            judged = timed_generate(engine, prompt, n, prompt_cache=True, thinking_tokens=budget)
+                            judged = send(engine, point_request(prompt_cache=True, thinking_tokens=budget))[:2]
                         reply, unmapped = sample.pop("reply", None), sample.pop("reply_unmapped", None)
                         # scored after the prompt the server rendered (ChatEngine.served_ids), not the frame's ids
                         long_reply = ({"point": point, "prompt_ids": reply.pop("prompt_ids", None) or list(prompt),
                                        "reply": reply} if reply else
                                       {"point": point, "reason": unmapped or "the engine returned no log-probabilities"})
                 else:
-                    tokens, sample = timed_generate(engine, prompt, n, thinking_tokens=thinking_tokens(engine, rule))
+                    tokens, sample, _ = send(engine, point_request(thinking_tokens=thinking_tokens(engine, rule)))
                 samples.append(sample)
             sampled, missing = None, unsampled
             if unsampled is None:
                 try:
-                    _, sampled, _ = timed_sampled(engine, prompt, n, sampled_request(prepared["sampling"], 1),
-                                                  prompt_cache=True)
+                    _, sampled, _ = send(engine, point_request(sampling=sampled_request(prepared["sampling"], 1),
+                                                       prompt_cache=True))
                 except Hung:
                     raise
                 except Exception as error:   # the greedy request stands: its first token and retrieval
@@ -145,18 +153,22 @@ def run_context(engine, info, prepared, settings, required, log, reply_logprobs=
     return points, dict(CONTEXT_TEXT), asked, long_reply
 
 
-def retrieval_point(engine, info, prepared, rule, prompt, point, log):
-    """One retrieval request (protocol context.retrieval): passes when the output up to its first stop token
-    contains every fact's answer verbatim; one the engine cannot serve fails. It is judged on its text alone, so it
-    may be served from a prompt cache."""
-    pieces, n = prepared["retrieval"], int(rule["output_tokens"])
+def retrieval_point(engine, info, prepared, rule, case, point, log):
+    """One retrieval request (protocol context.retrieval), the point's case (retrieval_case): passes when the output
+    up to its first stop token contains every fact's answer verbatim; one the engine cannot serve fails. It is judged
+    on its text alone, so it may be served from a prompt cache."""
+    n = int(rule["output_tokens"])
     if point > info["max_context"]:
         log(f"retrieval {point:,}: not served (max_context {info['max_context']:,})")
         return {"status": "failed", "context": point,
                 "error": f"the engine's max_context {info['max_context']:,} is below {point:,}"}
     budget = thinking_tokens(engine, rule)   # its output_tokens follow the reasoning budget
+    # The point's own request, allowed a prompt cache and a reasoning budget (protocol requests.overrides.retrieval).
+    request = case_request(case, "retrieval", None, output_tokens=n + (budget or 0), prompt_cache=True,
+                           thinking_tokens=budget)
+    prompt = request["prompt_ids"]
     try:
-        tokens, sample = timed_generate(engine, prompt, n + (budget or 0), prompt_cache=True, thinking_tokens=budget)
+        tokens, sample, _ = send(engine, request)
     except Hung:
         raise
     except Exception as error:  # an engine that cannot hold the context fails here, however it fails
@@ -176,7 +188,7 @@ def run_retrieval(engine, info, prepared, settings, required, log, from_curve=No
     if not pieces:
         log("retrieval: not in the prepared data (prepare it again with crit eval prepare into a new data directory)")
         return {"status": "missing", "reason": "the prepared data has no retrieval prompts; prepare it again"}
-    n, points = int(rule["output_tokens"]), {}
+    points = {}
     for point in sorted(set(retrieval_points(required, rule)) | set(from_curve)):   # every curve point too
         if point in from_curve:
             points[str(point)] = from_curve[point]
@@ -189,11 +201,11 @@ def run_retrieval(engine, info, prepared, settings, required, log, from_curve=No
             points[str(point)] = {"status": "failed", "context": point,
                                   "error": "the long-context curve did not reach the required context"}
             continue
-        prompt = retrieval_prompt(pieces, point - n, rule["positions"])
-        if prompt is None:
+        case = retrieval_case(pieces, rule, point)
+        if case is None:
             points[str(point)] = {"status": "skipped", "context": point, "reason": "too short to hold the facts"}
             continue
-        points[str(point)] = retrieval_point(engine, info, prepared, rule, prompt, point, log)
+        points[str(point)] = retrieval_point(engine, info, prepared, rule, case, point, log)
     judged_points = [p for p in points.values() if p["status"] != "skipped"]
     return {"status": "measured", "points": points,
             "passed": bool(judged_points) and all(p.get("passed") for p in judged_points)}
@@ -264,11 +276,17 @@ def run_required_again(module, model, config, prepared, protocol, required, warm
     try:
         engine, info = open_engine(module, model, config, speculative=True, context_tokens=required,
                                    exact_prompts=exact_prompts)
+        closed = None
         try:
-            return run_speed(engine, info, prepared, protocol, warmups, repetitions,
-                             lambda message: log("required again: " + message), continuations, disturbed_spread)
+            found = run_speed(engine, info, prepared, protocol, warmups, repetitions,
+                              lambda message: log("required again: " + message), continuations, disturbed_spread)
         finally:
-            engine.close()
+            closed = close_engine(engine)
+        if closed is not None:
+            found = {**found, "close": closed} if isinstance(found, dict) else found
+            if closed["returned"] is False:
+                log(f"required again: the engine's close did not return its device memory: {closed['message']}")
+        return found
     except (Disturbed, Hung):
         raise
     except Exception as error:   # noqa: BLE001 - the comparison with the first measurement stands, and says why
@@ -291,11 +309,12 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
     try:
         engine, info = open_engine(module, model, config, speculative=True, context_tokens=lower,
                                    exact_prompts=exact_prompts)
+        closed = None
         try:
             measured = run_speed(engine, info, prepared, protocol, warmups, repetitions,
                                  lambda message: log("lower context: " + message), continuations, disturbed_spread)
         finally:
-            engine.close()
+            closed = close_engine(engine)
     except (Disturbed, Hung):
         raise
     except RuntimeError as error:
@@ -306,4 +325,11 @@ def run_lower_context(module, model, config, prepared, protocol, required, warmu
     except Exception as error:  # an engine that cannot run at a lower context fails the gate, however it fails
         log(f"lower context: failed ({type(error).__name__}: {error})")
         return {"context": lower, "passed": False, "error": f"{type(error).__name__}: {error}"[:2000]}
-    return {"context": lower, "engine_max_context": info["max_context"], "speed": measured}
+    found = {"context": lower, "engine_max_context": info["max_context"], "speed": measured}
+    if closed is not None:   # the engine is opened again next: its close must have returned its memory
+        found["close"] = closed
+        if closed["returned"] is False:
+            log(f"lower context: the engine's close did not return its device memory: {closed['message']}")
+            found.update(passed=False, error="its close did not return its device memory, so the next engine opens "
+                                             f"beside the leak: {closed['message']}"[:2000])
+    return found

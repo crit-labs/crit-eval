@@ -4,11 +4,10 @@ every crit-eval of that checkpoint, so a run needs only the engine (`crit eval p
 A package source is a folder or an HTTPS base URL (a Hugging Face dataset's `resolve/main/`, say) holding
 packages.json and one folder per package, named by the first 16 hex digits of the model's and the suite's sha256:
 prepared.json (crit_eval.quality.prepare) and reference/ (crit_eval.quality.fixed), with the reference's own spread
-(spread.json) and the allowance (allowance.json, what the checkpoint's declared activation format costs, which
-speed's limits read) when the data holds them. packages.json
-lists each package with the
-identities it was made under (model_sha256, suite_sha256, protocol, reference version) and the sha256 of every file,
-which fetch checks before it writes anything into the data. The scores do not depend on the device that computed
+(spread.json), the allowance (allowance.json, what the checkpoint's declared activation format costs, which
+speed's limits read), the 16-bit baseline (baseline.json) and the canaries (canaries.json) when the data holds
+them. packages.json lists each package with the identities it was made under (model_sha256, suite_sha256,
+protocol, reference version) and the sha256 of every file, which fetch checks before it writes anything into the data. The scores do not depend on the device that computed
 them beyond rounding far below the drift budget, and a run reads them under the model, the suite and the reference
 version alone (runner.run), so one package serves every GPU. The model is identified as prepare identifies it
 (model_identity: its config, tokenizer, template and weight file names and sizes), so a checkpoint is found without
@@ -53,9 +52,9 @@ def pack(data, packages):
             prepared["model"]["sha256"]:
         raise SystemExit(f"{data}: its reference scores are not this crit's reference of the prepared model")
     files = ["prepared.json", f"{fixed.STORE}/index.json"] + [f"{fixed.STORE}/{f}" for f, _ in stored["files"].values()]
-    # The scores' own spread (reference.store_spread) and allowance (reference.store_allowance), when they were
-    # measured against these scores.
-    for extra in (fixed.SPREAD, fixed.ALLOWANCE):
+    # The scores' own spread (reference.store_spread), allowance (reference.store_allowance), 16-bit baseline
+    # (reference.store_baseline) and canaries (reference.store_canaries), when they were measured against these scores.
+    for extra in (fixed.SPREAD, fixed.ALLOWANCE, fixed.BASELINE, fixed.CANARIES):
         path = data / fixed.STORE / extra
         if path.is_file() and all((load_json(path).get("identity") or {}).get(key) == value
                                   for key, value in stored["identity"].items()):

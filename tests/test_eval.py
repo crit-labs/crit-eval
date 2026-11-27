@@ -22,6 +22,7 @@ sys.path.insert(0, str(ROOT))
 from crit_core.model import inspect_safetensors  # noqa: E402
 from crit_eval.run import (ab, adapters, host, hostload, long_context, pin, quality_checks, runner, speed, timing,
                            tool_calls)
+from crit_eval.run import requests as case_requests  # noqa: E402
 from crit_eval.limits import ceiling, context, headroom, probe
 from crit_eval.reports import metrics, compare as report
 from crit_eval.quality import prepare
@@ -372,6 +373,44 @@ class RunnerTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             timing.timed_generate(Short(), [1, 2], 4)
 
+    def test_a_run_given_no_headroom_places_the_model_at_crit_cores(self):
+        from crit_plugins.memory import HEADROOM
+        self.assertEqual(runner.VRAM_HEADROOM_BYTES, HEADROOM)
+        stop = RuntimeError("priced")
+        # The required context is priced with Core's headroom, not 1 GiB ...
+        with tempfile.TemporaryDirectory() as directory, \
+                patch.object(runner, "context_requirement", side_effect=stop) as priced:
+            data = Path(directory)
+            fixture(data)
+            with self.assertRaises(RuntimeError):
+                run_full(MOCK, "unused-model", data, data / "result.json", {"max_context": 64},
+                         warmups=0, repetitions=1, log=lambda message: None, bandwidth_gbs=1.0)
+        self.assertEqual(priced.call_args.args[3], HEADROOM)
+        # ... and so are the weights' tiers, for settings that carry no vram_headroom_bytes.
+        with patch.object(runner, "placement", return_value=None) as placed, \
+                patch.object(runner, "derive_tiers", return_value=None):
+            runner.placement_tiers("unused-model", {"memory_free_bytes": 1 << 34}, {}, 4096, {}, None, None)
+        self.assertEqual(placed.call_args.args[2], HEADROOM)
+
+    def test_a_package_run_sizes_its_computed_context_by_the_packages_engine_spec(self):
+        # crit eval run --package: the context Eval computes is priced by the engine's EngineSpec (its KV elements a
+        # token, the held bytes of its 16-bit matrices), resolved before any load, where a run gives no context; a
+        # spec crit Core cannot resolve leaves the config's static model, and says so.
+        stop, spec = RuntimeError("priced"), {"values": {"kv_elements_per_token": {"value": 25600}}}
+        with tempfile.TemporaryDirectory() as directory,                 patch("crit_core.spec.engine_spec", return_value=spec) as resolved,                 patch.object(runner, "context_requirement", side_effect=stop) as priced:
+            data = Path(directory)
+            fixture(data)
+            with self.assertRaises(RuntimeError):
+                run_full(MOCK, "unused-model", data, data / "result.json", {"package": "PACKAGE"},
+                         warmups=0, repetitions=1, log=lambda message: None, bandwidth_gbs=1.0)
+        self.assertEqual(resolved.call_args.args, ("PACKAGE", "unused-model"))
+        self.assertIs(priced.call_args.kwargs["spec"], spec)
+        logged = []
+        with patch("crit_core.spec.engine_spec", side_effect=ValueError("no model plugin")):
+            self.assertIsNone(runner.package_spec({"package": "PACKAGE"}, "unused-model", logged.append))
+        self.assertIn("sized by the checkpoint's config", logged[0])
+        self.assertIsNone(runner.package_spec({"max_context": 64}, "unused-model"))   # another adapter: no spec
+
 
 class CharacterText:
     """A stand-in for crit_core.text.ModelText whose tokens are characters."""
@@ -503,6 +542,7 @@ PROTOCOLS = {
     "crit-eval-v0.8.0": "64a97ad352f537567fe1b3bc9c593af3a9fa9e73744247f2d1c2b446e664aa6f",  # decode speed is sampled decode only; speed prices 16-bit matrices in 8 bits
     "crit-eval-v0.8.1": "fb2500d9278bd1e23cf3ad187cd63b378500f3e077d0f4415de0af442fc7df09",  # release 0.8.1: retrieval judges a reasoning model answer after a reasoning budget
     "crit-eval-v0.8.2": "5ccb432eea193b9e5474aa47b762f3946621b38b945680118bc23fa3fab806b8",  # release 0.8.2: speed judges a checkpoint's quantized activations by their measured allowance
+    "crit-eval-v0.9.0": "4f5a69f495b56c277c2c49b203119cbd7100c22efa62b3d5c9d6a57c64378bbb",  # release 0.9.0: every request built from its case's one definition; the 16-bit baseline and canaries reported
 }
 
 
@@ -1482,11 +1522,11 @@ class RepetitionTests(unittest.TestCase):
         tokens = list(outputs or [[7] * 4] * len(speeds)) * 2
         calls = []
 
-        def timed(engine, prompt, n):
+        def timed(engine, prompt, n, **options):
             calls.append(n)
             return tokens.pop(0), dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
                                        round_ms=None, output_tokens=reply)
-        with patch.object(speed, "timed_generate", timed):
+        with patch.object(case_requests, "timed_generate", timed):
             measured = speed.run_speed(None, {"max_context": 64}, prepared, protocol, warmups, repetitions,
                                        lambda m: None, disturbed_spread=disturbed_spread, warmed=warmed)
         return len(calls), measured["cases"]["a"]
@@ -1598,10 +1638,10 @@ class RepetitionTests(unittest.TestCase):
         queue = [self.sample(s, 50.0) for s in (100.0, 101.0, 150.0, 102.0, 101.0, 100.0, 101.0)]
         lines = []
 
-        def timed(engine, prompt, n):
+        def timed(engine, prompt, n, **options):
             return [7] * 4, dict(queue.pop(0), request_ms=200.0, prefill_tps=None, tokens_per_round=None,
                                  round_ms=None, output_tokens=256)
-        with patch.object(speed, "timed_generate", timed):
+        with patch.object(case_requests, "timed_generate", timed):
             case = speed.run_speed(None, {"max_context": 64}, prepared, protocol, 1, 2, lines.append,
                                    disturbed_spread=0.25)["cases"]["a"]
         self.assertIn("decode varied", case["measured_again"])
@@ -1650,10 +1690,10 @@ class RepetitionTests(unittest.TestCase):
         prepared = {"stop_ids": [], "speed": [{"id": "a", "kind": "chat", "prompt_ids": [1, 2], "output_tokens": 4}]}
         queue = [self.sample(decode, ttft) for decode, ttft in requests] * 2   # a disturbed case is measured again
 
-        def timed(engine, prompt, n):
+        def timed(engine, prompt, n, **options):
             return [7] * 4, dict(queue.pop(0), request_ms=3000.0, prefill_tps=None, tokens_per_round=None,
                                  round_ms=None, output_tokens=256)
-        with patch.object(speed, "timed_generate", timed):
+        with patch.object(case_requests, "timed_generate", timed):
             return speed.run_speed(None, {"max_context": 64}, prepared, protocol, warmups, 1, lambda m: None,
                                    disturbed_spread=0.25, warmed=warmed)["cases"]["a"]
 
@@ -2811,6 +2851,30 @@ class ContextTests(unittest.TestCase):
             self.assertIsNone(value["tokens"])
             self.assertIn("free device memory (re-run crit eval probe)", value["missing"])
 
+    def test_crits_engine_spec_prices_the_kv_and_the_held_matrices_and_the_protocol_keeps_its_precision(self):
+        # crit's EngineSpec of the engine (crit_core.spec): its KV pools' elements a token replace the config's count
+        # (priced at the protocol's KV precision, Eval's rule), and its projections' held bytes of the 16-bit target
+        # matrices replace their stored bytes in the resident weights
+        with tempfile.TemporaryDirectory() as directory:
+            model = safetensors_model(directory, SHAPES, DENSE)
+            device = {"device": "fixture gpu", "memory_free_bytes": self.overhead + RESIDENT + 32 * 20000}
+            plain = context.max_context(model, device, context.GIB, self.settings)
+            self.assertIsNone(plain["basis"]["sized_by"])
+            spec = {"values": {"kv_elements_per_token": {"value": 8, "source": "resolved", "by": "a-model"},
+                               "held_matrix_bytes": {"value": 1000, "source": "resolved", "by": "projections"},
+                               "stored_matrix_bytes": {"value": 3000, "source": "resolved", "by": "projections"}}}
+            value = context.max_context(model, device, context.GIB, self.settings, spec=spec)
+            element = float(self.settings["kv_bytes_per_element"])
+            self.assertEqual(value["kv_bytes_per_token"], int(round(8 * element)))
+            self.assertEqual(value["basis"]["resident_weight_bytes"], RESIDENT - 2000)
+            self.assertEqual(value["basis"]["sized_by"], ["held_matrix_bytes", "kv_elements_per_token",
+                                                          "stored_matrix_bytes"])
+            self.assertEqual(context.spec_prices({"kv_elements_per_token": 8}), {"kv_elements_per_token": 8})
+            self.assertEqual(context.spec_prices(None), {})
+            where = context.placement(model, device, context.GIB, context.GIB, self.settings, 1024, spec=spec)
+            self.assertEqual(where["kv_bytes_per_token"] if "kv_bytes_per_token" in where else
+                             value["kv_bytes_per_token"], int(round(8 * element)))
+
     def test_a_companion_drafter_is_kept_out_of_the_kv_cache(self):
         with tempfile.TemporaryDirectory() as directory:
             for name in ("target", "drafter"):
@@ -3163,11 +3227,25 @@ class ContextTests(unittest.TestCase):
         gates = {g["name"]: g for g in current["gates"]}
         self.assertEqual((gates["capacity"]["state"], gates["lower_context"]["state"]), ("pass", "fail"))
         self.assertIn("slower at 2,048 tokens than at 8,192", gates["lower_context"]["detail"])
+        self.assertEqual(lower["close"], {"returned": True, "judged": True, "message": "returned"})
         self.assertEqual([g["kpi"] for g in current["goals"]], ["decode", "prefill", "ttft", "context_decode", "context_ttft"])
         self.assertIsNotNone(result["headroom"]["context"]["decode"]["ceiling_score"])
         rows = status.stop_record_headroom(result)["kpis"]
         self.assertEqual([row["kpi"] for row in rows][-2:], ["context_decode", "context_ttft"])
         self.assertIn("context  8,192 tokens required (given); engine holds 8,192", status.render(current))
+
+    def test_a_lower_context_engine_whose_close_keeps_its_memory_fails_the_gate_with_the_report(self):
+        # The engine after it would open beside the leak (crit's Core refuses it): the gate fails naming what holds
+        # the memory, whatever the speeds say.
+        with tempfile.TemporaryDirectory() as directory:
+            result = self.run_mock(directory, 8192, kv_bytes_per_token=64, keeps_memory_below_context=8192)
+        lower = result["context"]["lower"]
+        self.assertFalse(lower["passed"])
+        self.assertEqual(lower["close"]["returned"], False)
+        gates = {g["name"]: g for g in result["status"]["gates"]}
+        self.assertEqual(gates["lower_context"]["state"], "fail")
+        self.assertIn("its close did not return its device memory, so the next engine opens beside the leak: "
+                      "elastic range mock/pages is open", gates["lower_context"]["detail"])
 
     def test_free_device_memory_at_the_required_context_sits_beside_the_capacity_gate(self):
         readings = iter([{"index": 0, "free_bytes": 3_000_000_000, "used_bytes": 29_000_000_000,
@@ -3640,8 +3718,13 @@ class QualityTests(unittest.TestCase):
         self.assertTrue(0 < half["share"]["conversations/served"] < base)
         self.assertEqual((half["description"], half["config"]), ("one group exact", {"score_drift": 0.1}))
         self.assertNotIn("attribution", plain["quality"])   # only on request
+        self.assertEqual(found["baseline"]["status"], "missing")   # the data holds no 16-bit baseline, and says so
+        # the quality terms the run judged by, in the engine's spec with their sources (crit_core.spec)
+        limits = result["engine"]["spec"]["values"]["quality_limits"]
+        self.assertEqual((limits["source"], limits["value"]["kld_mean_max"]), ("user", 1.0))
         text = status.render(result["status"])
         self.assertIn("drift attribution (share of the budget each exact variant takes away", text)
+        self.assertIn("no 16-bit baseline (missing)", text)
         # The prompt positions' share leaves out their perplexity ratio (protocol quality.prompt_perplexity).
         self.assertIn(f"all exact conversations/served {base:+.0%} (0% with it exact), "
                       f"conversations/prompt {found['base']['conversations/prompt']:+.0%} (0% with it exact); half", text)

@@ -55,6 +55,14 @@ class MachineSettingsTests(unittest.TestCase):
         self.assertEqual(crit_eval.machine_settings(), {})
         self.assertEqual(crit_eval.requested_context(), crit_eval.DEFAULT_CONTEXT_TOKENS)
 
+    def test_the_headroom_defaults_are_crit_cores(self):
+        # One default each, Core's: the device memory its loader leaves free and the host memory a run leaves
+        # available (the same 0.25 GiB and 2 GiB as before)
+        from crit_plugins.memory import HEADROOM, HOST_HEADROOM
+        self.assertEqual((crit_eval.VRAM_HEADROOM_GIB, crit_eval.RAM_HEADROOM_GIB),
+                         (HEADROOM / (1 << 30), HOST_HEADROOM / (1 << 30)))
+        self.assertEqual((crit_eval.VRAM_HEADROOM_GIB, crit_eval.RAM_HEADROOM_GIB), (0.25, 2.0))
+
     def test_without_a_named_project_the_checkouts_settings_stand(self):
         self.named(None)
         self.assertEqual(crit_eval.machine_settings(), {"vram_headroom_gib": 4.0, "context_tokens": 50000})

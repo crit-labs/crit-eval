@@ -384,7 +384,8 @@ class JournaledEngine:
 
     def close(self):
         if self.real is not None:
-            self.real.close()
+            return self.real.close()   # the adapter's close report, where it gives one (adapters.close_engine)
+        return None
 
     def __getattr__(self, name):
         if name in METHODS:

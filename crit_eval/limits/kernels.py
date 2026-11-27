@@ -145,6 +145,7 @@ def _timed(engine, ids, n, now=time.time_ns):
 
 def _child(spec):
     from ..run.adapters import load_adapter, open_engine
+    from ..run.requests import case_request
     prepared = load_json(Path(spec["data"]) / PREPARED)
     module = load_adapter(spec["adapter"])
     engine, info = open_engine(module, spec["model"], spec["config"], speculative=True,
@@ -157,17 +158,21 @@ def _child(spec):
         for case in prepared["speed"]:
             if spec["cases"] and case["id"] not in spec["cases"]:
                 continue
-            ids, n = list(case["prompt_ids"]), case["output_tokens"]
+            # The case's own request (protocol requests.cases), and the two the trace asks beside it with its prompt
+            # changed and, for the prefill, one output token (protocol requests.overrides.kernels).
+            request = case_request(case, "kernels")
+            ids, n = request["prompt_ids"], request["output_tokens"]
             # Warmup on a prompt of the same length: graph capture and lazy allocation for this length.
-            warm = warmup_prompt(ids)
-            engine.generate(warm, n, lambda tokens: None)
-            began.update((warm[0], ids[0]))
+            warm = case_request(case, "kernels", prompt_ids=warmup_prompt(ids))
+            engine.generate(warm["prompt_ids"], warm["output_tokens"], lambda tokens: None)
+            began.update((warm["prompt_ids"][0], ids[0]))
             time.sleep(0.1)
             # The prefill: one output token on a prompt no prefix cache holds any of, so the engine computes every
             # position and no verify pass or draft round follows.
-            fresh = fresh_prompt(ids, began)
-            began.add(fresh[0])
-            (prefill_start, prefill_first, prefill_end), _ = _timed(engine, fresh, 1, now)
+            fresh = case_request(case, "kernels", prompt_ids=fresh_prompt(ids, began), output_tokens=1)
+            began.add(fresh["prompt_ids"][0])
+            (prefill_start, prefill_first, prefill_end), _ = _timed(engine, fresh["prompt_ids"], fresh["output_tokens"],
+                                                                    now)
             time.sleep(0.1)
             (start, first, end), result = _timed(engine, ids, n, now)
             marks["cases"].append({"id": case["id"], "prompt_tokens": len(ids), "output_tokens": len(result["tokens"]),

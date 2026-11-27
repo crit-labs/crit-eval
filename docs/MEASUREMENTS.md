@@ -2,6 +2,23 @@
 
 [Overview](README.md) · [Measurements](MEASUREMENTS.md) · [Context](CONTEXT.md) · [Adapter](ADAPTER.md)
 
+## One request per case
+
+Every request Eval sends for a suite case is built by one function
+([requests.py](../crit_eval/run/requests.py) `case_request`, protocol `requests.cases`) from the case's one
+definition: its prompt (the token ids `prepare` froze, and for a server the chat messages and tools they render
+from) and its output tokens, asked greedily, stop tokens off, with no prompt cache, no log-probabilities, no
+reasoning budget and free decoding. The cases are the speed cases, the held-out prompts and the follow-up turns as
+prepared, and each long-context curve point and retrieval point. A part that asks a case otherwise names each field
+it changes, and only fields its entry in `requests.overrides` declares: the sampled suite and the held-out prompts
+sample at a seed, the held-out prompts and curve points are cut to their drawn length, the curve's first point asks
+for log-probabilities, retrieval adds the reasoning budget, the follow-up turns may be served from a prompt cache,
+the exactness check decodes plain, a pinned continuation is replayed; the request records them (`overrides`), and
+any other is refused. Two replies are compared only when their requests are the same, one case's definition with
+the same overrides: a speed case records the request its reply answers (`request_sha256`), and the concurrency part
+compares a batched reply with it only when the level asked the same (from v0.9.0, when every pool prompt is asked at
+its case's own length).
+
 ## Speed
 
 Decode speed is sampled decode: the [sampled suite](#sampled-speed)'s score at the model's own sampling is the
@@ -629,6 +646,33 @@ pass would fail. The margin of 20 covers how a dense model's spread grows from 4
 on Nanbeige4.3-33B, still 180 times below the level); a model that amplifies rounding shows it in the short texts
 already and gets the full pass. `spread.json` then names the texts it skipped (`spread_skipped`).
 
+**The 16-bit baseline.** The TF32 spread can under-count a model's own sensitivity by far: on Gemma 4 31B the
+long-4096 prompt p99 is 0.105 under TF32 and 3.26 for a plain BF16 engine, 82% of speed's 4.0. From
+crit-eval-v0.9.0 `crit eval reference` (by default; `--no-baseline` skips it) scores the texts once more through
+the same code path, chunks and order in the checkpoint's own 16-bit dtype (its config's `dtype`: bfloat16 or
+float16; a config that declares none, as a GGUF's derived config, takes the 16-bit float type its stored tensors
+hold the most elements in, else bfloat16 where it stores quantized tensors; an FP32 checkpoint has none): every weight decoded as the exact pass decodes it, then held in that dtype; the embeddings, activations,
+residual stream, KV and attention scores in it through the official forward; the head a product of its 16-bit
+values accumulated and output in FP32. It stores how far that lands from the exact scores per set and path, with
+the block-bootstrap resamples `position_spread` draws for an engine (`baseline.json` beside the scores, protocol
+`quality.baseline`; reference packages carry it). Every set and path of a run lists the baseline beside the
+engine (`baseline`: its KLD mean and p99, PPL ratio, the budget it uses of the limits the run judges that set by,
+and its `budget_spread` against them), and `status` names the sets where a 16-bit engine of this model already
+uses most of a limit: *unreachable at 16 bits* where the baseline exceeds it, *near the limit* where its bootstrap
+p95 does. Data scored without a baseline says so. Reported, not judged: no limit and no verdict reads it.
+
+**Canaries.** `crit eval reference --canaries` (off by default, a pass each) scores the texts with four
+deliberately broken forwards, each a general hook on the official forward that names no model: `skip_layer` (the
+middle decoder layer's output replaced by its input), `rope_base` (every rotary frequency table as a doubled base
+makes it), `kv_shift` (each query reads the keys and values one position off: through transformers' attention interface, or
+for attention that calls its own kernel its `k_proj` and `v_proj` outputs moved one position) and `coarse_weights`
+(every weight matrix, the output head and the embedding tables included, on a symmetric 3-bit grid per group of
+32). How far each lands is stored per set and path (`canaries.json`,
+protocol `quality.canaries`). A run judges each canary's sets against the limits it judges the engine by, the
+allowance and the spread included, and reports which canaries pass (`quality.canaries`, and `status`): a canary
+that passes means the limits are too loose to tell that breakage from a working engine of this model. Reported,
+not judged.
+
 **Drift attribution.** `crit eval run --adapter A --attribute-drift` (with `--only quality` during development)
 scores the quality texts again after the run's own engine closes, on an engine opened with each of the adapter's
 `exact_variants`: configuration overrides that each switch one matrix group or arithmetic choice back to exact (the
@@ -886,15 +930,17 @@ stays serial, and a server that reports none or 1 leaves the part unmeasured wit
 A **level** of N clients is one closed loop: the clients start together and each sends its next request when its
 previous reply has ended, 4 requests per client. Client c's r-th request is prompt (c + r) mod the pool's size, so a
 client never repeats a prompt and clients at the same step send different ones while there are enough. The pool is
-the speed cases with prompts of at most 2,048 tokens, then the held-out prompts, each as its frozen chat messages;
-every request is 128 tokens long, and the server prefills each one. Each level runs twice (from v0.8.0): greedy,
+the speed cases with prompts of at most 2,048 tokens, then the held-out prompts, each its case's own request
+([one request per case](#one-request-per-case)): its frozen chat messages at its own output tokens (a speed case 256,
+a held-out prompt 64; through v0.8.x every request was 128 tokens), and the server prefills each one. Each level runs
+twice (from v0.8.0): greedy,
 whose replies the consistency gate compares with the serial ones and which shows whether the requests ran together,
 then sampled at the prepared sampling, each prompt at its own seed (its pool position + 1, the same at every level),
 which gives every speed figure below (aggregate, first tokens, decode, ceiling fraction, speedup); the greedy
 aggregate stays beside them as `greedy`, comparison only, and an engine that cannot sample has them unmeasured
 (`sampled_missing`) (a reply with cached prompt tokens
 fails, as in the speed part). The levels are N = 1, 2, 4, 8, 16, 32 and 64, up to the server's capacity and while N x
-(the longest pool prompt + 128) fits the required context, the KV the requests hold at once.
+(the longest pool prompt with its output tokens) fits the required context, the KV the requests hold at once.
 
 | Figure | Per level |
 | --- | --- |
@@ -902,7 +948,7 @@ fails, as in the speed part). The levels are N = 1, 2, 4, 8, 16, 32 and 64, up t
 | `peak_concurrency` | The requests in flight at once at the peak, as the clients see them |
 | `streaming_peak`, `ran_together` | The replies streaming at once at the peak (their first and last tokens' intervals overlapping), and whether that is two or more (null: each reply in one chunk, or one client) |
 | `ttft_ms_p50`, `ttft_ms_p95`, `decode_tps_p50` | Per request: time to its first reply text, and its tokens after the first over the time from first to last |
-| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply from the speed part, as far as both go: the share that match and each differing reply's first different token (with its `fork` in quality mode `speed`, [judged](#forks-in-quality-mode-speed) on the engine). A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/inference/core/src/batch/README.md#batch-invariance)) |
+| `consistency` | Each reply to a speed-case prompt against that case's serial greedy reply to the same request: the speed part's, which records its request (`request_sha256`), else the request run alone first (`serial_source`); the share that match and each differing reply's first different token (with its `fork` in quality mode `speed`, [judged](#forks-in-quality-mode-speed) on the engine). A batch-invariant engine matches every one ([batched steps](https://github.com/crit-labs/crit/blob/main/inference/core/src/batch/README.md#batch-invariance)) |
 | `ceiling`, `fraction_of_ceiling` | The aggregate against the batched ceiling below |
 | `speedup`, `expected_speedup`, `fraction_of_expected`, `expected_missing` | The aggregate over one client's, the cost model's at the run's single-stream hit rate, the share of it reached, and why there is none |
 

@@ -162,7 +162,11 @@ class MockEngine:
         return {"expert_cache": {"reads": self.reads, "hits": self.hits}}
 
     def close(self):
-        pass
+        """The close's report (docs/ADAPTER.md): config "keeps_memory_below_context" makes an engine opened below
+        that context report a close that did not return its device memory."""
+        if self.capacity < int(self.config.get("keeps_memory_below_context", 0)):
+            return {"returned": False, "judged": True, "message": "elastic range mock/pages is open (1.00 GiB backed)"}
+        return {"returned": True, "judged": True, "message": "returned"}
 
 
 def create_eval_engine(context):

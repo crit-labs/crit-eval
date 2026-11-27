@@ -21,6 +21,7 @@ which a run draws 80-100% (protocol jitter). The concurrency part, last of all, 
 clients takes depends on how far the engine runs them together, which no single-stream request shows (a staged run
 prices each level from the aggregate of the one before it).
 """
+from .requests import definition
 from ..limits.context import curve_points, lower_context, retrieval_points
 
 # Seconds per scored position of crit serve's score call beyond the engine's own prefill and decode: computing,
@@ -180,10 +181,11 @@ def requests(prepared, protocol, parts, required, settings=None, info=None, warm
     if "history" in names:
         add("history", _history(prepared, held))
         add("history_again", _history(prepared, held))
-    turns, n = prepared.get("followup") or [], int(protocol["followup"]["output_tokens"])
-    if turns and len(turns[-1]["prompt_ids"]) + n <= held and (info or {}).get("prompt_cache") is not False:
-        add("followup", [(len(t["prompt_ids"]), n) for t in turns])
-        add("followup_again", [(len(t["prompt_ids"]), n) for t in turns])
+    # each turn at its own request's output tokens (requests.definition), as the follow-up part asks it
+    turns = prepared.get("followup") or []
+    if turns and len(turns[-1]["prompt_ids"]) + definition(turns[-1])["output_tokens"] <= held and (info or {}).get("prompt_cache") is not False:
+        add("followup", [(len(t["prompt_ids"]), definition(t)["output_tokens"]) for t in turns])
+        add("followup_again", [(len(t["prompt_ids"]), definition(t)["output_tokens"]) for t in turns])
     if "speed" in names:
         add("speed", _speed(prepared, held, each))
         if prepared.get("sampling") is not None and "sampled_speed" in names:
