@@ -4,14 +4,15 @@ single-stream figure or other gate sees it.
 
 A level of N clients is one closed loop: the clients start together and each sends its next request when its previous
 reply has ended, requests_per_client in all, over a pool of distinct prompts (the short speed cases, then the held-out
-prompts), output_tokens long (ChatEngine.cohort). Each level runs twice: greedy, whose replies the gate compares and
+prompts), each the case's own request at its own output tokens (crit_eval.run.requests; ChatEngine.cohort). Each level
+runs twice: greedy, whose replies the gate compares and
 whose requests in flight and replies streaming at once say whether the requests ran together, then sampled at the
 prepared sampling (each prompt at its own seed), which every speed figure is taken from: decode speed is sampled
 decode, and the greedy aggregate stays beside it as `greedy`, a comparison only. Per level: the aggregate completion
 tokens over the level's wall interval (crit_eval.run.outcomes.validate_cohort), the requests in flight at once at the
 peak and the replies streaming at once (whether the requests ran together), each request's time to first token and
-decode speed, each speed-case reply against that case's serial greedy reply (in quality mode speed, each difference judged as
-protocol forks judges one), the level's aggregate against the batched ceiling (crit_eval.limits.batched), and its
+decode speed, each speed-case reply against that case's serial greedy reply to the same request (in quality mode speed,
+each difference judged as protocol forks judges one), the level's aggregate against the batched ceiling (crit_eval.limits.batched), and its
 speedup over the 1-client level beside the speedup the cost model expects (protocol concurrency.speedup; reported, not
 judged)."""
 from ..limits.batched import drafted_floor, step_floor
@@ -21,6 +22,7 @@ from ..reports import metrics
 from .estimate import duration
 from .forks import ForkJudge
 from .outcomes import RequestRecord, StreamOutcome, validate_cohort
+from .requests import case_request, request_sha256, send_cohort
 from .speed import cannot_sample
 from ..quality.prepare import sampled_request
 
@@ -53,20 +55,22 @@ def sampled_level(gate, drawn, reason):
 
 
 def pool(prepared, protocol, max_context):
-    """The prompts a level's clients send (protocol concurrency.pool): {"id", "prompt_ids", "case"} rows, case naming the
-    speed case whose serial reply a reply is compared with (None for a held-out prompt)."""
+    """The prompts a level's clients send (protocol concurrency.pool): {"id", "prompt_ids", "case", "request"} rows,
+    request the case's own greedy request (crit_eval.run.requests.case_request) and case naming the speed case whose
+    serial reply a reply is compared with (None for a held-out prompt)."""
     rule = protocol["concurrency"]
-    rows = [{"id": c["id"], "prompt_ids": c["prompt_ids"], "case": c["id"]} for c in prepared["speed"]
-            if len(c["prompt_ids"]) <= rule["max_prompt_tokens"]]
-    rows += [{"id": "heldout/" + p["id"], "prompt_ids": p["prompt_ids"], "case": None} for p in prepared.get("heldout", [])]
-    return [row for row in rows if len(row["prompt_ids"]) + rule["output_tokens"] <= max_context]
+    entries = [(c["id"], c, c["id"]) for c in prepared["speed"] if len(c["prompt_ids"]) <= rule["max_prompt_tokens"]]
+    entries += [("heldout/" + p["id"], p, None) for p in prepared.get("heldout", [])]
+    rows = [{"id": pid, "prompt_ids": list(entry["prompt_ids"]), "case": case, "entry": entry,
+             "request": case_request(entry, "concurrency", protocol)} for pid, entry, case in entries]
+    return [row for row in rows if len(row["prompt_ids"]) + row["request"]["output_tokens"] <= max_context]
 
 
 def levels(protocol, capacity, required, prompts):
     """The client counts measured (protocol concurrency.clients_rule): at most the server's capacity, and with clients x
-    (the longest prompt + output) at most the required context."""
+    (the longest prompt with its output) at most the required context."""
     rule = protocol["concurrency"]
-    longest = max(len(p["prompt_ids"]) for p in prompts) + rule["output_tokens"]
+    longest = max(len(p["prompt_ids"]) + p["request"]["output_tokens"] for p in prompts)
     return [n for n in rule["clients"] if n <= capacity and n * longest <= required]
 
 
@@ -262,34 +266,36 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
             "no level fits the server's capacity and the context"
         log(f"concurrency: unmeasured ({reason})")
         return {"status": "unmeasured", "reason": reason, "max_concurrent_requests": capacity}
-    per, output = int(rule["requests_per_client"]), int(rule["output_tokens"])
+    per = int(rule["requests_per_client"])
     unsampled = cannot_sample(engine, prepared)
     seed_of = {p["id"]: i + 1 for i, p in enumerate(prompts)}   # each prompt at its own seed, at every level
-    serial = {cid: case.get("tokens") for cid, case in ((result.get("speed") or {}).get("cases") or {}).items()
-              if case.get("status") == "measured" and case.get("tokens")}
+    # A batched reply is compared with a serial reply to the same request only (protocol requests.cases): the speed
+    # part's, which records the request its tokens reply to, where that is the level's request, else the request run
+    # alone first, a cohort of one client (crit eval run --only concurrency, a result from before the record).
+    speed = (result.get("speed") or {}).get("cases") or {}
+    serial, missing = {}, []
+    for p in prompts:
+        if p["case"] is None:
+            continue
+        found = speed.get(p["case"]) or {}
+        if (found.get("status") == "measured" and found.get("tokens")
+                and found.get("request_sha256") == request_sha256(p["request"])):
+            serial[p["case"]] = found["tokens"]
+        else:
+            missing.append(p)
     serial_source = "speed part"
-    # A served engine's reply is its streamed text, which its server shapes by how the reply ends: a tool call it
-    # finished comes as delta tool_calls (name and arguments), one the output limit cut as text with the format's
-    # markers (crit serve's ToolReply). A case with tools, its speed reply the case's output_tokens long and a level's
-    # concurrency.output_tokens, would compare text of two shapes, so its serial reply is run alone at the level's.
-    shaped = ({c["id"] for c in prepared["speed"] if c.get("tools")} if info.get("served") else set())
-    missing = [p for p in prompts if p["case"] is not None and (serial.get(p["case"]) is None or p["case"] in shaped)]
     if missing:
-        # Without the speed part's replies (crit eval run --only concurrency), or for a served case with tools, each
-        # such speed case of the pool is run once alone, a cohort of one client, so every level has a serial reply of
-        # its own length to compare with.
         for p in missing:
-            serial.pop(p["case"], None)   # a served case with tools: never the speed part's reply of another length
-            alone = engine.cohort([[p["prompt_ids"]]], output)
+            alone = send_cohort(engine, [[p["request"]]])
             rows = alone.get("requests") or []
             if rows and not rows[0].get("errors") and rows[0].get("tokens"):
                 serial[p["case"]] = rows[0]["tokens"]
         serial_source = "speed part and one-client runs" if len(missing) < len(
             [p for p in prompts if p["case"] is not None]) else "one-client runs"
-        log(f"concurrency: {len(missing)} serial replies run alone first (no speed part reply, or a served case "
-            "with tools)")
+        log(f"concurrency: {len(missing)} serial replies run alone first (no speed part reply to the same request)")
     strings = (prepared.get("retrieval") or {}).get("token_text")
-    mean_context = sum(len(p["prompt_ids"]) for p in prompts) / len(prompts) + output / 2
+    outputs = {p["id"]: p["request"]["output_tokens"] for p in prompts}
+    mean_context = sum(len(p["prompt_ids"]) + outputs[p["id"]] / 2 for p in prompts) / len(prompts)
     terms, bandwidth_gbs, tflops, host = ceiling_inputs() if ceiling_inputs else (None, None, None, None)
 
     def ceiling(rows, at, rate=None, source=None):
@@ -303,7 +309,8 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
            "ceiling_basis": "one token per row per step",
            # The run's single-stream hit rate the expectations are priced at, for a model with weights off the device.
            **({"hit_rate": host["hit_rate"], "hit_rate_source": host["hit_rate_source"]} if host else {}),
-           "output_tokens": output, "pool": [p["id"] for p in prompts], "mean_context": mean_context,
+           # Each pool prompt's output tokens: its case's own (protocol requests.cases).
+           "output_tokens": outputs, "pool": [p["id"] for p in prompts], "mean_context": mean_context,
            "sampling": prepared.get("sampling") if unsampled is None else None,
            **({"sampled_missing": unsampled} if unsampled else {}), "levels": {},
            "skipped": {}}
@@ -311,17 +318,20 @@ def run_concurrency(engine, info, prepared, protocol, result, required, log, fit
     for clients in planned:
         prompts_of = [[prompts[(c + r) % len(prompts)] for r in range(per)] for c in range(clients)]
         # Two runs a level where the engine samples: greedy for the gate, sampled for the speed.
-        seconds = (clients * per * output / rate * (1 if unsampled else 2) if rate else None)
+        tokens = sum(outputs[p["id"]] for row in prompts_of for p in row)
+        seconds = (tokens / rate * (1 if unsampled else 2) if rate else None)
         if fits is not None and not fits(f"concurrency@{clients}", seconds):
             out["skipped"][str(clients)] = f"over budget: about {duration(seconds)}"
             break
-        asked = [[p["prompt_ids"] for p in row] for row in prompts_of]
-        found = engine.cohort(asked, output)
+        found = send_cohort(engine, [[p["request"] for p in row] for row in prompts_of])
         gate = summarize(found, clients, prompts_of, serial, strings, ceiling if terms else None, mean_context, judge)
         drawn = None
         if unsampled is None:
-            drawn = summarize(engine.cohort(asked, output, [[sampled_request(prepared["sampling"], seed_of[p["id"]])
-                                                             for p in row] for row in prompts_of]),
+            # The same requests, sampled: each prompt at its own seed (protocol requests.overrides.concurrency).
+            drawn = summarize(send_cohort(engine, [[case_request(p["entry"], "concurrency", protocol,
+                                                                 sampling=sampled_request(prepared["sampling"],
+                                                                                          seed_of[p["id"]]))
+                                                    for p in row] for row in prompts_of]),
                               clients, prompts_of, {}, strings, ceiling if terms else None, mean_context)
         level = sampled_level(gate, drawn, unsampled)
         out["levels"][str(clients)] = level

@@ -75,6 +75,17 @@ def open_engine(module, model, config, speculative, context_tokens=None, exact_p
     return opener(context) if written is None else written.open(opener, context, {**context, "exact_prompts": exact_prompts})
 
 
+def close_engine(engine):
+    """Close `engine`; its close's report in brief ({"returned": True, False or None where it was not judged, "judged",
+    "message"}) where the adapter's close() returns one (docs/ADAPTER.md: crit's Core measures whether the closed
+    engine returned the device memory its load took), else None."""
+    report = engine.close()
+    if not isinstance(report, dict) or "returned" not in report:
+        return None
+    return {"returned": report.get("returned"), "judged": report.get("judged"),
+            "message": str(report.get("message") or "")[:2000]}
+
+
 def file_sha256(path):
     digest = hashlib.sha256()
     with open(path, "rb") as handle:

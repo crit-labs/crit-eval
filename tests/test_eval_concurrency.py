@@ -2,6 +2,7 @@
 once, the levels it measures, its aggregate, peak, per-request and consistency figures, the concurrency gate, its
 budget, journal and status, and the batched ceiling."""
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import io
 import json
 from pathlib import Path
 import sys
@@ -13,7 +14,7 @@ from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 for _folder in ("", "tests"): sys.path.insert(0, str(ROOT / _folder))
-from crit_eval.run import adapters, chat, concurrency, runner  # noqa: E402
+from crit_eval.run import adapters, chat, concurrency, requests, runner  # noqa: E402
 from crit_eval.limits import batched, tiers  # noqa: E402
 from crit_eval.quality import prepare  # noqa: E402
 from crit_eval.reports import compare, status  # noqa: E402
@@ -89,6 +90,54 @@ class BatchingChat(BaseHTTPRequestHandler):
                 self.server.one.release()
 
 
+# The 2026-11-25 tool-call case as crit serve streamed it (tests/fixtures/tool_call_2026_11_25.json): a reply long
+# enough to finish its call came as delta tool_calls, one the output limit cut as text with the format's markers.
+RECORDED = json.loads((ROOT / "tests/fixtures/tool_call_2026_11_25.json").read_text(encoding="utf-8"))
+
+
+class ToolCallChat(BatchingChat):
+    """BatchingChat, but a request with tools replies as the recorded tool-call case did: its call finished (the
+    recorded speed reply, as content and delta tool_calls, finish_reason tool_calls) when max_tokens holds the whole
+    call, else the recorded cut reply's first max_tokens characters as text (finish_reason length)."""
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if not body.get("tools"):
+            self.rfile = io.BytesIO(json.dumps(body).encode())
+            self.headers.replace_header("Content-Length", str(len(json.dumps(body).encode())))
+            return BatchingChat.do_POST(self)
+        done, cut = RECORDED["finished"], RECORDED["cut"]
+        call = done["content"] + done["name"] + done["arguments"]
+        if body["max_tokens"] >= len(call):
+            arguments = done["arguments"]
+            deltas = ([{"content": done["content"]}, {"tool_calls": [{"index": 0, "function": {"name": done["name"]}}]}]
+                      + [{"tool_calls": [{"index": 0, "function": {"arguments": arguments[i:i + 50]}}]}
+                         for i in range(0, len(arguments), 50)])
+            finish, used = "tool_calls", len(call)
+        else:
+            text = cut["text"][:body["max_tokens"]]
+            deltas, finish, used = [{"content": text[i:i + 10]} for i in range(0, len(text), 10)], "length", len(text)
+        with self.server.lock:
+            self.server.active += 1
+            self.server.peak = max(self.server.peak, self.server.active)
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for delta in [{"content": ""}] + deltas:
+                event = {"choices": [{"index": 0, "delta": delta, "finish_reason": None}]}
+                self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+                self.wfile.flush()
+                time.sleep(self.server.step)
+            for event in ({"choices": [{"index": 0, "delta": {}, "finish_reason": finish}]},
+                          {"choices": [], "usage": {"prompt_tokens": 20, "completion_tokens": used}}):
+                self.wfile.write(b"data: " + json.dumps(event).encode() + b"\n\n")
+            self.wfile.write(b"data: [DONE]\n\n")
+        finally:
+            with self.server.lock:
+                self.server.active -= 1
+
+
 class ConcurrencyTests(unittest.TestCase):
     def setUp(self):
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), BatchingChat)
@@ -106,18 +155,24 @@ class ConcurrencyTests(unittest.TestCase):
         self.data = Path(tempfile.mkdtemp())
         write_data(self.data)
         self.protocol = json.loads(json.dumps(PROTOCOL))
-        self.protocol["concurrency"]["output_tokens"] = 24   # CI-sized levels
-        self.protocol["concurrency"]["requests_per_client"] = 2
+        self.protocol["concurrency"]["requests_per_client"] = 2   # CI-sized levels of the cases' 12-token requests
 
     def engine(self, context_tokens=4096):
         prepared = json.loads((self.data / "prepared.json").read_text())
         return adapters.open_engine(chat.Server(self.url, prepared), "unused-model", {}, True, context_tokens)
 
+    def speed_reply(self, case_id, tokens):
+        """A speed part's measured case: its reply and the request it replies to, the case's own."""
+        prepared = json.loads((self.data / "prepared.json").read_text())
+        case = next(c for c in prepared["speed"] if c["id"] == case_id)
+        return {"status": "measured", "tokens": tokens,
+                "request_sha256": requests.request_sha256(requests.case_request(case, "speed", self.protocol))}
+
     def measure(self, result=None, fits=None, inputs=None, required=4096):
         prepared = json.loads((self.data / "prepared.json").read_text())
         engine, info = self.engine()
         serial = result if result is not None else {"speed": {"cases": {
-            "chat": {"status": "measured", "tokens": prepare.token_ids(Text(), REPLY[:12])}}}}
+            "chat": self.speed_reply("chat", prepare.token_ids(Text(), REPLY[:12]))}}}
         return concurrency.run_concurrency(engine, info, prepared, self.protocol, serial, required, lambda m: None,
                                            fits, inputs)
 
@@ -130,7 +185,7 @@ class ConcurrencyTests(unittest.TestCase):
             level = found["levels"][str(clients)]
             self.assertTrue(level["qualified"], level["errors"])
             self.assertEqual((level["peak_concurrency"], level["requests"], level["completion_tokens"]),
-                             (clients, 2 * clients, 2 * clients * 24))
+                             (clients, 2 * clients, 2 * clients * 12))
             # The replies streamed at once: the server ran the requests together (one client runs beside nothing).
             self.assertEqual(level["ran_together"], True if clients > 1 else None)
             self.assertGreaterEqual(level["streaming_peak"], min(2, clients))
@@ -220,19 +275,62 @@ class ConcurrencyTests(unittest.TestCase):
         self.server.unstable = True
         self.assertEqual(self.gate(self.measure(result={}))["state"], "fail")
 
-    def test_a_served_case_with_tools_is_compared_with_its_own_reply_run_alone(self):
-        # A server streams a finished call as delta tool_calls and one the output limit cut as text with its markers,
-        # so the speed part's tool-call reply, decoded to another length, is no serial reply for a level's: the case
-        # runs alone at the level's length, and the gate compares like with like.
+    def test_a_speed_reply_to_another_request_is_never_the_serial_one(self):
+        # A stored speed reply whose request is not the level's (another length, or a result from before requests
+        # were recorded) is no serial reply: the case's request runs alone first, and the gate compares like with like.
         self.server.step = 0.004
-        other_shape = prepare.token_ids(Text(), REPLY[:12].upper())   # the speed reply's text, shaped otherwise
+        other = prepare.token_ids(Text(), REPLY[:12].upper())   # a reply to some other request
         found = self.measure(result={"speed": {"cases": {
-            "chat": {"status": "measured", "tokens": prepare.token_ids(Text(), REPLY[:12])},
-            "tool-call": {"status": "measured", "tokens": other_shape}}}})
+            "chat": self.speed_reply("chat", prepare.token_ids(Text(), REPLY[:12])),
+            "tool-call": {"status": "measured", "tokens": other, "request_sha256": "another request"}}}})
         self.assertEqual(found["serial_source"], "speed part and one-client runs")
         for level in found["levels"].values():
             cases = {c["case"] for c in level["consistency"]["differences"].values()}
             self.assertEqual(level["consistency"]["fraction"], 1.0, cases)
+        self.assertEqual(self.gate(found)["state"], "pass")
+        # The pool asks each case its own request: the speed cases' and the held-out prompt's 12 tokens.
+        self.assertEqual(found["output_tokens"], {"chat": 12, "tool-call": 12, "heldout/de": 12})
+
+    def test_the_2026_11_25_tool_call_case_is_compared_with_its_own_request(self):
+        # The recorded failure: the speed part asked the tool-call case 256 tokens and its call finished (streamed as
+        # delta tool_calls), every concurrency request asked 128 and its call was cut (streamed as text with the
+        # format's markers), so the gate compared token lists of two shapes, different from the second token on,
+        # at every level including one client's.
+        done, cut = RECORDED["finished"], RECORDED["cut"]
+        call = done["content"] + done["name"] + done["arguments"]
+        old = concurrency.same_reply(prepare.token_ids(Text(), cut["text"]), prepare.token_ids(Text(), call), None)
+        self.assertEqual(old, (False, len(done["content"])))
+        # A server shaped like crit serve, the case asked as before: its speed request long enough to finish the call
+        # (output 800 of a 748-character call, as 256 held its 233 tokens), a level's shorter (400, as 128).
+        server = ThreadingHTTPServer(("127.0.0.1", 0), ToolCallChat)
+        server.card, server.lock, server.active, server.peak = {"max_concurrent_requests": 4}, threading.Lock(), 0, 0
+        server.step, server.unstable, server.usage, server.serial, server.telemetry = 0.0005, False, {}, False, None
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        self.url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        prepared = json.loads((self.data / "prepared.json").read_text())
+        tool = next(c for c in prepared["speed"] if c["id"] == "tool-call")
+        tool["output_tokens"] = 800
+        (self.data / "prepared.json").write_text(json.dumps(prepared))
+        engine, info = self.engine()
+        speed_tokens, sample, _ = requests.send(engine, requests.case_request(tool, "speed", self.protocol))
+        self.assertEqual(sample["served"]["finish_reason"], "tool_calls")
+        self.assertEqual(speed_tokens, prepare.token_ids(Text(), call))   # the recorded speed reply, as Eval read it
+        before = engine.cohort([[tool["prompt_ids"]]], 400)["requests"][0]
+        self.assertEqual(before["finish_reason"], "length")
+        self.assertFalse(concurrency.same_reply(before["tokens"], speed_tokens, None)[0])   # the failure, again
+        # Now every level asks the case its own request, which the speed reply answers: one shape, and the gate passes.
+        found = concurrency.run_concurrency(engine, info, prepared, self.protocol, {"speed": {"cases": {
+            "chat": self.speed_reply("chat", prepare.token_ids(Text(), REPLY[:12])),
+            "tool-call": {**self.speed_reply("tool-call", speed_tokens)}}}}, 4096, lambda m: None)
+        self.assertEqual(found["serial_source"], "speed part")
+        self.assertEqual(found["output_tokens"]["tool-call"], 800)
+        for level in found["levels"].values():
+            consistency = level["consistency"]
+            self.assertEqual((consistency["fraction"], consistency["differences"]), (1.0, {}))
+        compared = sum(level["consistency"]["compared"] for level in found["levels"].values())
+        self.assertGreater(compared, 0)
         self.assertEqual(self.gate(found)["state"], "pass")
 
     def test_the_gate_does_not_pass_on_no_reply_compared(self):
@@ -294,9 +392,11 @@ class ConcurrencyTests(unittest.TestCase):
         self.assertIn("reports no max_concurrent_requests", self.measure()["reason"])
 
     def test_levels_stop_at_the_capacity_and_the_kv_their_requests_hold(self):
-        prompts = [{"id": "a", "prompt_ids": [1] * 100, "case": "a"}, {"id": "b", "prompt_ids": [1] * 120, "case": None}]
+        prompts = [{"id": "a", "prompt_ids": [1] * 100, "case": "a", "request": {"output_tokens": 44}},
+                   {"id": "b", "prompt_ids": [1] * 120, "case": None, "request": {"output_tokens": 24}}]
         rule = self.protocol["concurrency"]
-        # The longest request holds 120 + 24 tokens: 32 of them fit 8,192 tokens of KV, 16 fit 4,096.
+        # The longest request holds 120 + 24 tokens (the other 100 + 44): 32 of them fit 8,192 tokens of KV, 16 fit
+        # 4,096.
         self.assertEqual(concurrency.levels(self.protocol, 64, 8192, prompts), [1, 2, 4, 8, 16, 32])
         self.assertEqual(concurrency.levels(self.protocol, 64, 4096, prompts), [1, 2, 4, 8, 16])
         self.assertEqual(concurrency.levels(self.protocol, 3, 1 << 20, prompts), [1, 2])

@@ -379,10 +379,10 @@ def token_strings(model, count):
     return out
 
 
-def followup_prompts(model, followup, filler, prompt_tokens):
+def followup_prompts(model, followup, filler, prompt_tokens, output_tokens):
     """protocol followup: every turn's prompt, the conversation so far with the suite's fixed assistant replies and
     the turn's user message; the first user message holds the filler, cut so the first turn renders to about
-    prompt_tokens tokens."""
+    prompt_tokens tokens. Each turn holds its output_tokens, a part of its one request (protocol requests.cases)."""
     first = [{"role": "system", "content": followup["system"]},
              {"role": "user", "content": followup["turns"][0]["user"].replace("{document}", SENTINEL)}]
     head, tail = document_frame(model, first)
@@ -396,7 +396,8 @@ def followup_prompts(model, followup, filler, prompt_tokens):
         if number > 1:
             messages = messages + [{"role": "assistant", "content": turn["assistant"]},
                                    {"role": "user", "content": turn["user"]}]
-        prompts.append({"turn": number, "prompt_ids": prompt_ids(model, messages), "messages": api_messages(messages)})
+        prompts.append({"turn": number, "prompt_ids": prompt_ids(model, messages), "messages": api_messages(messages),
+                        "output_tokens": int(output_tokens)})
     return prompts
 
 
@@ -568,7 +569,8 @@ def prepare(model, data, speed_tokens=None, sampling=None, chat_template=None):
                                                                      protocol["heldout"]["output_tokens"])
     prepared["retrieval"] = retrieval_pieces(text, long, filler)
     followup = json.loads((SUITE_DIR / "followup.json").read_text(encoding="utf-8"))
-    prepared["followup"] = followup_prompts(text, followup, filler, protocol["followup"]["prompt_tokens"])
+    prepared["followup"] = followup_prompts(text, followup, filler, protocol["followup"]["prompt_tokens"],
+                                            protocol["followup"]["output_tokens"])
     Path(data).mkdir(parents=True, exist_ok=True)
     write_json(Path(data) / PREPARED, prepared)
     return prepared

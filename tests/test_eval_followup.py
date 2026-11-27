@@ -11,9 +11,10 @@ from crit_eval.run import chat, estimate, history, runner, stages, timing  # noq
 from crit_eval.reports import compare, status  # noqa: E402
 from test_eval import MEASURED, speed_part  # noqa: E402
 
-TURNS = [{"turn": 1, "prompt_ids": list(range(1, 101))},
-         {"turn": 2, "prompt_ids": list(range(1, 121))},
-         {"turn": 3, "prompt_ids": list(range(1, 141))}]
+# Each turn with its output tokens, a part of its one request (protocol requests.cases).
+TURNS = [{"turn": 1, "prompt_ids": list(range(1, 101)), "output_tokens": 64},
+         {"turn": 2, "prompt_ids": list(range(1, 121)), "output_tokens": 64},
+         {"turn": 3, "prompt_ids": list(range(1, 141)), "output_tokens": 64}]
 
 # A model and a device whose floors are easy to count: 10 GB of weights read at 1,000 GB/s are 10 ms, a token's
 # matmuls 2 GFLOP at 100 TFLOPS are 0.02 ms, a query-key pair 1 kFLOP, and a token's KV 100 kB.

@@ -241,6 +241,13 @@ def budget_spread(reference_rows, engine_rows, thresholds, block=64, draws=200, 
     positions, each the set's length in blocks of `block` consecutive positions drawn with replacement from a seeded
     generator, so neighbouring positions (which drift together) stay together. Returns the 5th, 50th and 95th
     percentiles of the budget used and of the KLD p99, with the method; None for fewer than two blocks."""
+    samples = bootstrap_samples(reference_rows, engine_rows, block, draws, seed)
+    return None if samples is None else spread_of(samples, thresholds, block)
+
+
+def bootstrap_samples(reference_rows, engine_rows, block=64, draws=200, seed=0):
+    """budget_spread's resamples: per draw [kld_mean, kld_p99, ppl_ratio] of the resampled positions, which judge
+    against any limits (spread_of); None for fewer than two blocks."""
     import random
     n = len(engine_rows)
     blocks = -(-n // block)
@@ -249,17 +256,24 @@ def budget_spread(reference_rows, engine_rows, thresholds, block=64, draws=200, 
     kls = [partial_kl(r["top_ids"], r["top_logprobs"], dict(e["top"])) for r, e in zip(reference_rows, engine_rows)]
     drift = [r["logprob"] - e["logprob"] for r, e in zip(reference_rows, engine_rows)]   # engine NLL - reference NLL
     rng = random.Random(seed)
-    used, p99s = [], []
+    samples = []
     for _ in range(draws):
         picked = [i for b in (rng.randrange(blocks) for _ in range(blocks)) for i in range(b * block, min(n, (b + 1) * block))][:n]
         sample = [kls[i] for i in picked]
-        row = {"kld_mean": sum(sample) / len(sample), "kld_p99": percentile(sample, 0.99),
-               "ppl_ratio": math.exp(sum(drift[i] for i in picked) / len(picked))}
-        used.append(budget_used(row, thresholds))
-        p99s.append(row["kld_p99"])
+        samples.append([sum(sample) / len(sample), percentile(sample, 0.99),
+                        math.exp(sum(drift[i] for i in picked) / len(picked))])
+    return samples
+
+
+def spread_of(samples, thresholds, block=64):
+    """budget_spread of bootstrap_samples against `thresholds`."""
+    used, p99s = [], []
+    for kld_mean, kld_p99, ppl_ratio in samples:
+        used.append(budget_used({"kld_mean": kld_mean, "kld_p99": kld_p99, "ppl_ratio": ppl_ratio}, thresholds))
+        p99s.append(kld_p99)
     return {"budget_used": {"p05": percentile(used, 0.05), "p50": percentile(used, 0.5), "p95": percentile(used, 0.95)},
             "kld_p99": {"p05": percentile(p99s, 0.05), "p95": percentile(p99s, 0.95)},
-            "method": f"block bootstrap: {draws} resamples of {block}-position blocks"}
+            "method": f"block bootstrap: {len(samples)} resamples of {block}-position blocks"}
 
 
 def log2_bucket(value, smallest):

@@ -117,30 +117,39 @@ class PackageTests(unittest.TestCase):
                     packages.fetch("checkpoint", root / "run", root / "packages")
 
     def test_the_scores_carry_their_spread_and_allowance(self):
-        # The reference's own spread and the allowance (scored with the activations the checkpoint declares) travel
-        # with the scores they were measured against; ones of other scores (an earlier reference, say) stay behind.
+        # The reference's own spread, the allowance (scored with the activations the checkpoint declares), the 16-bit
+        # baseline and the canaries travel with the scores they were measured against; ones of other scores (an
+        # earlier reference, say) stay behind.
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             data = scored(root / "data")
             identity = {"reference": REFERENCE, "model_sha256": MODEL, "top_k": 2}
             spread = {"long-1/prompt": {"kld_mean": 0.03, "kld_p99": 0.7, "ppl_ratio": 1.01}}
             allowance = {"activations": ["nvfp4"], "sets": spread}
+            baseline = {"dtype": "bfloat16", "sets": {"long-1/prompt": {**spread["long-1/prompt"], "bootstrap": None}}}
+            canaries = {"canaries": {"skip_layer": {"status": "measured", "sets": spread}}}
+            extras = {f"{fixed.STORE}/{name}" for name in (fixed.SPREAD, fixed.ALLOWANCE, fixed.BASELINE, fixed.CANARIES)}
             first, second, third = self.identities()
             with first, second, third:
                 entry = packages.pack(data, root / "packages")
                 self.assertNotIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])   # none stored
                 fixed.write_spread(data, {**identity, "reference": REFERENCE - 1, "spread_perturbation": "tf32"}, spread)
                 fixed.write_allowance(data, {**identity, "reference": REFERENCE - 1}, allowance)
+                fixed.write_beside(data, fixed.BASELINE, {**identity, "reference": REFERENCE - 1}, baseline)
+                fixed.write_beside(data, fixed.CANARIES, {**identity, "reference": REFERENCE - 1}, canaries)
                 entry = packages.pack(data, root / "packages")
-                self.assertFalse({f"{fixed.STORE}/{fixed.SPREAD}", f"{fixed.STORE}/{fixed.ALLOWANCE}"} & set(entry["files"]))
+                self.assertFalse(extras & set(entry["files"]))
                 fixed.write_spread(data, {**identity, "spread_perturbation": "tf32", "spread_texts": ["text"]}, spread)
                 fixed.write_allowance(data, {**identity, "allowance": "declared_activations"}, allowance)
+                fixed.write_beside(data, fixed.BASELINE, {**identity, "baseline": "bfloat16"}, baseline)
+                fixed.write_beside(data, fixed.CANARIES, {**identity, "canaries": ["skip_layer"]}, canaries)
                 entry = packages.pack(data, root / "packages")
-                self.assertIn(f"{fixed.STORE}/{fixed.SPREAD}", entry["files"])
-                self.assertIn(f"{fixed.STORE}/{fixed.ALLOWANCE}", entry["files"])
+                self.assertLessEqual(extras, set(entry["files"]))
                 packages.fetch("checkpoint", root / "run", root / "packages", log=lambda m: None)
             self.assertEqual(fixed.load_spread(root / "run", {"reference": REFERENCE}), spread)
             self.assertEqual(fixed.load_allowance(root / "run", identity), allowance)
+            self.assertEqual(fixed.load_beside(root / "run", fixed.BASELINE, identity), baseline)
+            self.assertEqual(fixed.load_beside(root / "run", fixed.CANARIES, identity), canaries)
 
     def test_scores_of_another_reference_are_not_packed(self):
         with tempfile.TemporaryDirectory() as directory:

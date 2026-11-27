@@ -20,13 +20,9 @@ STORE = "reference"
 # same scores, the checkpoint's stored weights decoded exactly with FP32 activations. speed: a
 # budget eight times preserve's (quality.mode_thresholds), near-tie output differences allowed (forks); preserve: a
 # budget that keeps the output close to the checkpoint's. The modes are crit Core's (crit_plugins.exactness), which every
-# engine and run states; a crit-core from before Core held them gives the same two here.
-try:
-    from crit_plugins.exactness import QUALITY_MODES
-except ImportError:
-    QUALITY_MODES = ("preserve", "speed")
-# The mode a run judges in when it names none.
-DEFAULT_QUALITY_MODE = "speed"
+# engine and run states.
+# The mode a run judges in when it names none: Core's too.
+from crit_plugins.exactness import DEFAULT_QUALITY_MODE, QUALITY_MODES   # noqa: E402 - Core's, in every crit-core it takes
 
 
 def mode_of(requirements):
@@ -47,6 +43,14 @@ ALLOWANCE = "allowance.json"
 # perturbation (TF32 matmuls) disagrees with the stored scores, per set and path, with the identity it was computed
 # under.
 SPREAD = "spread.json"
+# The checkpoint's 16-bit baseline (protocol quality.baseline, crit_eval.quality.reference.store_baseline): how far the
+# texts scored in its own 16-bit dtype land from the stored scores, per set and path with its bootstrap resamples, which
+# every run reports against its own limits (reported, not judged).
+BASELINE = "baseline.json"
+# The canaries (protocol quality.canaries, crit_eval.quality.reference.store_canaries): how far each deliberately
+# broken forward lands from the stored scores, per set and path, which every run judges against its own limits to
+# report whether they would pass (reported, not judged).
+CANARIES = "canaries.json"
 DTYPES = {"F64": "d", "F32": "f", "I64": "q", "I32": "i"}
 
 
@@ -123,42 +127,20 @@ def write(data, identity_value, scores, store=STORE):
     return size
 
 
-def write_spread(data, identity_value, sets, store=STORE):
-    """Store the reference's spread ({"SET/path": text_quality row}) under prepared data folder `data`."""
+def write_beside(data, name, identity_value, body, store=STORE):
+    """Store `body` (a dict) with the identity it was measured under as file `name` beside the reference scores of
+    prepared data folder `data` (spread, allowance, baseline, canaries), written whole or not at all."""
     folder = Path(data) / store
     folder.mkdir(parents=True, exist_ok=True)
-    temporary = folder / (SPREAD + ".tmp")
-    temporary.write_text(json.dumps({"identity": identity_value, "sets": sets}, indent=1), encoding="utf-8")
-    temporary.replace(folder / SPREAD)
+    temporary = folder / (name + ".tmp")
+    temporary.write_text(json.dumps({"identity": identity_value, **body}, indent=1), encoding="utf-8")
+    temporary.replace(folder / name)
 
 
-def load_spread(data, expected, store=STORE):
-    """The reference's spread stored under `data` whose identity holds every key of `expected`: {"SET/path": row};
-    None when none is stored or it is another identity's."""
-    path = Path(data) / store / SPREAD
-    if not path.is_file():
-        return None
-    stored = json.loads(path.read_text(encoding="utf-8"))
-    found = stored.get("identity") or {}
-    if any(found.get(key) != value for key, value in expected.items()):
-        return None
-    return stored["sets"]
-
-
-def write_allowance(data, identity_value, allowance):
-    """Store the allowance ({"activations", "sets": {"SET/path": text_quality row}, ...}: what the checkpoint's declared
-    activation quantization costs, reported only) beside the reference scores of prepared data folder `data`."""
-    folder = Path(data) / STORE
-    folder.mkdir(parents=True, exist_ok=True)
-    temporary = folder / (ALLOWANCE + ".tmp")
-    temporary.write_text(json.dumps({"identity": identity_value, **allowance}, indent=1), encoding="utf-8")
-    temporary.replace(folder / ALLOWANCE)
-
-
-def load_allowance(data, expected):
-    """The allowance stored under `data` whose identity holds every key of `expected` ({"activations", "sets", ...},
-    without the identity); None when none is stored or it is another identity's."""
-    path = Path(data) / STORE / ALLOWANCE
+def load_beside(data, name, expected, store=STORE):
+    """The body of file `name` beside the reference scores of `data` (write_beside) whose identity holds every key of
+    `expected`, without the identity; None when none is stored or it is another identity's."""
+    path = Path(data) / store / name
     if not path.is_file():
         return None
     stored = json.loads(path.read_text(encoding="utf-8"))
@@ -166,6 +148,30 @@ def load_allowance(data, expected):
     if any(found.get(key) != value for key, value in expected.items()):
         return None
     return stored
+
+
+def write_spread(data, identity_value, sets, store=STORE):
+    """Store the reference's spread ({"SET/path": text_quality row}) under prepared data folder `data`."""
+    write_beside(data, SPREAD, identity_value, {"sets": sets}, store)
+
+
+def load_spread(data, expected, store=STORE):
+    """The reference's spread stored under `data` whose identity holds every key of `expected`: {"SET/path": row};
+    None when none is stored or it is another identity's."""
+    stored = load_beside(data, SPREAD, expected, store)
+    return None if stored is None else stored["sets"]
+
+
+def write_allowance(data, identity_value, allowance):
+    """Store the allowance ({"activations", "sets": {"SET/path": text_quality row}, ...}: what the checkpoint's declared
+    activation quantization costs) beside the reference scores of prepared data folder `data`."""
+    write_beside(data, ALLOWANCE, identity_value, allowance)
+
+
+def load_allowance(data, expected):
+    """The allowance stored under `data` whose identity holds every key of `expected` ({"activations", "sets", ...},
+    without the identity); None when none is stored or it is another identity's."""
+    return load_beside(data, ALLOWANCE, expected)
 
 
 def load(data, expected, store=STORE):

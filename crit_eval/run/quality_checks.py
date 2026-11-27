@@ -94,6 +94,24 @@ def set_limits(thresholds, spread, factor, keys=QUALITY_KEYS):
     return limits, raised
 
 
+def quality_spec(thresholds, budget, mode, allowance=None):
+    """The quality terms a run judges an engine by, as values of crit's EngineSpec (crit_core.spec: {value, source}):
+    quality_limits (the limits it judges by: the run's own budget's, source user, beside the mode's, source mode) and
+    quality_allowance (the checkpoint's stored allowance in a mode that reads it: source measured, its factor and the
+    limits it may raise per set; or why it is missing). Eval's result records them beside the engine's own values."""
+    given = set(budget or {})
+    found = {"quality_limits": {"value": dict(thresholds or {}), "source": "user" if given else "mode",
+                                **({"note": f"the run's budget sets {', '.join(sorted(given))}, quality mode {mode} "
+                                            "the rest"} if given else {"note": f"quality mode {mode}"})}}
+    if allowance is not None:
+        found["quality_allowance"] = {"value": {key: allowance[key] for key in ("factor", "keys", "sets", "missing")
+                                                if key in allowance},
+                                      "source": "measured",
+                                      "note": "the checkpoint's own declared format, scored by crit eval reference "
+                                              "(protocol quality.allowance)"}
+    return found
+
+
 def stored_allowance(data, protocol, reference_identity, model=None, budget=None, *, mode):
     """protocol quality.allowance, for a run in quality mode `mode`: in a mode the rule names (speed), the
     checkpoint's allowance stored under `data` (fixed.load_allowance: what its own declared activation format costs
@@ -120,6 +138,131 @@ def stored_allowance(data, protocol, reference_identity, model=None, budget=None
         return None
     return {"missing": "the checkpoint declares quantized activations but the data holds no allowance for them "
                        "(crit eval reference measures it): judged against the mode's limits alone", "sets": {}}
+
+
+def stored_qualification(data, protocol, reference_identity, store=fixed.STORE):
+    """What qualifies the yardstick for this model, as stored under `data` for the stored scores: {"baseline": the
+    16-bit baseline (fixed.BASELINE, protocol quality.baseline) for the bootstrap the protocol draws now, "canaries":
+    the canaries (fixed.CANARIES, protocol quality.canaries)}, each None where the data holds none."""
+    noise = protocol["quality"].get("position_spread") or {}
+    bootstrap = {key: int(noise.get(key, default)) for key, default in (("block", 64), ("draws", 200), ("seed", 0))}
+    baseline = fixed.load_beside(data, fixed.BASELINE, {**reference_identity, "bootstrap": bootstrap}, store)
+    return {"baseline": baseline and {**baseline, "block": bootstrap["block"]},
+            "canaries": fixed.load_beside(data, fixed.CANARIES, reference_identity, store)}
+
+
+BASELINE_MISSING = ("the data holds no 16-bit baseline (scored before crit-eval-v0.9.0, or with --no-baseline): crit "
+                    "eval reference measures it")
+
+
+def baseline_row(row, limits, baseline):
+    """The 16-bit baseline's row of one set and path against `limits` (protocol quality.baseline): its metrics, the
+    budget it uses of them, its budget_spread from its bootstrap, and reach (unreachable where it exceeds a limit,
+    near where its bootstrap p95 does, else within)."""
+    spread = (metrics.spread_of(row["bootstrap"], limits, int(baseline.get("block", 64)))
+              if row.get("bootstrap") else None)
+    state = ("unreachable" if metrics.judge(row, limits) else
+             "near" if spread and spread["budget_used"]["p95"] > 1.0 else "within")
+    return {**{key: row[key] for key in ("kld_mean", "kld_p99", "ppl_ratio", "top1_agreement")},
+            "budget_used": metrics.budget_used(row, limits), **({"budget_spread": spread} if spread else {}),
+            "reach": state}
+
+
+def baseline_budgets(sets, qualification):
+    """{status: measured, dtype, budget_used: {set path: the budget the 16-bit baseline uses of that set's limits}}
+    for the scored `sets` (run_quality's), or {status, reason} where the data holds no baseline (qualify's reasons).
+    Reported, never judged."""
+    baseline = (qualification or {}).get("baseline")
+    if baseline is None:
+        return {"status": "missing", "reason": BASELINE_MISSING}
+    if not baseline.get("sets"):
+        return {"status": "unsupported" if baseline.get("unsupported") else "none",
+                "reason": baseline.get("unsupported") or baseline.get("reason")}
+    return {"status": "measured", "dtype": baseline.get("dtype"),
+            "budget_used": {name: baseline_row(baseline["sets"][name], s["limits"], baseline)["budget_used"]
+                            for name, s in sets.items() if name in baseline["sets"]}}
+
+
+def qualify(quality, qualification):
+    """protocol quality.baseline and quality.canaries, reported, never judged: the scored quality part `quality`
+    (run_quality) gets, per set and path, the 16-bit baseline's drift beside the engine's (baseline: its row, the
+    budget it uses of the limits that set is judged by and its budget_spread against them, and reach: unreachable
+    where it exceeds a limit, near where its bootstrap p95 does, else within), quality.baseline (measured with the
+    sets unreachable and near, or missing, none or unsupported with the reason), and quality.canaries: each stored
+    canary judged against the same limits, passed where every set it shares with the run stays within them (the
+    limits too loose to tell that breakage from a working engine). No verdict changes. Returns `quality`."""
+    if (quality or {}).get("status") != "scored":
+        return quality
+    qualification = qualification or {}
+    sets, baseline = quality["sets"], qualification.get("baseline")
+    if baseline is None:
+        quality["baseline"] = {"status": "missing", "reason": BASELINE_MISSING}
+    elif not baseline.get("sets"):
+        quality["baseline"] = {"status": "unsupported" if baseline.get("unsupported") else "none",
+                               "reason": baseline.get("unsupported") or baseline.get("reason")}
+    else:
+        reach = {"unreachable": [], "near": []}
+        for name, s in sets.items():
+            row = baseline["sets"].get(name)
+            if row is None:
+                continue
+            s["baseline"] = baseline_row(row, s["limits"], baseline)
+            state = s["baseline"]["reach"]
+            if state in reach:
+                reach[state].append(name)
+        quality["baseline"] = {"status": "measured", "dtype": baseline["dtype"], **reach}
+    canaries = qualification.get("canaries")
+    if canaries is None:
+        quality["canaries"] = {"status": "unmeasured", "reason": "crit eval reference --canaries measures them"}
+        return quality
+    found = {}
+    for name, canary in canaries["canaries"].items():
+        shared = {set_name: row for set_name, row in canary.get("sets", {}).items() if set_name in sets}
+        if canary.get("status") != "measured" or not shared:
+            found[name] = {"status": canary.get("status") if canary.get("status") != "measured" else "no shared set",
+                           "passed": None, **({"reason": canary["reason"]} if canary.get("reason") else {})}
+            continue
+        used = {set_name: metrics.budget_used(row, sets[set_name]["limits"]) for set_name, row in shared.items()}
+        passing = sorted(set_name for set_name, row in shared.items() if not metrics.judge(row, sets[set_name]["limits"]))
+        found[name] = {"status": "measured", "passed": len(passing) == len(shared), "passing_sets": passing,
+                       "budget_used": max(used.values())}
+    quality["canaries"] = {"status": "measured", "canaries": found,
+                           "passing": [name for name, canary in found.items() if canary["passed"]]}
+    return quality
+
+
+def qualification_lines(quality):
+    """What qualify reported, as lines for the status and the run's log: where a 16-bit engine of this model already
+    uses most of a limit (or the baseline's worst set when none does, or why there is none), and which canaries the
+    limits pass. Empty for a part qualify did not report on."""
+    lines, baseline = [], (quality or {}).get("baseline") or {}
+    sets = (quality or {}).get("sets") or {}
+    if baseline.get("status") == "measured":
+        where = [f"{name} unreachable at 16 bits (the baseline uses {sets[name]['baseline']['budget_used']:.0%} of "
+                 f"its limits)" for name in baseline["unreachable"]]
+        where += [f"{name} near the limit (the baseline's bootstrap p95 uses "
+                  f"{sets[name]['baseline']['budget_spread']['budget_used']['p95']:.0%})" for name in baseline["near"]]
+        used = {name: s["baseline"]["budget_used"] for name, s in sets.items()
+                if (s.get("baseline") or {}).get("budget_used") is not None}
+        worst = max(used, key=used.get) if used else None
+        lines.append(f"a {baseline['dtype']} engine of this model: " + "; ".join(where) if where else
+                     f"the {baseline['dtype']} baseline uses at most {used[worst]:.0%} of a limit ({worst})" if worst
+                     else f"the {baseline['dtype']} baseline shares no set with this run")
+    elif baseline:
+        lines.append(f"no 16-bit baseline: {baseline['reason']}")
+    canaries = (quality or {}).get("canaries") or {}
+    if canaries.get("status") == "measured":
+        judged = {name: c for name, c in canaries["canaries"].items() if c["passed"] is not None}
+        if canaries["passing"]:
+            lines.append("canaries the limits pass, so the limits are too loose to tell them from a working engine of "
+                         "this model: " + ", ".join(canaries["passing"]))
+        failing = [f"{name} {c['budget_used']:.0%}" for name, c in judged.items() if not c["passed"]]
+        if failing:
+            lines.append("canaries the limits catch (the largest budget each uses): " + ", ".join(failing))
+        unjudged = [f"{name} ({c['status']})" for name, c in canaries["canaries"].items() if c["passed"] is None]
+        if unjudged:
+            lines.append("canaries not judged: " + ", ".join(unjudged))
+    return lines
 
 
 def run_quality(engine, info, prepared, protocol, log, reference, thresholds, spread=None, *, mode, honesty=True,
@@ -257,13 +400,14 @@ def run_quality(engine, info, prepared, protocol, log, reference, thresholds, sp
 
 
 def run_attribution(module, model, config, prepared, protocol, log, reference, thresholds, spread, quality, variants,
-                    context_tokens=None, *, mode, allowance=None):
+                    context_tokens=None, *, mode, allowance=None, qualification=None):
     """protocol quality.attribution: the quality texts scored again on an engine opened with each of the adapter's
     exact_variants ({name: config overrides that switch one matrix group or arithmetic choice back to exact}, or
     {name: {"config": overrides, "description": text}}), one engine at a time; per variant and set, the budget it
     uses and the share of the full engine's that the variant's exactness takes away. Shares need not add up: the
     terms interact. mode and allowance: the run's quality mode and allowance, judged as the run judges it
-    (run_quality)."""
+    (run_quality). qualification (stored_qualification): the 16-bit baseline's budget per set rides beside the full
+    engine's (baseline: baseline_budgets), reported, never judged: no variant takes away what 16 bits already spend."""
     rule = protocol["quality"].get("attribution") or {}
     if quality.get("status") != "scored":
         return {"status": "unmeasured", "reason": "quality was not scored"}
@@ -271,7 +415,9 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
         return {"status": "unmeasured", "reason": "the adapter declares no exact_variants (info): configuration "
                                                    "overrides that switch one matrix group or arithmetic choice back to exact"}
     base = {name: s["budget_used"] for name, s in quality["sets"].items()}
-    out = {"status": "measured", "base": base, "variants": {}}
+    out = {"status": "measured", "base": base, "baseline": baseline_budgets(quality["sets"], qualification),
+           "variants": {}}
+    sixteen = out["baseline"].get("budget_used") or {}
     for name, value in variants.items():
         overrides = value.get("config", value) if isinstance(value, dict) else {}
         described = value.get("description") if isinstance(value, dict) and "config" in value else None
@@ -289,8 +435,11 @@ def run_attribution(module, model, config, prepared, protocol, log, reference, t
                                  "share": shares, "status": scored.get("status"),
                                  **({"stopped_early": scored["stopped_early"]} if scored.get("stopped_early") else {})}
         worst = max(base, key=lambda s: -1 if base[s] is None else base[s])
+        at = sixteen.get(worst)
         log(f"attribution {name}: {worst} uses {sets.get(worst, float('nan')):.1%} of the budget with it exact "
-            f"(full engine {base[worst]:.1%})")
+            f"(full engine {base[worst]:.1%}"
+            + (f", 16-bit baseline {at:.1%})" if at is not None else
+               f", no 16-bit baseline: {out['baseline'].get('reason')})"))
     out["rule"] = rule.get("rule")
     return out
 
@@ -310,12 +459,8 @@ def clearly_failed(set_name, sets, thresholds, rule):
     return None
 
 
-# An engine's row exactness, from the least exact, and its phases: crit Core's levels (crit_plugins.exactness); a
-# crit-core from before Core held them gives the same levels here.
-try:
-    from crit_plugins.exactness import LEVELS as EXACTNESS_LEVELS, PHASES
-except ImportError:
-    EXACTNESS_LEVELS, PHASES = ("repeatable", "row-exact", "exact", "declared"), ("decode", "prompt")
+# An engine's row exactness, from the least exact, and its phases: crit Core's levels (crit_plugins.exactness).
+from crit_plugins.exactness import LEVELS as EXACTNESS_LEVELS, PHASES   # noqa: E402 - Core's
 
 
 def asked_exactness(info):

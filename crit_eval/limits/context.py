@@ -37,17 +37,9 @@ SIXTEEN = ("BF16", "F16")   # the stored dtypes of 16-bit matrices (safetensors 
 
 
 def _kv_fit(free_bytes, kv_bytes_per_token, *, headroom, reserve, held, granularity):
-    """The KV cache that fits the device: crit Core's arithmetic (crit_plugins.memory.kv_fit), which the engine it
-    loads is sized by too; a crit-core from before Core held it computes the same here."""
-    try:
-        from crit_plugins.memory import kv_fit
-    except ImportError:
-        budget = free_bytes - headroom - reserve
-        for amount in held:
-            budget -= amount
-        if not kv_bytes_per_token:
-            return {"budget": budget, "tokens": None}
-        return {"budget": budget, "tokens": 0 if budget <= 0 else budget // kv_bytes_per_token // granularity * granularity}
+    """The KV cache that fits the device: crit Core's arithmetic (crit_plugins.memory.kv_fit, in every crit-core
+    this crit-eval takes), which the engine it loads is sized by too."""
+    from crit_plugins.memory import kv_fit
     return kv_fit(free_bytes, kv_bytes_per_token, headroom=headroom, reserve=reserve, held=held,
                   granularity=granularity)
 
@@ -170,13 +162,34 @@ def companion_drafter_bytes(drafter, model):
     return {"weight_bytes": int(weights), "pass_bytes": int(weights + head)}
 
 
-def max_context(model, device, vram_headroom_bytes, settings, requested=None, drafters=()):
+def spec_prices(spec):
+    """The prices Eval sizes an engine by from crit's EngineSpec (crit_core.spec, a spec's values or their plain
+    {name: value}): kv_elements_per_token (the selection's KV pools a token, which Eval prices at its protocol's
+    precision), kv_ring_bytes (the device bytes of its sliding windows' rings, a sequence each, which do not grow with
+    the context), held_matrix_bytes and stored_matrix_bytes (the projections slot's held and stored bytes of the
+    checkpoint's 16-bit target matrices). {} without a spec; a value the spec lacks is left out."""
+    if not spec:
+        return {}
+    values = spec.get("values", spec)
+    found = {}
+    for name in ("kv_elements_per_token", "kv_ring_bytes", "held_matrix_bytes", "stored_matrix_bytes"):
+        item = values.get(name)
+        item = item.get("value") if isinstance(item, dict) else item
+        if isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            found[name] = item
+    return found
+
+
+def max_context(model, device, vram_headroom_bytes, settings, requested=None, drafters=(), spec=None):
     """The required context of an engine for MODEL on DEVICE (a `crit eval probe` result) with the facts
     behind it. `tokens` is None when an input is missing (`missing`) or the weights read on every pass do
     not fit (`reason`). settings: protocol.json's `context` section. requested: the user's wanted context; the
     model's positions and the device's memory may cap it (`bound`, and `note` says by how much). drafters: companion
     drafter folders the engine may load beside the model; their stored weights (companion_drafter_bytes) are kept
-    out of the KV cache, so a candidate that speculates with one still fits the required context."""
+    out of the KV cache, so a candidate that speculates with one still fits the required context. spec: crit's
+    EngineSpec of the engine (spec_prices): its KV pools' elements a token replace the config's count, its sliding
+    windows' rings (kv_ring_bytes) the config's one window in the fixed state, and its projections' held bytes of the 16-bit target matrices replace their stored bytes in the resident weights; the
+    protocol's KV precision, reserve and the required context stay Eval's (`basis.sized_by` says which were read)."""
     from .devices import pooled
     # Several GPUs (crit eval probe --devices): their memory together, each keeping its headroom and reserve.
     device = pooled(device, vram_headroom_bytes, int(float(settings["reserve_gib"]) * GIB))
@@ -184,7 +197,8 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
     limit, source = config.position_limit()
     element = float(settings["kv_bytes_per_element"])
     granularity = int(settings.get("granularity", 1))
-    elements = config.kv_elements_per_token()
+    prices = spec_prices(spec)
+    elements = prices.get("kv_elements_per_token") or config.kv_elements_per_token()
     kv = int(round(elements * element)) if elements else None
     out = {"tokens": None, "bound": None, "requested": int(requested) if requested else None, "note": None,
            "model_limit": limit, "model_limit_source": source, "device_limit": None,
@@ -212,7 +226,14 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
             companions.append({"path": str(path), **found})
     if out["missing"]:
         return out
-    fixed = config.fixed_state_bytes(element)
+    if "held_matrix_bytes" in prices and "stored_matrix_bytes" in prices:
+        # the engine holds its 16-bit target matrices as its projections slot prices them (FP8 in speed), not as stored
+        split = {**split, "resident": max(0, split["resident"] - prices["stored_matrix_bytes"]
+                                          + prices["held_matrix_bytes"])}
+    # the state that does not grow with the context; the engine's own sliding-window rings where its spec prices them
+    # (one ring a sequence it runs at once, whole pages), in place of the config's one window
+    fixed = (config.fixed_state_bytes(element, sliding=False) + prices["kv_ring_bytes"] if "kv_ring_bytes" in prices
+             else config.fixed_state_bytes(element))
     reserve = int(float(settings["reserve_gib"]) * GIB)
     drafter_bytes = sum(row["weight_bytes"] for row in companions)
     fit = _kv_fit(free, kv, headroom=int(vram_headroom_bytes), reserve=reserve,
@@ -223,7 +244,8 @@ def max_context(model, device, vram_headroom_bytes, settings, requested=None, dr
                     "vram_headroom_bytes": int(vram_headroom_bytes), "reserve_bytes": reserve,
                     "resident_weight_bytes": split["resident"], "draft_weight_bytes": split["draft"],
                     "expert_bytes": split["experts"], "embedding_bytes": split["embedding"],
-                    "fixed_state_bytes": fixed, "kv_cache_bytes_available": max(0, budget)}
+                    "fixed_state_bytes": fixed, "kv_cache_bytes_available": max(0, budget),
+                    "sized_by": sorted(prices) or None}
     if companions:
         out["basis"] |= {"companion_drafter_bytes": drafter_bytes, "companion_drafters": companions}
     if budget <= 0:
@@ -271,7 +293,7 @@ def link_gbs(device):
 
 
 def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, tokens, drafters=(), held_bytes=None,
-              kv_bytes_per_token=None):
+              kv_bytes_per_token=None, spec=None):
     """The placement scenario of MODEL on DEVICE (a `crit eval probe` result) at `tokens` of required context: which of
     SCENARIOS applies, the bytes each memory tier holds, where the lookup tables go, and the bound one plain decode
     pass (one token, no speculation, routing spread evenly over the experts so a device cache holds its share of them)
@@ -284,8 +306,9 @@ def placement(model, device, vram_headroom_bytes, ram_headroom_bytes, settings, 
     at the requirement holds, measured (free memory before its load less after it); with it the resident weights off
     the device are those that footprint cannot hold beside its KV cache at the requirement (kv_bytes_per_token, the
     engine's, else the protocol precision's), not those the planning margins (headroom and reserve) leave no room
-    for. None when Eval cannot size the model (max_context's `missing`)."""
-    value = max_context(model, device, vram_headroom_bytes, settings, tokens, drafters)
+    for. spec: crit's EngineSpec of the engine, as max_context reads it. None when Eval cannot size the model
+    (max_context's `missing`)."""
+    value = max_context(model, device, vram_headroom_bytes, settings, tokens, drafters, spec)
     basis = value.get("basis")
     if not basis:
         return None

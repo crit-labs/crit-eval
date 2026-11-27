@@ -8,7 +8,7 @@ import sys
 PARTS = ("speed", "quality", "exactness", "context", "heldout", "history", "followup", "concurrency")
 # The quality modes and the default, defined once (crit_eval.quality.fixed imports nothing outside the standard library).
 from .quality.fixed import DEFAULT_QUALITY_MODE, QUALITY_MODES  # noqa: E402
-from . import VRAM_HEADROOM_GIB  # noqa: E402
+from . import RAM_HEADROOM_GIB, VRAM_HEADROOM_GIB  # noqa: E402
 QUALITY_MODE_HELP = ("how much output drift from the checkpoint the engine may trade for speed, whatever format the "
                      "checkpoint is stored in; both modes judge against the same reference (its stored weights, exact "
                      f"activations). {DEFAULT_QUALITY_MODE} (the default): a budget eight times "
@@ -209,6 +209,9 @@ def main(argv=None):
     context.add_argument("--drafter", action="append", default=[], metavar="DIR",
                          help="A companion drafter the engine may load beside the model; its stored weights are kept "
                               "out of the KV cache (repeatable)")
+    context.add_argument("--spec", metavar="JSON", default=None,
+                         help="crit's EngineSpec of the engine (crit plugins resolve --spec --json): its KV pools' "
+                              "elements a token and its held matrix bytes size the context and the placement")
     context.add_argument("--json", action="store_true", help="Print the computation as JSON")
 
     probe = subs.add_parser("probe", help="Measure device bandwidth and GEMM rates per weight format (needs nvcc, "
@@ -253,6 +256,16 @@ def main(argv=None):
                                 "quantized as declared and store how far that lands from the scores (allowance.json): "
                                 "what the format itself costs, which speed mode's limits are raised to twice of; a "
                                 "second scoring pass, on by default (--no-allowance skips it)")
+    reference.add_argument("--baseline", action=argparse.BooleanOptionalAction, default=True,
+                           help="Also score the texts in the checkpoint's own 16-bit dtype (its config's bfloat16 or "
+                                "float16) and store how far that lands from the scores (baseline.json): how much of "
+                                "each limit a plain 16-bit engine of this model already uses, reported beside every "
+                                "run's sets, never judged; a scoring pass, on by default (--no-baseline skips it)")
+    reference.add_argument("--canaries", action=argparse.BooleanOptionalAction, default=False,
+                           help="Also score the texts with each canary, a deliberately broken forward (a middle layer "
+                                "skipped, the rope base doubled, keys and values one position off, weights on a 3-bit "
+                                "grid), and store how far each lands (canaries.json): every run reports which its own "
+                                "limits would pass, never judged; a scoring pass per canary, off by default")
 
     fetch = subs.add_parser("fetch", help="Fetch the checkpoint's reference package (prepared data and reference "
                                           "scores) into the data, so a run needs only the engine")
@@ -400,14 +413,19 @@ def _command(args):
     if args.command == "reference":
         from .quality.reference import score_data
         from .quality.fixed import STORE
-        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), allowance=args.allowance)
+        how = score_data(args.model, args.data, log=lambda line: print(line, flush=True), allowance=args.allowance,
+                         baseline=args.baseline, canaries=args.canaries)
         print(f"reference scores of {how['positions']:,} positions {how['method']} in {Path(args.data) / STORE}"
               + (f" ({how['seconds']:.0f} s, {how['bytes'] / 2**20:.1f} MiB)" if how["method"] == "scored" else "")
               + (f"; the reference's own spread {how['spread']}" if how.get("spread") else "")
               + {"none": "; the checkpoint declares no quantized activations: no allowance to measure",
                  "unsupported": "; the allowance not measured (see above)"}.get(
                   how.get("allowance"), f"; the allowance (what the declared activation format costs, judged by in speed) "
-                                        f"{how['allowance']}" if how.get("allowance") else ""))
+                                        f"{how['allowance']}" if how.get("allowance") else "")
+              + {"none": "; the checkpoint's config declares no 16-bit dtype: no baseline to measure",
+                 "unsupported": "; the 16-bit baseline not measured (see above)"}.get(
+                  how.get("baseline"), f"; the 16-bit baseline {how['baseline']}" if how.get("baseline") else "")
+              + (f"; the canaries {how['canaries']}" if how.get("canaries") else ""))
         return 0
     if args.command == "fetch":
         from .quality.packages import fetch as do_fetch, source
@@ -434,13 +452,14 @@ def _command(args):
         from .limits.context import GIB, max_context, render as render_context
         from . import EVAL_DIR
         settings = context_settings(load(EVAL_DIR / "protocol.json")["context"], args)
+        spec = load(args.spec) if args.spec else None
         value = max_context(args.model, load(args.device), headroom_gib(args) * GIB, settings, requested(args),
-                            drafters=args.drafter)
+                            drafters=args.drafter, spec=spec)
         from .limits.context import placement, render_placement
         from . import machine_settings
-        ram = args.ram_headroom_gib if args.ram_headroom_gib is not None else machine_settings().get("ram_headroom_gib", 2.0)
+        ram = args.ram_headroom_gib if args.ram_headroom_gib is not None else machine_settings().get("ram_headroom_gib", RAM_HEADROOM_GIB)
         where = placement(args.model, load(args.device), headroom_gib(args) * GIB, ram * GIB, settings, requested(args),
-                          drafters=args.drafter)
+                          drafters=args.drafter, spec=spec)
         print(json.dumps({**value, "placement": where}, indent=1) if args.json
               else render_context(value) + "\n" + render_placement(where))
         return 0 if value["tokens"] else 1

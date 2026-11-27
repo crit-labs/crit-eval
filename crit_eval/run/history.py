@@ -1,7 +1,7 @@
 """The history parts of a run: follow-up turns run again after everything else, and greedy requests repeated on
 the fresh engine and after what it served."""
 from ..reports import metrics
-from .timing import timed_generate
+from .requests import case_request, send
 
 
 def run_followup(engine, info, prepared, protocol, log):
@@ -10,20 +10,23 @@ def run_followup(engine, info, prepared, protocol, log):
     no prompt cache (info prompt_cache false) is not sent them: each turn would be a fresh prefill the speed cases
     already measure, and its answer the one the fresh path gives (no_prompt_cache; the prompt_cache gate passes).
     Cached tokens of 0 are no such declaration: an exact-prompt cache serves only the turns' second pass."""
-    turns, n = prepared.get("followup"), int(protocol["followup"]["output_tokens"])
+    turns = prepared.get("followup")
     if not turns:
         return {"status": "missing", "reason": "the prepared data has no follow-up turns; prepare it again"}
     if info.get("prompt_cache") is False:
         reason = "the engine declares no prompt cache (prompt_cache false)"
         log(f"followup: not run ({reason})")
         return {"status": "skipped", "no_prompt_cache": True, "reason": reason}
-    if len(turns[-1]["prompt_ids"]) + n > info["max_context"]:
-        reason = f"its last turn needs {len(turns[-1]['prompt_ids']) + n:,} tokens of context"
+    # Each turn's own request, which may be served from a prompt cache (protocol requests.overrides.followup).
+    requests = [case_request(turn, "followup", protocol, prompt_cache=True) for turn in turns]
+    need = len(requests[-1]["prompt_ids"]) + requests[-1]["output_tokens"]
+    if need > info["max_context"]:
+        reason = f"its last turn needs {need:,} tokens of context"
         log(f"followup: skipped ({reason})")
         return {"status": "skipped", "reason": reason}
     rows, before = [], None
-    for turn in turns:
-        tokens, sample = timed_generate(engine, turn["prompt_ids"], n, prompt_cache=True)
+    for turn, request in zip(turns, requests):
+        tokens, sample, _ = send(engine, request)
         served = sample.get("served") or {}
         prompt = int(served.get("prompt_tokens") or len(turn["prompt_ids"]))
         cached = served.get("cached_tokens")
@@ -75,8 +78,9 @@ def history_cases(prepared, info):
     return [c for c in held if any(c is end for end in ends)]
 
 
-def history_outputs(engine, cases):
-    return {case["id"]: timed_generate(engine, case["prompt_ids"], case["output_tokens"])[0] for case in cases}
+def history_outputs(engine, cases, part="history"):
+    """Each case's reply to its own request (protocol history; the pre-check's request history, part precheck)."""
+    return {case["id"]: send(engine, case_request(case, part))[0] for case in cases}
 
 
 def compare_history(fresh, after, served):

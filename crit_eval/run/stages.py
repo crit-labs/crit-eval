@@ -7,6 +7,7 @@ left of the budget. Each stage is a prefix of the next, so a run stopped by the 
 before it in full. A certified run (the candidate that will ship) goes to stage 3 whatever the budget and adds one
 request at the requirement itself.
 """
+from .requests import definition
 from ..limits.context import curve_points, retrieval_points
 from .deadline import RequestDeadline
 from .estimate import DECODE_TERMS, SCORE_ROW_SECONDS, fit
@@ -108,9 +109,10 @@ def stage_requests(prepared, protocol, required, info, settings, sampled=True, e
                              for _ in range(int(protocol["heldout"]["repetitions"]))]
     repeated = [(len(c["prompt_ids"]), c["output_tokens"], 0, False) for c in short_cases(prepared, info, rule)]
     out[2]["speed"] = repeated * int(rule["repetitions"])
-    turns, n = prepared.get("followup") or [], int(protocol["followup"]["output_tokens"])
-    if turns and len(turns[-1]["prompt_ids"]) + n <= info["max_context"] and info.get("prompt_cache") is not False:
-        out[2]["followup"] = [(len(t["prompt_ids"]), n, 0, False) for t in turns]
+    # each turn at its own request's output tokens (requests.definition), as the follow-up part asks it
+    turns = prepared.get("followup") or []
+    if turns and len(turns[-1]["prompt_ids"]) + definition(turns[-1])["output_tokens"] <= info["max_context"] and info.get("prompt_cache") is not False:
+        out[2]["followup"] = [(len(t["prompt_ids"]), definition(t)["output_tokens"], 0, False) for t in turns]
         out[3]["followup_again"] = list(out[2]["followup"])
     out[2]["quality"] = quality(quality_sets(prepared, short, above=True))
     pieces = prepared.get("retrieval")

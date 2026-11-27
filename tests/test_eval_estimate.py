@@ -27,7 +27,7 @@ PREPARED = {
                 {"id": "b", "set": "conversations", "prompt_ids": [0] * 20, "continuation_ids": [0] * 16},
                 {"id": "a@64", "set": "long-64", "prompt_ids": [0] * 64, "continuation_ids": [0] * 16},
                 {"id": "b@64", "set": "long-64", "prompt_ids": [0] * 64, "continuation_ids": [0] * 16}],
-    "followup": [{"turn": t, "prompt_ids": [0] * n} for t, n in ((1, 500), (2, 520), (3, 540))],
+    "followup": [{"turn": t, "prompt_ids": [0] * n, "output_tokens": 8} for t, n in ((1, 500), (2, 520), (3, 540))],
     "retrieval": {"head_ids": [0] * 4, "tail_ids": [0] * 3, "curve_tail_ids": [0] * 4, "filler_ids": [0] * 100,
                   "facts": [{"ids": [0, 0]}] * 3},
 }
@@ -92,6 +92,13 @@ class FitTests(unittest.TestCase):
 
 
 class EstimateTests(unittest.TestCase):
+    def test_each_follow_up_turn_is_priced_at_its_own_requests_output_tokens(self):
+        # requests.definition: a turn's request is its own output_tokens, not a protocol-wide count
+        turns = [{**t, "output_tokens": 8 * t["turn"]} for t in PREPARED["followup"]]
+        found = run(prepared={**PREPARED, "followup": turns}, load_seconds=10.0, tokens_per_round=2.0)
+        expected = sum(request(n, 8 * turn) for turn, n in ((1, 500), (2, 520), (3, 540)))
+        self.assertAlmostEqual(found["parts"]["followup"], expected, places=6)
+
     def test_every_part_takes_its_requests_at_the_engines_rates(self):
         found = run(load_seconds=10.0, tokens_per_round=2.0)
         cases = (100, 1000, 4000)

@@ -225,6 +225,11 @@ def _quality_gate(result):
     if (quality.get("allowance") or {}).get("status") == "missing":
         # protocol quality.allowance: a speed run of a checkpoint whose declared format the data has no allowance for.
         detail += "; " + quality["allowance"]["reason"]
+    # protocol quality.baseline and quality.canaries: where a 16-bit engine of this model already uses most of a
+    # limit, and which deliberately broken forwards the limits pass. Reported, never judged.
+    from ..run.quality_checks import qualification_lines
+    for line in qualification_lines(quality):
+        detail += "; " + line
     if development:
         # An in-process adapter's scores: what the sets measure, never a gate result (protocol quality.development).
         return {"name": "quality", "state": "unmeasured",
@@ -648,8 +653,12 @@ def _render_attribution(attribution, worst):
         rows.append(f"{name} " + ", ".join(f"{s} {shares[s]:+.0%} ({row['budget_used'][s]:.0%} with it exact)"
                                            for s in order[:3]))
     base = attribution.get("base", {}).get(worst)
+    baseline = attribution.get("baseline") or {}
+    sixteen = (baseline.get("budget_used") or {}).get(worst)
+    at = (f", 16-bit baseline {_pct(sixteen)}" if sixteen is not None else
+          f", no 16-bit baseline ({baseline['status']})" if baseline.get("status") else "")
     return [f"  drift attribution (share of the budget each exact variant takes away; full engine {worst} "
-            f"{_pct(base)}; shares interact): " + "; ".join(rows)]
+            f"{_pct(base)}{at}; shares interact): " + "; ".join(rows)]
 
 
 def _render_ttft_parts(t):
@@ -877,9 +886,13 @@ def _concurrency_kpi(result):
 def _render_concurrency(c):
     if c["status"] != "measured":
         return [f"  concurrency unmeasured ({c['reason']})"]
+    # Each pool prompt at its case's own output tokens (crit-eval-v0.9.0: {prompt: tokens}); one count before it.
+    found = c["output_tokens"]
+    lengths = sorted(set(found.values())) if isinstance(found, dict) else [found]
+    tokens = (f"{lengths[0]}" if len(lengths) == 1 else f"{lengths[0]} to {lengths[-1]}") if lengths else "no"
     lines = [f"  concurrency {len(c['levels'])} levels up to {max(map(int, c['levels']), default=0)} clients "
              f"(server runs {c['max_concurrent_requests']} at once; {c['requests_per_client']} requests of "
-             f"{c['output_tokens']} tokens per client)"]
+             f"{tokens} tokens per client)"]
     for clients, row in c["levels"].items():
         line = (f"    {int(clients):>3} clients: " + (f"{row['aggregate_tps']:,.1f} tok/s sampled aggregate"
                                                       if row["aggregate_tps"] else "not qualified")

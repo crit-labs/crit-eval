@@ -14,7 +14,7 @@ and quality references, so results from different runs, agents and machines comp
 crit eval probe --out device.json
 crit eval context --model MODEL_DIR --device device.json
 crit eval pin --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR [--context TOKENS]
-crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR
+crit eval reference --model MODEL_DIR --data EVAL_DATA_DIR [--no-allowance] [--no-baseline] [--canaries]
 crit eval fetch --model MODEL_DIR --data EVAL_DATA_DIR [--packages FOLDER_OR_URL]
 crit eval pack --data EVAL_DATA_DIR --packages FOLDER
 crit eval run --adapter my_adapter.py --model MODEL_DIR --data EVAL_DATA_DIR --device device.json [--context TOKENS] [--quality-mode preserve] --out result.json
@@ -424,7 +424,10 @@ which crit-eval 0.6.0 kept; crit-eval 0.6.1 kept `crit-eval-v0.6.0`, and the cha
 `crit-eval-v0.7.0`, which crit-eval 0.7.0 kept; the changes since ran under `crit-eval-v0.7.1`, which crit-eval
 0.7.1, 0.7.2 and 0.7.3 kept; the changes since ran under `crit-eval-v0.8.0` and then `crit-eval-v0.8.1`, and
 crit-eval 0.8.1 kept `crit-eval-v0.8.1` (no release kept `crit-eval-v0.8.0`); the changes since ran under
-`crit-eval-v0.8.2`, which crit-eval 0.8.2 kept. A change that can move a
+`crit-eval-v0.8.2`, which crit-eval 0.8.2 kept; the changes since ran under `crit-eval-v0.8.3` and then
+`crit-eval-v0.9.0`, which starts a new series (every request built from its case's one definition, so the concurrency
+part asks each prompt at its case's own length) and which crit-eval 0.9.0 kept (no release kept `crit-eval-v0.8.3`).
+A change that can move a
 score (the speed, held-out, quality or long-context cases and their prompts, output lengths, warmups and
 repetitions, aggregation, the quality thresholds or scoring rules, and any harness change that measures differently)
 is listed in the changelog as one, so the release can say whether it starts a series. `compare` warns when results

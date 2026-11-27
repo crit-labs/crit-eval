@@ -9,6 +9,167 @@ with versions following [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-27
+
+### Overview
+
+crit-eval 0.9.0 releases protocol crit-eval-v0.9.0, which starts a new series: results do not compare with v0.8.x
+ones, and data prepared under v0.8.x is prepared again. Every request Eval sends for a suite case is now built by
+one function from the case's one definition, and a part may change only the fields the protocol declares for it.
+The only requests that change are the concurrency part's: each pool prompt is asked at its case's own output length
+(256 tokens for a speed case, 64 for a held-out prompt, where every request decoded 128), and its consistency gate
+compares each batched reply with the serial reply to the same request. Every other score, limit and verdict is
+unchanged. The reference now also measures the checkpoint's 16-bit baseline by default (a GGUF included) and, with
+`--canaries`, four deliberately broken forwards; results, the pre-check and the drift attribution report both
+beside the engine, never judged. Eval sizes an engine through crit's EngineSpec where it has one, puts the run's
+quality limits and allowance in the engine's spec, records the close report of its lower-context engine (and fails
+that gate on a close that kept memory), and takes crit Core's definitions and headroom default alone. crit 0.25.0
+ships with crit-eval 0.9.0, which needs crit-core and crit-models 0.25.0 or later.
+
+### Added
+
+- `crit eval reference` measures the checkpoint's 16-bit baseline by default (protocol `quality.baseline`,
+  crit-eval-v0.8.3, reported, not judged; `--no-baseline` skips it): the texts scored once more through the same
+  code path, chunks and order in the config's own dtype (bfloat16 or float16), with the weights decoded as the
+  exact pass decodes them and then held in it, the activations, residual stream, KV and attention in it, and the
+  head a 16-bit product accumulated in FP32. How far that lands from the exact scores is stored per set and path
+  with its block-bootstrap resamples (`baseline.json`, which reference packages carry). A checkpoint whose config
+  declares no 16-bit dtype stores an empty baseline saying so. This is the 2026-11-24 BF16 yardstick job, made
+  automatic: one more scoring pass (126 s for Gemma 4 31B on an RTX 5090).
+- `crit eval reference --canaries` (off by default, a pass each; protocol `quality.canaries`, reported, not
+  judged) scores the texts with four deliberately broken forwards, each a general hook on the official forward
+  that names no model: the middle decoder layer skipped, the rope base doubled, keys and values one position off,
+  and the weights on a 3-bit grid per group of 32. How far each lands is stored per set and path (`canaries.json`,
+  carried by reference packages); a canary with nothing to break in the model is recorded as not applicable.
+- Each quality set and path of a result lists the 16-bit baseline beside the engine (`baseline`: its KLD mean and
+  p99, PPL ratio, top-1 agreement, the budget it uses of the limits the run judges that set by, and its
+  `budget_spread` against them; `reach`: unreachable, near or within), and `quality.baseline` names the sets where
+  a 16-bit engine of this model is unreachable at 16 bits (the baseline over a limit) or near the limit (its
+  bootstrap p95 over it). The quality gate's status says so ("a bfloat16 engine of this model: long-4096/prompt
+  near the limit ..."), or names the baseline's worst set when it is far from every limit. Data scored before this
+  holds no baseline: the result and status say so (`quality.baseline` missing), and nothing fails.
+- `quality.canaries` judges each stored canary against the limits the run judges each set by (the allowance and the
+  spread included) and reports which pass (`passing`; per canary `passed`, `passing_sets` and the largest budget it
+  uses), and the status names them: a canary that passes means the limits are too loose to tell that breakage from a
+  working engine of this model. Without stored canaries the result says how to measure them.
+- These additions ran under protocol id crit-eval-v0.8.3, in the 0.8 series, and changed no score, limit or verdict;
+  the one request per case below moves the working id to crit-eval-v0.9.0, a new series.
+- An eval-v1 engine's `close()` may return its close's report (`returned`, `message`: whether the device got back
+  what its load took, which crit's Core now measures at every close). The lower-context round records it
+  (`context.lower.close`, and `required_again.close`), and a lower-context engine whose close did not return its
+  memory fails the lower-context gate with the report: the engines opened after it would run beside the leak. The
+  journal's engine passes the report through, and the mock adapter reports one (`keeps_memory_below_context`
+  makes it leak).
+- The quality pre-check (`precheck_quality`, which `crit run ablate` scores each variant with) and the drift
+  attribution (`--attribute-drift`) show the 16-bit baseline: the pre-check's item names the budget a plain 16-bit
+  engine of this model uses of the same limits on the worst set (`baseline`, and in its detail), and the attribution
+  carries the baseline's budget per set beside the full engine's (`attribution.baseline`, in its log lines and the
+  status line), or why the data holds none (`quality_checks.baseline_budgets`, `baseline_row`, shared with `qualify`).
+  Reported, never judged: no item's state, score or verdict changes.
+- Eval sizes an engine through crit's EngineSpec where it is given one: `limits.context.max_context`, `placement` and
+  `context_requirement` take `spec` (`spec_prices`: the selection's KV pools' elements a token, which Eval still
+  prices at its protocol's KV precision, and the projections slot's held and stored bytes of the 16-bit target
+  matrices, which replace their stored bytes in the resident weights; `basis.sized_by` names the prices read); the
+  runner's placement passes the engine's `info.spec`, and `crit eval context --spec JSON` reads one. The protocol's KV
+  precision, reserve and required-context rule stay Eval's. Without a spec nothing changes.
+- A run's quality terms go into the engine's spec with their sources (`quality_checks.quality_spec`):
+  `result.engine.spec.values.quality_limits` (the limits the run judged by: source user where the run's budget sets
+  some, else mode) and `quality_allowance` (the checkpoint's stored allowance, source measured). A served engine's
+  `spec_prices` engine fact (crit serve's) reaches the chat adapter's facts, and the runner's placement sizes by it.
+  No score, limit or verdict changes.
+
+### Changed
+
+- Protocol crit-eval-v0.9.0 starts a new series: every request Eval sends for a suite case is built by one function
+  (`crit_eval.run.requests.case_request`, protocol `requests.cases`) from the case's one definition, its prompt
+  (ids, chat messages and tools) and output tokens asked greedily, stop tokens off, no prompt cache, no
+  log-probabilities, no reasoning budget, free decoding. A part that asks a case otherwise names each field it
+  changes, only those `requests.overrides` declares for it (the sampled suite's and held-out prompts' sampling and
+  seeds, the jitter's cut prompts, the curve's log-probabilities, sampled request and reasoning budget, retrieval's
+  budget, the follow-up turns' prompt cache, plain decoding for exactness, a pinned continuation's replay, the kernel
+  trace's warmup and prefill prompts); the request records them, and any other is refused. Two replies are compared
+  only when their requests are the same: a speed case records the request its reply answers (`request_sha256`).
+  The cases: the speed cases, held-out prompts and follow-up turns as prepared (each turn now holds its
+  `output_tokens`), and each curve and retrieval point. Routed through it: the speed part (free, pinned and replayed
+  requests), the sampled suite, the sampling check, the held-out prompts, the wider draft, exactness, the request
+  history, the follow-up turns, `crit eval pin`, the pre-check (speed samples, request history, long reply), the
+  long-context curve, retrieval, the concurrency pool and the kernel trace.
+  - **Which requests change:** only the concurrency part's. Each pool prompt is asked its case's own request
+    instead of `concurrency.output_tokens` (128, removed from the protocol): a speed case 256 tokens, a held-out
+    prompt 64. Its consistency gate compares each batched reply with the serial reply to the same request, the speed
+    part's whenever the speed part ran (`serial_source` "speed part"), else that request run alone first. The
+    0.8.2 special case for a served speed case with tools (its serial reply run alone at 128 tokens) is gone: the
+    speed reply now is the same request. A cohort takes per-request output tokens (`cohort(clients,
+    max_new_tokens[c][r], sampling)`; one int still means every request), in ChatEngine and Core's eval adapter
+    (crit-core from the next crit release). Every other part sends exactly the requests it sent under v0.8.3: a
+    test (`tests/test_eval_requests.py`) pins the distinct requests of a full round in process and behind a server
+    to those crit-eval 8882699 sent, and holds every request of both rounds to its case's definition and its part's
+    declared overrides.
+  - **Effect on existing results:** a level now decodes 256 tokens per speed-case request and 64 per held-out one,
+    where every request decoded 128, so its aggregate, first tokens, decode p50, ceiling fraction, speedup and run
+    time change, and the concurrency gate compares full-length replies (a tool-call case's finished call where the
+    128-token request cut it; the 2026-11-25 Gemma 4 failure, from its recorded replies, is a test). Every other
+    score, limit and verdict is unchanged. Results across the series boundary do not compare (`compare` warns), and
+    data prepared under v0.8.x is prepared again (`crit eval prepare` into a new directory: its follow-up turns lack
+    their output tokens); reference scores carry over, their identity being the model, texts and reference version.
+- The runner's VRAM headroom default is crit Core's (`crit_plugins.memory.HEADROOM`, 0.25 GiB, through
+  `crit_eval.VRAM_HEADROOM_GIB`; `runner.VRAM_HEADROOM_BYTES`), which `crit eval run`, `precheck` and `context`
+  already use: a run given no `vram_headroom_bytes` priced its required context, recorded its headroom and placed
+  the weights' tiers at 1 GiB. `crit run` and `crit eval run` always pass the run's headroom, so their runs are
+  unaffected; only a library call to `crit_eval.run.runner.run` without a headroom now places and reports the
+  model at 0.25 GiB, which can raise its computed context and move weights onto the device.
+- A GGUF checkpoint gets a 16-bit baseline: where the config declares no dtype (a GGUF's derived config, or a config
+  without the key), `sixteen_bit_dtype` takes the 16-bit float type the stored tensors hold the most elements in
+  (BF16, else F16, as the converter wrote them from the model's weights; `stored_sixteen_bit`), and bfloat16, the
+  dtype crit's engines compute in, where the checkpoint stores only quantized and 32-bit tensors. A config that
+  declares a dtype decides as before, and an FP32 checkpoint still has none. Protocol `quality.baseline.rule` and
+  docs/MEASUREMENTS.md state the rule. Reported, not judged: no score, limit or verdict changes.
+- crit Eval reads Core's answers alone: the copies it kept for a crit-core from before Core held them (the KV that
+  fits, the quality modes, the exactness levels and phases, the VRAM and host headroom defaults) are gone, since every
+  crit-core it takes (0.24.0 or later) defines them (`crit_plugins.memory.kv_fit`, `HEADROOM`, `HOST_HEADROOM`,
+  `crit_plugins.exactness`). Results are unchanged.
+- The default quality mode is crit Core's (`crit_plugins.exactness.DEFAULT_QUALITY_MODE`), which
+  `crit_eval.quality.fixed` re-exports.
+
+### Internal
+
+- `crit_eval/run/runner.py` no longer imports `time`, which it does not use.
+- `metrics.budget_spread` is its resamples (`bootstrap_samples`) judged against limits (`spread_of`), so a
+  bootstrap stored once judges against another run's limits. Its output is unchanged.
+- The files beside the reference scores (spread, allowance) are written and read by one pair
+  (`fixed.write_beside`, `fixed.load_beside`).
+
+### Fixed
+
+- A context Eval computes from crit's EngineSpec counts the engine's sliding-window rings (`kv_ring_bytes`, one a
+  sequence it runs at once) in the fixed state, in place of the config's one window (`spec_prices`,
+  `max_context`'s `fixed_state_bytes`, `basis.sized_by`), and a tied head's copy through the held matrix bytes crit
+  prices: Gemma 4 31B NVFP4's library-default speed engine was sized for 200,000 tokens on an RTX 5090 and did not
+  load; it is sized for 49,152, which does. Without a spec nothing changes.
+- `crit eval run --package` sizes the context it computes by the package's EngineSpec (`runner.package_spec`:
+  crit Core's `engine_spec`, resolved from the headers before any load): its KV elements a token and the held bytes of
+  its 16-bit target matrices. It priced those matrices at their stored bytes, so a speed engine that holds them in
+  FP8 (Gemma 4 31B NVFP4: 31.5 GB counted where it reads 23.0 GB) did not fit, got no context and left its
+  capacity, retrieval and lower-context gates unmeasured. A run that gives its context (`crit run ... eval`, a
+  `--context`) is unchanged.
+- The protocol texts name the series their items belong to: `quality.baseline.since`, `quality.canaries.since`, the
+  "no 16-bit baseline" reason (`BASELINE_MISSING`) and docs/MEASUREMENTS.md's baseline paragraph say crit-eval-v0.9.0,
+  where they named crit-eval-v0.8.3, a working id no release kept. Every other `since` and `judged_since` already
+  names a released id. No score, limit or verdict changes.
+- The run's time estimate (`run/estimate.py`) and the staged plan (`run/stages.py`) price each follow-up turn, and
+  check that the last one fits, at its own request's output tokens (`requests.definition`), as the follow-up part asks
+  it, instead of `protocol.followup.output_tokens` (the same number by construction today, so no estimate changes).
+- The rope_base canary builds every rotary module again from a copy of its config with each rope_theta doubled
+  (`_rebuilt_rotary`, `_doubled_theta`), so a scaled rope (yarn, llama3, dynamic, longrope) gets the table its own
+  rule makes of the doubled base, and yarn's attention scaling with it; it scaled the built table as a doubled base
+  scales the standard form, which is not that table for a scaled rope (yarn at factor 4 differs by up to 32%). A table
+  outside a rebuildable rotary module is scaled as before. Reported, not judged: no score, limit or verdict changes.
+- The canaries cover what they left out: coarse_weights rounds the output head and the gathered embedding tables' rows
+  to its grid too (they stayed exact), and kv_shift also breaks attention that calls its own kernel instead of
+  transformers' attention interface, by moving its `k_proj` and `v_proj` outputs one position (`_own_attention_shift`;
+  such a model was "not applicable"). Protocol `quality.canaries.rule` and docs/MEASUREMENTS.md say so. Reported, not
+  judged: no score, limit or verdict changes.
+
 ## [0.8.2] - 2026-11-26
 
 ### Overview
@@ -63,6 +224,9 @@ warming after the engine is reopened. crit 0.24.0 ships with crit-eval 0.8.2, wh
   in the same host can settle and move again while its file-backed pages come back: a build's certified round stopped
   twice in the lower-context round on agent-long (68%, then 26%). A case that is not disturbed is measured as before,
   so scores stay in the 0.8 series.
+- The RAM headroom's default is crit Core's (`crit_plugins.memory.HOST_HEADROOM`, `crit_eval.RAM_HEADROOM_GIB`), as
+  the VRAM headroom's already is: `crit eval context` and the runner's placement took their own 2.0 GiB. The value is
+  the same, so no limit, score or verdict changes.
 
 ### Fixed
 

@@ -222,7 +222,8 @@ class StagePlanTests(unittest.TestCase):
                 "quality": [{"set": "conversations", "prompt_ids": [0] * 30, "continuation_ids": [0] * 256},
                             {"set": "long-32768", "prompt_ids": [0] * 32768, "continuation_ids": [0] * 256}],
                 "sampling": {"temperature": 1.0},
-                "followup": [{"prompt_ids": [0] * 8192}, {"prompt_ids": [0] * 8300}],
+                "followup": [{"turn": 1, "prompt_ids": [0] * 8192, "output_tokens": 64},
+                             {"turn": 2, "prompt_ids": [0] * 8300, "output_tokens": 64}],
                 "retrieval": {"facts": []}}
     INFO = {"max_context": 200000, "speculative": True}
 

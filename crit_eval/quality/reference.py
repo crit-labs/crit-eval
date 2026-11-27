@@ -59,6 +59,19 @@ path (store_allowance, fixed.ALLOWANCE): what the declared format itself costs, 
 is the one place the reference quantizes activations (StreamingReference declared_activations). Fused experts (MergeModulelist, then Concatenate
 along the output rows) quantize each expert matrix's input with that matrix's own declared scale (_FusedInputs). A
 matrix with declared activations that the modeling code multiplies any other way is refused rather than left exact.
+
+The 16-bit baseline (protocol quality.baseline, by default; store_baseline): the same texts, chunks and order scored
+once more by this code path in the checkpoint's own 16-bit dtype (sixteen_bit_dtype: its config's dtype, bfloat16 or float16, else its stored tensors'): every
+weight decoded as in the exact pass, then held in that dtype, the embeddings, activations, residual stream, KV and
+attention scores in it through the official forward, the head a 16-bit product accumulated and output in FP32
+(StreamingReference dtype). How far that run lands from the stored scores is kept per set and path with its
+block-bootstrap resamples (fixed.BASELINE): how much of a limit a plain 16-bit engine of this model already uses.
+Reported beside every run's sets, never judged.
+
+The canaries (protocol quality.canaries, on request; store_canaries): deliberately broken forwards, each a general
+hook on the official forward that names no model (StreamingReference canary, CANARIES), scored on the same texts in
+FP32 and kept like the baseline (fixed.CANARIES). A run reports which of them its own limits would pass: a canary that
+passes means the limits are too loose for this model. Reported, never judged.
 """
 import math
 import os
@@ -90,6 +103,15 @@ SCORE_ROWS = 512
 # What a chunk of such a text takes beside the layers (its activations, the forward's own per-chunk tensors) lives in
 # that margin, so the chunk is sized from it (called_chunk).
 CALLED_FREE_SHARE = 0.2
+# The 16-bit dtypes a checkpoint's config may declare, which the baseline computes in (store_baseline).
+SIXTEEN_BITS = ("bfloat16", "float16")
+# The canaries (protocol quality.canaries), each a deliberately broken forward: the middle decoder layer skipped (its
+# output is its input), every rotary frequency table's base doubled, keys and values one position off (each query
+# reads the keys and values of the positions before), and every weight matrix rounded to a coarse per-group grid
+# (COARSE_BITS signed levels over groups of COARSE_GROUP along its input dimension, scaled by the group's largest
+# magnitude).
+CANARIES = ("skip_layer", "rope_base", "kv_shift", "coarse_weights")
+COARSE_BITS, COARSE_GROUP = 3, 32
 
 
 def _host_memory():
@@ -185,6 +207,168 @@ def _meta_parameters():
         torch.nn.Module.register_parameter = register
 
 
+def sixteen_bit_dtype(model):
+    """The 16-bit dtype the baseline computes in, one of SIXTEEN_BITS, by one rule:
+    1. the dtype the checkpoint's config declares (its text config's, else its own dtype or torch_dtype): that one
+       where it is 16-bit, none where it declares another (an FP32 checkpoint has no 16-bit baseline);
+    2. a config that declares none (a GGUF's derived config, a config without the key): the 16-bit float type the
+       stored tensors hold the most elements in (BF16, else F16; GGUF's and safetensors' type names), as the
+       checkpoint's converter wrote them from the model's own weights (stored_sixteen_bit);
+    3. no 16-bit tensor stored, but quantized ones (a GGUF whose norms are F32 and every matrix a block type):
+       bfloat16, the 16-bit dtype crit's engines compute in.
+    None where none applies (only 32- or 64-bit floats stored), or the checkpoint cannot be read."""
+    import json
+    try:
+        from crit_core.model import CONFIG_NAME, open_model
+        source = open_model(model)
+        source.config()
+        data = json.loads(source.files.read(CONFIG_NAME))
+    except Exception:   # a model it cannot read: no baseline, and the stored record says why
+        return None
+    for scope in (data.get("text_config") or {}, data):
+        value = scope.get("dtype") or scope.get("torch_dtype")
+        if value:
+            value = str(value).removeprefix("torch.")
+            return value if value in SIXTEEN_BITS else None
+    try:
+        return stored_sixteen_bit(source.weights.tensors.values())
+    except Exception:   # headers it cannot read: no baseline
+        return None
+
+
+# Stored tensor types (safetensors' and GGUF's names) of the floats that are not 16-bit: any other type a
+# checkpoint stores is a quantized one.
+WIDE_FLOATS = ("F32", "F64")
+
+
+def stored_sixteen_bit(tensors):
+    """sixteen_bit_dtype's rules 2 and 3 over tensor headers (each with .dtype and .shape): "bfloat16" or "float16"
+    for the 16-bit float type holding the most elements (a tie goes to bfloat16), "bfloat16" where none is 16-bit but
+    some are quantized, None where every tensor is a 32- or 64-bit float."""
+    elements = {"BF16": 0, "F16": 0}
+    quantized = False
+    for tensor in tensors:
+        kind = str(tensor.dtype).upper()
+        count = 1
+        for size in tensor.shape:
+            count *= int(size)
+        if kind in elements:
+            elements[kind] += count
+        elif kind not in WIDE_FLOATS:
+            quantized = True
+    if elements["BF16"] or elements["F16"]:
+        return "bfloat16" if elements["BF16"] >= elements["F16"] else "float16"
+    return "bfloat16" if quantized else None
+
+
+def _doubled_theta(value):
+    """A copy of a config value (a config, a dict, a list) with every rope_theta doubled (the rope_base canary)."""
+    import copy
+    if isinstance(value, dict):
+        return {key: (2 * item if key == "rope_theta" and isinstance(item, (int, float)) else _doubled_theta(item))
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_doubled_theta(item) for item in value]
+    if hasattr(value, "to_dict") and hasattr(value, "__dict__"):
+        found = copy.deepcopy(value)
+        for key, item in list(vars(found).items()):
+            if key == "rope_theta" and isinstance(item, (int, float)):
+                setattr(found, key, 2 * item)
+            elif isinstance(item, (dict, list)) or hasattr(item, "to_dict"):
+                setattr(found, key, _doubled_theta(item))
+        return found
+    return value
+
+
+def _rebuilt_rotary(module):
+    """A rotary module (a *RotaryEmbedding with its config) built again on the CPU from its config with every rope
+    base doubled, or None where it cannot be (no config, a constructor that takes more)."""
+    config = getattr(module, "config", None)
+    if config is None or not type(module).__name__.endswith("RotaryEmbedding"):
+        return None
+    try:
+        return type(module)(_doubled_theta(config))
+    except Exception:   # noqa: BLE001 - a module built otherwise: its tables are scaled instead
+        return None
+
+
+def coarse_grid(tensor, bits=COARSE_BITS, group=COARSE_GROUP):
+    """The coarse_weights canary: `tensor` rounded to a symmetric grid of 2 ** (bits - 1) - 1 levels each side per
+    group of `group` values along its last dimension, scaled by the group's largest magnitude, in its own dtype."""
+    import torch
+    shape, levels = tensor.shape, 2 ** (bits - 1) - 1
+    flat = tensor.reshape(-1, shape[-1]).float()
+    pad = -shape[-1] % group
+    if pad:
+        flat = torch.nn.functional.pad(flat, (0, pad))
+    groups = flat.reshape(flat.shape[0], -1, group)
+    scale = groups.abs().amax(dim=-1, keepdim=True) / levels
+    rounded = torch.where(scale > 0, torch.round(groups / torch.where(scale > 0, scale, 1)).clamp(-levels, levels)
+                          * scale, groups)
+    return rounded.reshape(flat.shape)[:, :shape[-1]].reshape(shape).to(tensor.dtype)
+
+
+def _shifted_attention(inner):
+    """The kv_shift canary's attention: `inner` (an attention implementation's name, or "eager": the attention
+    module's own modeling code's eager_attention_forward) on keys and values moved one position later along the
+    sequence ([batch, heads, positions, dim]: position j reads what position j - 1 stored, the first its own), so each
+    query reads every key and value one position off."""
+    import sys
+    import torch
+
+    def attention(module, query, key, value, *args, **kwargs):
+        key = torch.cat([key[:, :, :1], key[:, :, :-1]], dim=2)
+        value = torch.cat([value[:, :, :1], value[:, :, :-1]], dim=2)
+        if inner == "eager":
+            function = getattr(sys.modules[type(module).__module__], "eager_attention_forward", None)
+            if function is None:
+                raise SchemeError(f"kv_shift: {type(module).__module__} has no eager_attention_forward")
+        else:
+            from transformers import AttentionInterface
+            function = AttentionInterface._global_mapping[inner]
+        return function(module, query, key, value, *args, **kwargs)
+    return attention
+
+
+def _calls_interface(module):
+    """Whether an attention module's forward reaches transformers' attention interface (ALL_ATTENTION_FUNCTIONS, or
+    the eager_attention_forward the interface stands for), read from its source."""
+    import inspect
+    try:
+        source = inspect.getsource(type(module).forward)
+    except (OSError, TypeError):
+        return True   # cannot tell: left to the interface's shift
+    return "ALL_ATTENTION_FUNCTIONS" in source or "AttentionInterface" in source or "_attn_implementation" in source         or "eager_attention_forward" in source
+
+
+def _own_attention_shift(model, reference):
+    """The kv_shift canary for attention modules that call their own kernel instead of transformers' interface (a
+    module named *Attention holding k_proj and v_proj whose forward never reaches the interface): each projection's
+    output is moved one position later along the sequence (position j holds what j - 1 computed, the first its own),
+    so each query reads keys and values one position off, as the interface's shift makes it. Returns the modules
+    hooked (marking the canary as applying when one runs); none where every attention goes through the interface."""
+    import torch
+    hooked = []
+
+    def shift(module, args, output):
+        reference.canary_applies = True
+        if not torch.is_tensor(output) or output.dim() < 2 or output.shape[-2] < 2:
+            return output
+        return torch.cat([output[..., :1, :], output[..., :-1, :]], dim=-2)
+    for name, module in model.named_modules():
+        if not type(module).__name__.endswith("Attention") or _calls_interface(module):
+            continue
+        projections = [getattr(module, key, None) for key in ("k_proj", "v_proj")]
+        if any(projection is None for projection in projections):
+            continue
+        for projection in projections:
+            projection.register_forward_hook(shift)
+        hooked.append(name)
+    return hooked
+
+
+# The reference whose kv_shift canary is running (StreamingReference._shifted): the registered attention marks it.
+_SHIFTING = {"reference": None}
 _GATHERED = {}
 
 
@@ -223,7 +407,7 @@ class _StreamedExperts:
         checkpoint, device = reference.checkpoint, reference.device
         self.held = {key: checkpoint.raw(key).to(device).clone() for sources in self.parts.values()
                      for base, _ in sources for key in reference.members.get(base, ())}
-        self.shape, self.dtype = tuple(placeholder.shape), reference.torch.float32
+        self.shape, self.dtype = tuple(placeholder.shape), reference.dtype or reference.torch.float32
 
     def __getitem__(self, index):
         expert = int(index)
@@ -235,7 +419,7 @@ class _StreamedExperts:
                                        target_patterns=self.converter.target_patterns, full_layer_name=self.name,
                                        config=self.reference.config)
         (tensor,) = inputs.values()
-        tensor = tensor.float()[0]
+        tensor = self.reference._sixteen(tensor.float()[0])
         if _FusedInputs.active is not None:
             _FusedInputs.active.tag(self, expert, tensor)
         return tensor
@@ -327,12 +511,19 @@ class StreamingReference:
     # would take more than half the device's free memory in FP32, True for every one, False for none.
     stream_experts = None
 
-    def __init__(self, model, device="cuda", declared_activations=False):
+    def __init__(self, model, device="cuda", declared_activations=False, dtype=None, canary=None):
         import os
         # The reference's own arithmetic, not a run's quality mode: exact activations score what both quality modes
         # judge against; declared_activations quantizes them as the checkpoint declares, the allowance's pass alone
         # (store_allowance), whose distance from the exact scores raises speed's limits, never scores judged against.
         self.declared = declared_activations
+        # dtype (one of SIXTEEN_BITS): the baseline's pass alone (store_baseline): weights decoded as in the exact pass,
+        # then held in it, the forward's activations, residual stream, KV and attention in it, the head's product of
+        # its values accumulated and output in FP32. None: FP32, the scores every run is judged against.
+        # canary (one of CANARIES): a canary's pass alone (store_canaries), a deliberately broken forward.
+        if canary is not None and canary not in CANARIES:
+            raise ValueError(f"canary must be one of {', '.join(CANARIES)}")
+        self.canary, self.skipped = canary, None
         # declared_activations: {checkpoint base: crit_eval.limits.schemes.activations} as found, and the output head's
         self.inputs, self.head_inputs = {}, None
         # Chunked attention allocates a score block of another width for every block of query rows; torch's default
@@ -349,10 +540,29 @@ class StreamingReference:
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         self.torch, self.device = torch, device
+        if dtype is not None and str(dtype).removeprefix("torch.") not in SIXTEEN_BITS:
+            raise ValueError(f"dtype must be one of {', '.join(SIXTEEN_BITS)}")
+        self.dtype = None if dtype is None else getattr(torch, str(dtype).removeprefix("torch."))
         self.config = _text_config(model)
         self.checkpoint = open_checkpoint(model, self.config)
         with _meta_parameters():
             self.skeleton = AutoModel.from_config(self.config)
+        if self.dtype is not None:
+            # The skeleton's (meta) parameters in the dtype, as from_pretrained(dtype=...) builds them: a module that
+            # follows its weight's dtype (an embedding's scale) computes in it.
+            for module in self.skeleton.modules():
+                for key, parameter in list(module._parameters.items()):
+                    if parameter is not None and parameter.is_floating_point():
+                        module._parameters[key] = torch.nn.Parameter(parameter.to(self.dtype), requires_grad=False)
+        if canary == "rope_base":
+            self.canary_applies = self._double_rope_base()
+        elif canary == "kv_shift":
+            self.canary_applies = None   # known once a pass has run: whether any attention read keys (_shifted)
+            # attention that calls its own kernel, not transformers' interface: its key and value projections'
+            # outputs shifted instead (_own_attention_shift)
+            self.own_shifted = _own_attention_shift(self.skeleton, self)
+        else:
+            self.canary_applies = True
         # Faster forms of modeling-code loops, bound where the code is the one they were checked against
         # (crit_eval.architectures.indexers): the same selection, without a Python loop per token.
         self.forms = exact_forms(self.skeleton)
@@ -375,6 +585,57 @@ class StreamingReference:
         self.tables = {}
         # Decoder layers' stored tensors by layer, and the read of the next layer under way (Checkpoint.stage).
         self.layer_keys, self.ahead, self.reader, self.host = None, None, None, None
+        if canary == "skip_layer":
+            self.skipped = self._layer_count() // 2
+
+    def _double_rope_base(self):
+        """The rope_base canary: every rotary frequency table the model computed when built (a buffer named
+        *inv_freq, the text model's or a layer's own) as the model builds it with its rope base doubled. A rotary
+        module (a *RotaryEmbedding holding its config) is built again from a copy of its config whose every
+        rope_theta is doubled (_doubled_theta), so a scaled rope (yarn, llama3, dynamic, longrope) is the table its
+        own rule makes of the doubled base; any other table is scaled as a doubled base scales the standard form:
+        entry i of n by 2 ** (-i / n), theta ** (-2i / d) becoming (2 theta) ** (-2i / d). Returns whether the model
+        holds any (a model without rope has nothing to break)."""
+        found = False
+        rebuilt = set()
+        for module in self.skeleton.modules():
+            tables = {key: buffer for key, buffer in module._buffers.items()
+                      if key.endswith("inv_freq") and buffer is not None and not buffer.is_meta and buffer.numel()}
+            if not tables:
+                continue
+            found = True
+            again = _rebuilt_rotary(module)
+            for key, buffer in tables.items():
+                table = None if again is None else again._buffers.get(key)
+                if table is not None and table.shape == buffer.shape:
+                    buffer.copy_(table.to(buffer.dtype))
+                    rebuilt.add(id(module))
+                    continue
+                n = buffer.shape[-1]
+                scale = 2.0 ** (-self.torch.arange(n, dtype=self.torch.float64) / n)
+                buffer.copy_((buffer.double() * scale).to(buffer.dtype))
+            if again is not None and id(module) in rebuilt:
+                for name, value in vars(again).items():   # the scaling the rule derives with the base (yarn's)
+                    if name.endswith("attention_scaling") and isinstance(value, float):
+                        setattr(module, name, value)
+        return found
+
+    def _skip(self, index, args, kwargs, out):
+        """The skip_layer canary: decoder layer `index`'s output replaced by its input where it is the skipped layer
+        (it still runs, so the cache it keeps is what the forward expects)."""
+        if index != self.skipped:
+            return out
+        hidden = _hidden(args, kwargs)[1]
+        return (hidden,) + tuple(out[1:]) if isinstance(out, tuple) else hidden
+
+    def _sixteen(self, tensor, matrix=True):
+        """A decoded tensor as this pass holds it: floating point in the baseline's dtype (as is in FP32), rounded to
+        the coarse grid in the coarse_weights canary where it is a weight matrix (`matrix`, two dimensions or more)."""
+        if tensor is None or not tensor.is_floating_point():
+            return tensor
+        if self.canary == "coarse_weights" and matrix and tensor.dim() >= 2:
+            tensor = coarse_grid(tensor)
+        return tensor if self.dtype is None else tensor.to(self.dtype)
 
     def _conversions(self):
         """({parameter name: (converter, {source pattern: [(base, stored key), ...]})}, {base: [stored keys]}): the
@@ -506,7 +767,7 @@ class StreamingReference:
             else:
                 return None
             tensor = self.checkpoint.fit(key, tensor, value.shape)
-        return tensor
+        return self._sixteen(tensor, name.rsplit(".", 1)[-1] == "weight")
 
     def _row_keys(self, base, primary, full_rows):
         """The stored keys whose rows make rows of matrix `base` (stored key `primary`): it and its per-row scales
@@ -551,8 +812,18 @@ class StreamingReference:
         return scheme(view, base) in GATHERABLE
 
     def _row_source(self, name):
-        """rows(index) -> FP32 rows of the embedding table parameter `name`, read without materializing the table
-        where its storage allows (see the module docstring), else from the table decoded once on the CPU."""
+        """rows(index) -> FP32 rows of the embedding table parameter `name` (in the baseline's dtype in its pass), read
+        without materializing the table where its storage allows (see the module docstring), else from the table
+        decoded once on the CPU."""
+        source = self._rows_of(name)
+        if self.canary == "coarse_weights":
+            # the table's rows on the coarse grid: groups run along a row, so a gathered row rounds as the whole
+            # table's would
+            rounded = source
+            source = lambda index: coarse_grid(rounded(index))
+        return source if self.dtype is None else lambda index: source(index).to(self.dtype)
+
+    def _rows_of(self, name):
         key = self._key(name)
         base = key[: -len(".weight")]
         if isinstance(self.checkpoint, TensorCheckpoint):
@@ -904,8 +1175,28 @@ class StreamingReference:
     def _implementation(self, implementation):
         """Point the model's attention (and the masks its forward builds) at `implementation` ("eager" or
         self.chunked)."""
+        if self.canary == "kv_shift":
+            implementation = self._shifted(implementation)
         for config in self.configs:
             config._attn_implementation = implementation
+
+    def _shifted(self, implementation):
+        """The kv_shift canary's attention implementation in place of `implementation` (_shifted_attention),
+        registered with the same masks; the first call marks the canary as applying (canary_applies)."""
+        from transformers import AttentionInterface
+        from transformers.masking_utils import AttentionMaskInterface
+        name = f"crit_kv_shift_{implementation}"
+        _SHIFTING["reference"] = self
+        if name not in AttentionInterface._global_mapping:
+            inner = _shifted_attention(implementation)
+
+            def attention(*args, **kwargs):
+                if _SHIFTING["reference"] is not None:
+                    _SHIFTING["reference"].canary_applies = True
+                return inner(*args, **kwargs)
+            AttentionInterface.register(name, attention)
+            AttentionMaskInterface.register(name, AttentionMaskInterface._global_mapping[implementation])
+        return name
 
     def _layer_count(self):
         return min(len(self.skeleton.layers), self.config.num_hidden_layers)
@@ -1035,7 +1326,8 @@ class StreamingReference:
                     layer = self.layer(i)
                 resident[i] = layer
                 at[0] += 1
-                return type(layer).forward(layer, *args, **kwargs)   # its own forward, not the stand-in
+                # its own forward, not the stand-in
+                return self._skip(i, args, kwargs, type(layer).forward(layer, *args, **kwargs))
             return forward
 
         outputs, recording = [], [True]
@@ -1077,6 +1369,8 @@ class StreamingReference:
         return {"reference": REFERENCE_VERSION, "transformers": transformers.__version__,
                 "torch": self.torch.__version__, "device": device, "model_sha256": model_sha,
                 **({"activations": "declared"} if self.declared else {}),
+                **({"dtype": str(self.dtype).removeprefix("torch.")} if self.dtype is not None else {}),
+                **({"canary": self.canary} if self.canary else {}),
                 **({} if self.chained() else {"layers": "called"}),
                 **({"forms": [f"{name}@{FORM_VERSIONS.get(name, 1)}" for name in self.forms]} if self.forms else {}),
                 # Only attention with sinks runs its long texts otherwise (chunked_sink_attention).
@@ -1142,7 +1436,7 @@ class StreamingReference:
                     kwargs = dict(kwargs, hidden_states=states[s])
                 if p.state is not None:
                     p.state.enter(index, self.device)
-                states[s] = layer(*args, **kwargs)
+                states[s] = self._skip(index, args, kwargs, layer(*args, **kwargs))
                 if p.state is not None:
                     p.state.leave(index, p.keep)
                 calls[index] = None
@@ -1211,7 +1505,7 @@ class StreamingReference:
         own.apply(state.cache)
         state.enter(index, self.device)
         with _watched(state.cache) as seen:
-            out = layer(*args, **kwargs)
+            out = self._skip(index, args, kwargs, layer(*args, **kwargs))
         if not own.held_by(state.cache, index):
             raise _OrderUnsafe("a decoder layer changes the cache's own state")
         early = sorted(j for j in seen if j != index and prompt.done[j] != job.chunk + (j < index))
@@ -1399,6 +1693,10 @@ class StreamingReference:
                          if module is self.skeleton.get_input_embeddings())
         base = (self._key(embedding + ".weight") if tied else stored)[: -len(".weight")]
         head = self.checkpoint.dense(base, self.device)[:valid_vocab]
+        if self.canary == "coarse_weights":   # the output head is a weight matrix too
+            head = coarse_grid(head)
+        if self.dtype is not None:   # the baseline's head: its 16-bit values, the product accumulated in FP32
+            head = head.to(self.dtype).float()
         # The allowance's pass: the head's inputs quantized as the checkpoint declares for it (FP8 per token, typically).
         self.head_inputs = self._activations(base) if self.declared else None
         return head, getattr(self.config, "final_logit_softcapping", None)
@@ -1412,7 +1710,8 @@ class StreamingReference:
         start = 0
         for piece, out in zip(pieces, outputs):
             self._implementation(self.chunked if long else "eager")
-            hidden = (self._tail(piece, out.to(self.device)) if tail else out.to(self.device))[0]
+            # FP32 rows: the baseline's 16-bit hidden states as they are, a product of 16-bit values accumulated in FP32.
+            hidden = (self._tail(piece, out.to(self.device)) if tail else out.to(self.device))[0].float()
             following = torch.tensor(ids[start + 1:start + len(piece) + 1], device=self.device)
             for row in range(0, len(following), SCORE_ROWS):
                 rows = hidden[row:row + SCORE_ROWS][:len(following) - row]
@@ -1526,42 +1825,47 @@ def store_spread(reference, texts, top_k, valid_vocab, data, identity, rule, lay
     return "probed" if skipped else "scored"
 
 
-def _spread_rows(reference, texts, top_k, valid_vocab, data, store, log, check):
-    """{text id: rows} of `texts` ({id: (ids, long)}) scored with TF32 matmuls (store_spread)."""
-    torch = reference.torch
+def _scored(reference, texts, top_k, valid_vocab, scratch, log, check):
+    """{text id: rows} of `texts` ({id: (ids, long)}) scored by `reference` (score_texts), the long ones with chunked
+    attention: every pass after the exact one (the spread's, the allowance's, the baseline's, a canary's)."""
     names = list(texts)
-    previous = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
-    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
-    try:
-        rows = reference.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
-                                     Path(data) / store / "scratch-spread", log=log,
-                                     long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
-    finally:
-        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous
+    rows = reference.score_texts([texts[name][0] for name in names], top_k, valid_vocab, scratch, log=log,
+                                 long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
     return dict(zip(names, rows))
 
 
-def _spread_sets(rows, stored, layout):
-    """{"SET/path": text_quality row} of a run's rows ({text id: (target, top ids, top log-probabilities)} tensors)
-    against the stored scores, the texts' positions split as crit_eval.run.quality_checks.run_quality splits them."""
-    return _compare_sets({name: [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
-                                 for lp, ids, tops in zip(target.tolist(), top.tolist(), values.tolist())]
-                          for name, (target, top, values) in rows.items()}, stored, layout)
+def _spread_rows(reference, texts, top_k, valid_vocab, data, store, log, check):
+    """{text id: rows} of `texts` ({id: (ids, long)}) scored with TF32 matmuls (store_spread)."""
+    torch = reference.torch
+    previous = torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = torch.backends.cudnn.allow_tf32 = True
+    try:
+        return _scored(reference, texts, top_k, valid_vocab, Path(data) / store / "scratch-spread", log, check)
+    finally:
+        torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous
 
 
-def _compare_sets(found_rows, stored, layout):
-    """_spread_sets of rows in an engine's form ({text id: [{"logprob", "top": [[id, logprob], ...]}, ...]})."""
-    from ..reports import metrics
+def _set_rows(rows, stored, layout):
+    """{"SET/path": (the stored rows, the run's rows in an engine's form)} of a run's rows ({text id: (target, top ids,
+    top log-probabilities)} tensors), the texts' positions split as crit_eval.run.quality_checks.run_quality splits
+    them (SET/prompt: the prompt positions, SET/served: the continuation's); a path without positions left out."""
     parts = {}
-    for name, again in found_rows.items():
+    for name, (target, top, values) in rows.items():
+        again = [{"logprob": lp, "top": [[int(i), float(v)] for i, v in zip(ids, tops)]}
+                 for lp, ids, tops in zip(target.tolist(), top.tolist(), values.tolist())]
         set_name, prompt = layout[name]
         last = prompt - 1
         for part, pick in (("prompt", slice(0, last)), ("served", slice(last, None))):
             reference_rows, found = parts.setdefault(f"{set_name}/{part}", ([], []))
             reference_rows += stored[name][pick]
             found += again[pick]
-    return {name: metrics.text_quality(reference_rows, found)
-            for name, (reference_rows, found) in parts.items() if found}
+    return {name: pair for name, pair in parts.items() if pair[1]}
+
+
+def _spread_sets(rows, stored, layout):
+    """{"SET/path": text_quality row} of a run's rows against the stored scores (_set_rows)."""
+    from ..reports import metrics
+    return {name: metrics.text_quality(*pair) for name, pair in _set_rows(rows, stored, layout).items()}
 
 
 def _spread_tiny(sets, budget, factor, margin):
@@ -1598,19 +1902,16 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
         return "none"
     stored = fixed.load(data, identity)
     started = time.time()
-    names = list(texts)
     log(f"reference allowance: the texts scored again with the activations quantized as the checkpoint declares "
         f"({', '.join(declared)})")
     try:
-        quantized = StreamingReference(model, device, declared_activations=True)
-        rows = quantized.score_texts([texts[name][0] for name in names], top_k, valid_vocab,
-                                     Path(data) / STORE / "scratch-allowance", log=log,
-                                     long={i for i, name in enumerate(names) if texts[name][1]}, check=check)
+        rows = _scored(StreamingReference(model, device, declared_activations=True), texts, top_k, valid_vocab,
+                       Path(data) / STORE / "scratch-allowance", log, check)
     except SchemeError as error:
         fixed.write_allowance(data, allowance_identity, {"unsupported": str(error), "sets": {}})
         log(f"reference allowance: not measured ({error})")
         return "unsupported"
-    sets, how = _spread_sets(dict(zip(names, rows)), stored, layout), "measured"
+    sets, how = _spread_sets(rows, stored, layout), "measured"
     for name, row in sets.items():
         log(f"reference allowance {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.2e}, "
             f"PPL x{row['ppl_ratio']:.4f} over {row['targets']:,} positions")
@@ -1619,35 +1920,138 @@ def store_allowance(model, data, texts, top_k, valid_vocab, identity, layout, de
     return how
 
 
-def score_data(model, data, log=print, check=lambda: None, allowance=True):
+def store_baseline(model, data, texts, top_k, valid_vocab, identity, layout, rule, log=print, check=lambda: None,
+                   device="cuda"):
+    """protocol quality.baseline: the texts scored once more in the checkpoint's own 16-bit dtype (sixteen_bit_dtype;
+    StreamingReference dtype) and how far that lands from the stored scores kept per set and path, its text_quality row
+    and its block-bootstrap resamples (metrics.bootstrap_samples, as protocol quality.position_spread draws them for
+    every run, so a run judges them against its own limits), beside the scores (fixed.BASELINE) with the identity they
+    were computed under. A checkpoint whose config declares no 16-bit dtype stores an empty baseline saying so.
+    rule: protocol quality. Returns "stored", "measured", "none" or "unsupported" (a stored form the 16-bit pass
+    cannot hold, recorded so the baseline says why it is missing)."""
+    from . import fixed
+    from ..reports import metrics
+    noise = rule.get("position_spread") or {}
+    bootstrap = {key: int(noise.get(key, default)) for key, default in (("block", 64), ("draws", 200), ("seed", 0))}
+    dtype = sixteen_bit_dtype(model)
+    baseline_identity = {**identity, "baseline": dtype or "none", "bootstrap": bootstrap}
+    if fixed.load_beside(data, fixed.BASELINE, baseline_identity) is not None:
+        return "stored"
+    if dtype is None:
+        fixed.write_beside(data, fixed.BASELINE, baseline_identity,
+                           {"dtype": None, "sets": {}, "reason": "the checkpoint's config declares no 16-bit dtype "
+                                                                 f"({' or '.join(SIXTEEN_BITS)})"})
+        log("reference baseline: none (the checkpoint's config declares no 16-bit dtype)")
+        return "none"
+    stored, started = fixed.load(data, identity), time.time()
+    log(f"reference baseline: the texts scored again in {dtype}, the checkpoint's own 16-bit dtype")
+    try:
+        rows = _scored(StreamingReference(model, device, dtype=dtype), texts, top_k, valid_vocab,
+                       Path(data) / STORE / "scratch-baseline", log, check)
+    except SchemeError as error:
+        fixed.write_beside(data, fixed.BASELINE, baseline_identity, {"dtype": dtype, "sets": {}, "unsupported": str(error)})
+        log(f"reference baseline: not measured ({error})")
+        return "unsupported"
+    budget = metrics.mode_thresholds(rule, fixed.DEFAULT_QUALITY_MODE)
+    sets = {}
+    for name, (reference_rows, found) in _set_rows(rows, stored, layout).items():
+        row = metrics.text_quality(reference_rows, found)
+        samples = metrics.bootstrap_samples(reference_rows, found, bootstrap["block"], bootstrap["draws"],
+                                            bootstrap["seed"])
+        sets[name] = {**row, "bootstrap": samples}
+        judged = {k: v for k, v in budget.items() if name.endswith("/served") or k != "ppl_ratio_max"}
+        p95 = metrics.spread_of(samples, judged, bootstrap["block"])["kld_p99"]["p95"] if samples else None
+        log(f"reference baseline {name}: KLD mean {row['kld_mean']:.2e}, p99 {row['kld_p99']:.3g}"
+            + (f" (bootstrap p95 {p95:.3g})" if p95 is not None else "")
+            + f", PPL x{row['ppl_ratio']:.4f}: {metrics.budget_used(row, judged):.0%} of {fixed.DEFAULT_QUALITY_MODE}'s "
+              f"budget over {row['targets']:,} positions")
+    fixed.write_beside(data, fixed.BASELINE, baseline_identity,
+                       {"dtype": dtype, "sets": sets, "seconds": round(time.time() - started, 1)})
+    return "measured"
+
+
+def store_canaries(model, data, texts, top_k, valid_vocab, identity, layout, log=print, check=lambda: None,
+                   device="cuda", names=CANARIES):
+    """protocol quality.canaries: the texts scored once per canary `names` (CANARIES) by a deliberately broken
+    forward (StreamingReference canary) and how far each lands from the stored scores kept per set and path
+    (_spread_sets) beside the scores (fixed.CANARIES), judged by each run against its own limits. A canary with nothing
+    to break in this model (rope_base without rotary frequencies, kv_shift without attention through transformers'
+    attention interface) is recorded as not applicable, and one the forward refuses as unsupported. Returns "stored"
+    or "measured"."""
+    import gc
+    from . import fixed
+    canary_identity = {**identity, "canaries": list(names)}
+    if fixed.load_beside(data, fixed.CANARIES, canary_identity) is not None:
+        return "stored"
+    stored, found = fixed.load(data, identity), {}
+    for name in names:
+        started = time.time()
+        log(f"reference canary {name}: the texts scored again by a deliberately broken forward")
+        try:
+            broken = StreamingReference(model, device, canary=name)
+            rows = None if broken.canary_applies is False else _scored(
+                broken, texts, top_k, valid_vocab, Path(data) / STORE / f"scratch-{name}", log, check)
+            applies = broken.canary_applies
+        except SchemeError as error:
+            found[name] = {"status": "unsupported", "reason": str(error), "sets": {}}
+            log(f"reference canary {name}: not measured ({error})")
+            continue
+        finally:
+            broken, _SHIFTING["reference"] = None, None
+            gc.collect()
+        if not applies:
+            found[name] = {"status": "not applicable", "sets": {},
+                           "reason": {"rope_base": "the model holds no rotary frequencies (inv_freq)",
+                                      "kv_shift": "no attention of the model runs through transformers' attention "
+                                                  "interface or projects its keys and values with k_proj and "
+                                                  "v_proj"}.get(name, "nothing to break")}
+            log(f"reference canary {name}: not applicable ({found[name]['reason']})")
+            continue
+        sets = _spread_sets(rows, stored, layout)
+        found[name] = {"status": "measured", "sets": sets, "seconds": round(time.time() - started, 1)}
+        for set_name, row in sets.items():
+            log(f"reference canary {name} {set_name}: KLD mean {row['kld_mean']:.3g}, p99 {row['kld_p99']:.3g}, "
+                f"PPL x{row['ppl_ratio']:.4f}")
+    fixed.write_beside(data, fixed.CANARIES, canary_identity, {"canaries": found})
+    return "measured"
+
+
+def score_data(model, data, log=print, check=lambda: None, allowance=True, baseline=True, canaries=False):
     """Score every quality text of the prepared data at every position on the checkpoint it was prepared from and
     store the scores under the data (crit_eval.quality.fixed), with the reference's own spread, unless they are stored
     already under the same identity: both quality modes judge against them. allowance (the default): also measure,
     for a checkpoint that declares quantized activations, how far the checkpoint run with them quantized lands from
     the scores (store_allowance), a second scoring pass that speed judges by (protocol quality.allowance); a
-    checkpoint that declares none stores an empty one without a second pass. False skips it. check() runs between layers and
-    texts: it raises to stop. Returns how they were obtained."""
+    checkpoint that declares none stores an empty one without a second pass. baseline (the default): also measure the
+    checkpoint's 16-bit baseline (store_baseline, protocol quality.baseline: reported beside every run's sets). canaries
+    (on request): also score every canary (store_canaries, protocol quality.canaries), a pass each. False skips each.
+    check() runs between layers and texts: it raises to stop. Returns how they were obtained."""
     from . import fixed
     protocol = load_json(EVAL_DIR / "protocol.json")
     prepared = load_json(Path(data) / PREPARED)
     if model_identity(model, prepared_template(prepared))["sha256"] != prepared["model"]["sha256"]:
         raise SystemExit(f"{model} is not the checkpoint {data} was prepared from: the reference is that checkpoint")
     layout = {t["id"]: (t["set"], len(t["prompt_ids"])) for t in prepared["quality"]}
-    texts, top_k = fixed.texts(prepared), protocol["quality"]["top_k"]
+    texts, top_k, vocab = fixed.texts(prepared), protocol["quality"]["top_k"], prepared["valid_vocab"]
     reference = StreamingReference(model)
-    out = store_texts(reference, texts, top_k, prepared["valid_vocab"], data, prepared["model"]["sha256"], log=log,
+    out = store_texts(reference, texts, top_k, vocab, data, prepared["model"]["sha256"], log=log,
                       check=check, spread=protocol["quality"].get("spread"), layout=layout,
                       budget=protocol["quality"]["thresholds"])
-    if not allowance:
+    if not (allowance or baseline or canaries):
         return out
-    identity = dict(reference.identity(prepared["model"]["sha256"]), **fixed.identity(texts, top_k, prepared["valid_vocab"]))
+    identity = dict(reference.identity(prepared["model"]["sha256"]), **fixed.identity(texts, top_k, vocab))
     try:
-        declared = reference.declared_activations()
+        declared = reference.declared_activations() if allowance else None
     except SchemeError as error:
         declared = error
-    del reference   # its device memory and staging buffers, before the quantized pass builds its own
+    del reference   # its device memory and staging buffers, before another pass builds its own
     import gc
     gc.collect()
-    out["allowance"] = store_allowance(model, data, texts, top_k, prepared["valid_vocab"], identity, layout, declared,
-                                       log, check)
+    if allowance:
+        out["allowance"] = store_allowance(model, data, texts, top_k, vocab, identity, layout, declared, log, check)
+    if baseline:
+        out["baseline"] = store_baseline(model, data, texts, top_k, vocab, identity, layout, protocol["quality"], log,
+                                         check)
+    if canaries:
+        out["canaries"] = store_canaries(model, data, texts, top_k, vocab, identity, layout, log, check)
     return out

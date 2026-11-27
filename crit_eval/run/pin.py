@@ -44,7 +44,7 @@ def pin(adapter, model, data, config=None, log=print, context_tokens=None):
     Refuses to replace an existing one: a data directory has one pinned text. context_tokens: the context
     the engine is built for (the run's required context)."""
     from .adapters import load_adapter, open_engine
-    from .timing import timed_generate
+    from .requests import case_request, send
     data = Path(data)
     prepared = load_json(data / PREPARED)
     out = data / CONTINUATIONS
@@ -60,8 +60,8 @@ def pin(adapter, model, data, config=None, log=print, context_tokens=None):
                 skipped[case["id"]] = f"needs {len(prompt) + n} tokens of context"
                 log(f"pin {case['id']}: skipped (context)")
                 continue
-            first, _ = timed_generate(engine, prompt, n)
-            second, _ = timed_generate(engine, prompt, n)
+            request = case_request(case, "pin")   # the case's own request (protocol requests.cases)
+            first, second = send(engine, request)[0], send(engine, request)[0]
             if first != second:
                 raise SystemExit(f"plain greedy output of speed case {case['id']} changes between runs; "
                                  "a pinned continuation needs a repeatable engine")
